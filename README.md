@@ -1,10 +1,10 @@
-# quantilica-io
+# quantilica-analytics
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square) ![Python](https://img.shields.io/badge/python-3.12+-blue.svg?style=flat-square)
 
 **Camada de processamento e padronização analítica da Quantilica.**
 
-`quantilica-io` é a biblioteca especializada em leitura, validação e conversão de dados brutos para formatos analíticos de alto desempenho (Parquet), integrando-se nativamente com a infraestrutura de metadados do `quantilica-core`.
+`quantilica-analytics` é a biblioteca especializada em leitura, validação e conversão de dados brutos para formatos analíticos de alto desempenho (Parquet), integrando-se nativamente com a infraestrutura de metadados do `quantilica-core`.
 
 ## Objetivo
 
@@ -19,18 +19,18 @@ O pacote utiliza as melhores ferramentas modernas para processamento de dados de
 
 ## Módulos
 
-### 1. `quantilica_io.reader`
+### 1. `quantilica.analytics.reader`
 Abstração de leitura multi-formato integrada aos manifestos do core.
 - Suporte a: `CSV`, `JSON`, `Excel`, `DBF` (comum no DATASUS).
-- Integração com `quantilica_core.storage.LocalStorage`.
+- Integração com `quantilica.core.storage.LocalStorage`.
 - Detecção automática de encoding e delimitadores.
 
-### 2. `quantilica_io.schema`
+### 2. `quantilica.analytics.schema`
 Definição de contratos de dados para garantir consistência entre datasets.
 - Classe `DataContract`: Define nomes de colunas padronizados, tipos e campos obrigatórios.
 - Validação preventiva: Erro imediato se a fonte oficial alterar o layout do arquivo.
 
-### 3. `quantilica_io.writer`
+### 3. `quantilica.analytics.writer`
 Conversão padronizada para formatos analíticos.
 - `to_parquet()`: Escrita otimizada com compressão `zstd` e inclusão de metadados de proveniência (como o `sha256` original) no header do arquivo Parquet.
 - Particionamento inteligente baseado nos metadados do dataset.
@@ -43,17 +43,17 @@ Conversão padronizada para formatos analíticos.
 
 ## Instalação
 
-O `quantilica-io` é publicado via GitHub. Adicione-o ao seu projeto:
+O `quantilica-analytics` é publicado via GitHub. Adicione-o ao seu projeto:
 
 ```bash
-uv add "quantilica-io @ git+https://github.com/Quantilica/quantilica-io.git"
+uv add "quantilica-analytics @ git+https://github.com/Quantilica/quantilica-analytics.git"
 ```
 
 ## Uso Rápido
 
 ```python
-from quantilica_io.writer import to_parquet
-from quantilica_core.manifests import DownloadManifest
+from quantilica.analytics.writer import to_parquet
+from quantilica.core.manifests import DownloadManifest
 
 # Carrega um manifesto de um download realizado pelo core
 manifest = DownloadManifest.read_json("data/raw/dataset.csv.manifest.json")
@@ -65,8 +65,8 @@ to_parquet(manifest, "data/processed/dataset.parquet")
 ## Desenvolvimento
 
 ```bash
-git clone https://github.com/Quantilica/quantilica-io.git
-cd quantilica-io
+git clone https://github.com/Quantilica/quantilica-analytics.git
+cd quantilica-analytics
 uv sync --dev
 uv run pytest
 ```
