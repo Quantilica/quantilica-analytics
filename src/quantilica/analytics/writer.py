@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
-from quantilica_core.manifests import DownloadManifest
+from quantilica.core.manifests import DownloadManifest
 
 
 def to_parquet(

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import polars as pl
-from quantilica_core.manifests import DownloadManifest
+from quantilica.core.manifests import DownloadManifest
 
 DEFAULT_BR_NA = ["-9999", "N/D", "NA", ""]
 """Default sentinel strings treated as null in Brazilian public-data CSVs."""

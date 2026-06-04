@@ -3,7 +3,7 @@
 from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = version("quantilica-io")
+    __version__ = version("quantilica-analytics")
 except PackageNotFoundError:
     __version__ = "0.0.0"
 

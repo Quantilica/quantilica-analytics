@@ -1,8 +1,8 @@
 import polars as pl
-from quantilica_core.manifests import DownloadManifest
+from quantilica.core.manifests import DownloadManifest
 
-from quantilica_io.reader import SmartReader, read_brazilian_csv
-from quantilica_io.writer import to_parquet
+from quantilica.analytics.reader import SmartReader, read_brazilian_csv
+from quantilica.analytics.writer import to_parquet
 
 
 def test_to_parquet_with_manifest(tmp_path):
