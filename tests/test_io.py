@@ -1,8 +1,7 @@
 import polars as pl
-from quantilica.core.manifests import DownloadManifest
-
 from quantilica.analytics.reader import SmartReader, read_brazilian_csv
 from quantilica.analytics.writer import to_parquet
+from quantilica.core.manifests import DownloadManifest
 
 
 def test_to_parquet_with_manifest(tmp_path):
@@ -45,9 +44,7 @@ def test_smart_reader_csv(tmp_path):
 
 def test_read_brazilian_csv_polars_defaults(tmp_path):
     csv_file = tmp_path / "br.csv"
-    csv_file.write_text(
-        "nome;valor\nfoo;1,5\nbar;-9999\n", encoding="latin-1"
-    )
+    csv_file.write_text("nome;valor\nfoo;1,5\nbar;-9999\n", encoding="latin-1")
 
     df = read_brazilian_csv(csv_file)
 
@@ -62,9 +59,7 @@ def test_read_brazilian_csv_polars_kwargs_passthrough(tmp_path):
     csv_file = tmp_path / "nohdr.csv"
     csv_file.write_text("foo;10\nbar;20\n", encoding="latin-1")
 
-    df = read_brazilian_csv(
-        csv_file, has_header=False, new_columns=["k", "v"]
-    )
+    df = read_brazilian_csv(csv_file, has_header=False, new_columns=["k", "v"])
 
     assert df.columns == ["k", "v"]
     assert df.height == 2
