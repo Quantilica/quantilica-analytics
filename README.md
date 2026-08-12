@@ -6,6 +6,9 @@
 
 `quantilica-analytics` é a biblioteca especializada em leitura, validação e conversão de dados brutos para formatos analíticos de alto desempenho (Parquet), integrando-se nativamente com a infraestrutura de metadados do `quantilica-core`.
 
+> **Note**
+> For full documentation, please visit the official docs: **[https://docs.quantilica.com](https://docs.quantilica.com)**
+
 ## Objetivo
 
 Desacoplar a lógica de processamento de dados (leitura, limpeza, conversão) do `quantilica-core`, mantendo o núcleo leve e focado exclusivamente em I/O (HTTP/FTP) e infraestrutura de metadados. Atua como uma ponte entre os arquivos brutos baixados pelos fetchers e os ativos analíticos prontos para consumo.
