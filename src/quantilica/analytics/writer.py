@@ -25,8 +25,10 @@ def to_parquet(
     Args:
         data (pl.DataFrame | pl.LazyFrame): The DataFrame or LazyFrame to write.
         output_path (str | Path): The destination path for the Parquet file.
-        manifest (DownloadManifest | None, optional): The download manifest containing provenance metadata. Defaults to None.
-        compression (str, optional): The compression algorithm to use. Defaults to "zstd".
+        manifest (DownloadManifest | None, optional): The download manifest containing
+            provenance metadata. Defaults to None.
+        compression (str, optional): The compression algorithm to use. Defaults to
+            "zstd".
         **kwargs (Any): Extra keyword arguments forwarded to the `write_parquet` method.
 
     Returns:

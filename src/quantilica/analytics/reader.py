@@ -32,15 +32,18 @@ def read_brazilian_csv(
 
     Args:
         source (Any): The source CSV file. May be a path, bytes, or file-like object.
-        engine (Literal["polars", "pandas"], optional): The processing engine to use. Defaults to "polars".
+        engine (Literal["polars", "pandas"], optional): The processing engine to use.
+            Defaults to "polars".
         separator (str, optional): The column separator. Defaults to ";".
         decimal (str, optional): The decimal separator. Defaults to ",".
         encoding (str, optional): The file encoding. Defaults to "latin-1".
-        na_values (list[str] | None, optional): A list of strings to interpret as missing values. Defaults to None, which uses `DEFAULT_BR_NA`.
+        na_values (list[str] | None, optional): A list of strings to interpret as
+            missing values. Defaults to None, which uses `DEFAULT_BR_NA`.
         **kwargs (Any): Extra keyword arguments forwarded to the underlying reader.
 
     Returns:
-        Any: A ``polars.DataFrame`` (default) or ``pandas.DataFrame`` when ``engine="pandas"``.
+        Any: A ``polars.DataFrame`` (default) or ``pandas.DataFrame`` when
+            ``engine="pandas"``.
 
     Raises:
         ValueError: If an unknown engine is provided.
@@ -74,7 +77,8 @@ class SmartReader:
         """Initialize the SmartReader.
 
         Args:
-            default_encoding (str, optional): The default encoding to use if not specified. Defaults to "utf-8".
+            default_encoding (str, optional): The default encoding to use if not
+                specified. Defaults to "utf-8".
         """
         self.default_encoding = default_encoding
 
@@ -86,8 +90,10 @@ class SmartReader:
         """Read a file into a Polars DataFrame, optionally guided by a manifest.
 
         Args:
-            path_or_manifest (str | Path | DownloadManifest): The file path or a download manifest pointing to the file.
-            **kwargs (Any): Extra keyword arguments forwarded to the underlying polars reader.
+            path_or_manifest (str | Path | DownloadManifest): The file path or a
+                download manifest pointing to the file.
+            **kwargs (Any): Extra keyword arguments forwarded to the underlying polars
+                reader.
 
         Returns:
             pl.DataFrame: The loaded data as a Polars DataFrame.
@@ -129,8 +135,10 @@ class SmartReader:
         """Lazily scan a file (optimized for large CSVs/Parquet).
 
         Args:
-            path_or_manifest (str | Path | DownloadManifest): The file path or a download manifest pointing to the file.
-            **kwargs (Any): Extra keyword arguments forwarded to the underlying polars scanner.
+            path_or_manifest (str | Path | DownloadManifest): The file path or a
+                download manifest pointing to the file.
+            **kwargs (Any): Extra keyword arguments forwarded to the underlying polars
+                scanner.
 
         Returns:
             pl.LazyFrame: The loaded data as a Polars LazyFrame.

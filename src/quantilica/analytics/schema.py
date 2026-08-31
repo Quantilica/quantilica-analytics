@@ -16,7 +16,8 @@ class Field:
         name (str): The name of the field.
         dtype (pl.DataType): The expected Polars data type.
         required (bool, optional): Whether the field must be present. Defaults to True.
-        description (str | None, optional): An optional description of the field. Defaults to None.
+        description (str | None, optional): An optional description of the field.
+            Defaults to None.
     """
 
     name: str
@@ -32,7 +33,8 @@ class DataContract:
     Attributes:
         dataset_id (str): A unique identifier for the dataset.
         fields (list[Field]): A list of field specifications.
-        metadata (dict[str, Any], optional): Additional metadata for the contract. Defaults to an empty dict.
+        metadata (dict[str, Any], optional): Additional metadata for the contract.
+            Defaults to an empty dict.
     """
 
     dataset_id: str
@@ -47,7 +49,8 @@ class DataContract:
 
         Raises:
             ValueError: If a required field is missing from the DataFrame schema.
-            TypeError: If a field's type does not match the expected type in the contract.
+            TypeError: If a field's type does not match the expected type in the
+                contract.
         """
         schema = df.collect_schema() if isinstance(df, pl.LazyFrame) else df.schema
 
