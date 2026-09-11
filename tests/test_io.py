@@ -79,3 +79,14 @@ def test_read_brazilian_csv_pandas_engine(tmp_path):
     assert isinstance(df, pd.DataFrame)
     assert list(df.columns) == ["nome", "valor"]
     assert df.loc[0, "valor"] == 1.5
+
+
+def test_top_level_exports():
+    import quantilica.analytics as qa
+
+    assert hasattr(qa, "DataContract")
+    assert hasattr(qa, "Field")
+    assert hasattr(qa, "SmartReader")
+    assert hasattr(qa, "to_parquet")
+    assert hasattr(qa, "read_brazilian_csv")
+    assert hasattr(qa, "DEFAULT_BR_NA")
