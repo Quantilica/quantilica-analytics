@@ -7,6 +7,15 @@ from typing import Any
 
 import polars as pl
 
+DEFAULT_NULL_SENTINELS = ["-9999", "N/D", "NA", "n.a.", "n.d.", "-", "não disp", ""]
+"""Canonical sentinel strings treated as null in Brazilian public data.
+
+Tokens such as ``-9999`` (numeric hole), ``N/D`` (não disponível), ``n.a.``
+(não aplicável), ``n.d.`` (não disponível) and ``não disp`` appear across
+IBGE, Banco Central and ministry CSV/Excel extracts. Reader and writer
+modules import this constant so every entry point shares one definition.
+"""
+
 
 @dataclass(frozen=True)
 class Field:
