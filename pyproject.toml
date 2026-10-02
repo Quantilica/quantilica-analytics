@@ -1,6 +1,6 @@
 [project]
 name = "quantilica-analytics"
-version = "0.2.1"
+version = "0.3.0"
 description = "Analytical data processing and conversion layer for Quantilica"
 readme = "README.md"
 authors = [
@@ -43,6 +43,7 @@ Issues = "https://github.com/Quantilica/quantilica-analytics/issues"
 dev = [
     "pytest>=8.0",
     "ruff>=0.9.0",
+    "pandas>=2.0",
 ]
 
 [tool.pytest.ini_options]
