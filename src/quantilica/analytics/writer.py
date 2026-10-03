@@ -9,6 +9,8 @@ from typing import Any
 import polars as pl
 from quantilica.core.manifests import DownloadManifest
 
+from quantilica.analytics.schema import DataContract
+
 _TMP_SUFFIX = ".tmp.parquet"
 _SIDECAR_SUFFIX = ".manifest.json"
 
@@ -48,6 +50,7 @@ def to_parquet(
     output_path: str | Path,
     *,
     manifest: DownloadManifest | None = None,
+    contract: DataContract | None = None,
     compression: str = "zstd",
     add_sidecar: bool = True,
     **kwargs: Any,
@@ -65,12 +68,20 @@ def to_parquet(
     metadata and as a JSON sidecar file written next to the target
     (``<target>.manifest.json``).
 
+    When a ``contract`` is provided, the data is validated against it before
+    writing (invalid data never reaches the output) and the contract identity
+    is recorded in the Parquet metadata (``quantilica.contract.id`` and
+    ``quantilica.contract.version``).
+
     Args:
         data (pl.DataFrame | pl.LazyFrame): The DataFrame or LazyFrame to write.
             LazyFrames are collected before writing.
         output_path (str | Path): The destination path for the Parquet file.
         manifest (DownloadManifest | None, optional): The download manifest
             containing provenance metadata. Defaults to None.
+        contract (DataContract | None, optional): The data contract to validate
+            against, with its identity injected into the Parquet metadata.
+            Defaults to None.
         compression (str, optional): The compression algorithm to use. Defaults to
             "zstd".
         add_sidecar (bool, optional): Whether to persist the JSON sidecar
@@ -81,6 +92,10 @@ def to_parquet(
 
     Returns:
         Path: The path to the written Parquet file.
+
+    Raises:
+        ValueError: If the data violates the contract when one is provided.
+        TypeError: If the data types do not match the contract.
     """
     if kwargs.get("partition_by") is not None:
         raise ValueError(
@@ -88,10 +103,19 @@ def to_parquet(
             "renamed; split the data explicitly if needed"
         )
 
+    if contract is not None:
+        contract.validate(data)
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     metadata = manifest_to_metadata(manifest)
+    if contract is not None:
+        metadata = {
+            **metadata,
+            "quantilica.contract.id": contract.dataset_id,
+            "quantilica.contract.version": str(contract.version),
+        }
     metadata = metadata or None
 
     tmp_path = output.with_name(f"{output.stem}.tmp.parquet")

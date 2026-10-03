@@ -62,6 +62,7 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 sources = ["src"]
 packages = ["src/quantilica"]
+artifacts = ["src/quantilica/analytics/data/*.parquet"]
 
 [build-system]
 requires = ["hatchling"]
