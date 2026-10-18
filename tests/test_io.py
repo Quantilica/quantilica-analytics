@@ -4,7 +4,7 @@ import json
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
-from quantilica.core.manifests import DownloadManifest
+from quantilica.core.manifests import DownloadManifest, write_manifest_sidecar
 
 from quantilica.analytics.reader import (
     SmartReader,
@@ -277,3 +277,28 @@ def test_top_level_exports():
     ):
         assert hasattr(qa, name), name
     assert qa.DEFAULT_NULL_SENTINELS is qa.DEFAULT_BR_NA
+
+
+def test_to_parquet_source_path_reads_sidecar(tmp_path):
+    raw = tmp_path / "raw.csv"
+    raw.write_text("a\n1\n")
+    write_manifest_sidecar(raw, _manifest("from-sidecar"))
+    output = tmp_path / "out.parquet"
+
+    to_parquet(pl.DataFrame({"a": [1]}), output, source_path=raw)
+
+    meta = pq.read_metadata(output).metadata
+    assert meta[b"quantilica.source_id"] == b"from-sidecar"
+    assert meta[b"quantilica.producer"] == b"test-producer"
+    assert (tmp_path / "out.parquet.manifest.json").exists()
+
+
+def test_to_parquet_source_path_without_sidecar_is_noop(tmp_path):
+    raw = tmp_path / "raw.csv"
+    raw.write_text("a\n1\n")
+    output = tmp_path / "out.parquet"
+
+    to_parquet(pl.DataFrame({"a": [1]}), output, source_path=raw)
+
+    assert output.exists()
+    assert not (tmp_path / "out.parquet.manifest.json").exists()
