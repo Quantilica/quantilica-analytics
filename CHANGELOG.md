@@ -5,6 +5,16 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [0.4.0] - 2026-10-18
+
+### Adicionado
+
+- `writer`: `to_parquet()` aceita o parâmetro `source_path` para ler automaticamente o sidecar `<source_path>.manifest.json` via `read_manifest_sidecar` (`quantilica-core>=0.12.0`) quando `manifest` não for fornecido explicitamente.
+
+### Alterado
+
+- `pyproject.toml`: licença migrada para expressão SPDX PEP 639 (`license = "MIT"` + `license-files = ["LICENSE"]`), `hatchling>=1.27` e piso `quantilica-core>=0.12.0`.
+
 ## [0.3.0] - 2026-10-02
 ### Adicionado
 - `normalize_brazilian_numbers()`: renormaliza colunas numéricas formatadas

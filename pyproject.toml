@@ -1,12 +1,13 @@
 [project]
 name = "quantilica-analytics"
-version = "0.3.0"
+version = "0.4.0"
 description = "Analytical data processing and conversion layer for Quantilica"
 readme = "README.md"
 authors = [
     { name = "Komesu, D.K.", email = "daniel@dkko.me" },
 ]
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 keywords = [
     "data",
@@ -20,7 +21,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
@@ -31,7 +31,7 @@ classifiers = [
 dependencies = [
     "polars>=1.0.0",
     "pyarrow>=15.0.0",
-    "quantilica-core>=0.3.2",
+    "quantilica-core>=0.12.0",
 ]
 
 [project.urls]
@@ -56,14 +56,11 @@ line-length = 88
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
 [tool.hatch.build.targets.wheel]
 sources = ["src"]
 packages = ["src/quantilica"]
 artifacts = ["src/quantilica/analytics/data/*.parquet"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
