@@ -1,0 +1,1060 @@
+"""Writers, conformance checker and readers for the Hive-partitioned lake.
+
+The layout contract lives in :mod:`quantilica.core.lake`; this module holds
+the pieces that need heavy dependencies:
+
+* :class:`LakeWriter` converts a raw file into ``<file_key>[-NNN].parquet``
+  inside its Hive partition, with two engines: DuckDB (streaming CSV/TXT,
+  ZIP and 7z, any encoding) and Polars (DataFrame/LazyFrame).
+* :func:`check_dataset` verifies a dataset against the contract, including
+  that DuckDB, Polars and PyArrow read the same rows and partition types.
+* :func:`scan_dataset` and :func:`duckdb_view_sql` read a dataset back.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import zipfile
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any
+
+import polars as pl
+import pyarrow as pa
+import pyarrow.dataset as pa_ds
+import pyarrow.parquet as pq
+from quantilica.core.files import sha256_file
+from quantilica.core.lake import (
+    DESCRIPTOR_FILENAME,
+    LAYOUT_VERSION,
+    DatasetDescriptor,
+    dataset_lock,
+    file_key,
+    partition_dir,
+)
+from quantilica.core.manifests import read_manifest_sidecar
+
+from quantilica.analytics.schema import DataContract
+from quantilica.analytics.writer import manifest_to_metadata
+
+try:
+    __version__ = version("quantilica-analytics")
+except PackageNotFoundError:  # pragma: no cover - source checkout without install
+    __version__ = "0.0.0"
+
+logger = logging.getLogger("quantilica.analytics.lake")
+
+TMP_DIRNAME = ".tmp"
+TMP_SUFFIX = ".tmp"
+TEXT_SUFFIXES = frozenset({".csv", ".txt"})
+
+META_ORIGIN_SHA = "quantilica.origin_sha256"
+META_LAYOUT = "quantilica.lake.layout_version"
+META_CONTRACT_ID = "quantilica.contract.id"
+META_CONTRACT_VERSION = "quantilica.contract.version"
+META_CAST_NULLS = "quantilica.cast_nulls"
+META_FILE_KEY = "quantilica.file_key"
+META_CONVERTED_AT = "quantilica.converted_at"
+# Metadata that every Parquet in the lake must carry.
+REQUIRED_METADATA = (
+    META_LAYOUT,
+    "quantilica.source_id",
+    "quantilica.dataset_id",
+    META_FILE_KEY,
+    META_CONVERTED_AT,
+)
+
+_PART_NAME = re.compile(r"^(?P<key>.+?)(?:-(?P<part>\d{3}))?\.parquet$")
+_PARTITION_DIR = re.compile(r"^(?P<key>[a-z][a-z0-9_]*)=(?P<value>[0-9A-Za-z._-]+)$")
+_DUCKDB_PART_FILE = re.compile(r"(\d+)")
+
+
+class LakeError(RuntimeError):
+    """A raw file cannot be converted, or a dataset violates the contract."""
+
+
+@dataclass
+class LakeWriteResult:
+    """Outcome of a :class:`LakeWriter` call.
+
+    ``status`` is ``"converted"`` or ``"skipped"`` (origin already in the
+    lake). ``rows`` is 0 for skipped files, ``outputs`` lists the existing
+    parts in that case. ``cast_nulls`` counts, per typed column, the values
+    that ``TRY_CAST`` turned into null.
+    """
+
+    source_file: Path | None
+    outputs: list[Path]
+    status: str
+    rows: int = 0
+    cast_nulls: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def output(self) -> Path:
+        return self.outputs[0]
+
+
+# --- partition type vocabulary -------------------------------------------------
+
+# Descriptor type name -> (DuckDB type, Polars dtype, Arrow type).
+_PARTITION_TYPES: dict[str, tuple[str, Any, pa.DataType]] = {
+    "varchar": ("VARCHAR", pl.String, pa.string()),
+    "string": ("VARCHAR", pl.String, pa.string()),
+    "str": ("VARCHAR", pl.String, pa.string()),
+    "int": ("BIGINT", pl.Int64, pa.int64()),
+    "integer": ("BIGINT", pl.Int64, pa.int64()),
+    "bigint": ("BIGINT", pl.Int64, pa.int64()),
+    "int64": ("BIGINT", pl.Int64, pa.int64()),
+    "smallint": ("SMALLINT", pl.Int16, pa.int16()),
+    "int16": ("SMALLINT", pl.Int16, pa.int16()),
+    "double": ("DOUBLE", pl.Float64, pa.float64()),
+    "float": ("DOUBLE", pl.Float64, pa.float64()),
+    "float64": ("DOUBLE", pl.Float64, pa.float64()),
+    "date": ("DATE", pl.Date, pa.date32()),
+    "boolean": ("BOOLEAN", pl.Boolean, pa.bool_()),
+    "bool": ("BOOLEAN", pl.Boolean, pa.bool_()),
+}
+
+
+def _partition_type(name: str, declared: str) -> tuple[str, Any, pa.DataType]:
+    try:
+        return _PARTITION_TYPES[declared.strip().lower()]
+    except KeyError:
+        raise LakeError(
+            f"Unknown type {declared!r} for partition key {name!r}; "
+            f"expected one of {sorted(_PARTITION_TYPES)}."
+        ) from None
+
+
+def _declared_types(descriptor: DatasetDescriptor) -> dict[str, str]:
+    """Declared type per partition key; undeclared keys are ``varchar``."""
+    return {
+        key: descriptor.partition_types.get(key, "varchar")
+        for key in descriptor.partition_keys
+    }
+
+
+# --- DuckDB helpers ---------------------------------------------------------------
+
+
+def _lit(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _connect(temp_dir: Path):
+    import duckdb
+
+    conn = duckdb.connect()
+    conn.execute(f"SET temp_directory = {_lit(str(temp_dir))}")
+    memory = os.environ.get("QUANTILICA_DUCKDB_MEMORY")
+    if memory:
+        conn.execute(f"SET memory_limit = {_lit(memory)}")
+    threads = os.environ.get("QUANTILICA_DUCKDB_THREADS")
+    if threads:
+        conn.execute(f"SET threads = {int(threads)}")
+    return conn
+
+
+def _normalize_name(raw: str) -> str:
+    """Lowercase snake_case ASCII name (``"Município (UF)"`` -> ``municipio_uf``)."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode()
+    text = re.sub(r"[^0-9a-zA-Z]+", "_", text).strip("_").lower()
+    return text or "col"
+
+
+def _unique_names(names: list[str]) -> list[str]:
+    """Normalize and disambiguate duplicates (``col``, ``col_2``...)."""
+    seen: dict[str, int] = {}
+    out = []
+    for raw in names:
+        base = _normalize_name(raw)
+        seen[base] = seen.get(base, 0) + 1
+        out.append(base if seen[base] == 1 else f"{base}_{seen[base]}")
+    return out
+
+
+def _duckdb_type(dtype: Any) -> str:
+    """DuckDB type for a Polars dtype used in a ``DataContract``."""
+    simple = {
+        pl.Int8: "TINYINT",
+        pl.Int16: "SMALLINT",
+        pl.Int32: "INTEGER",
+        pl.Int64: "BIGINT",
+        pl.UInt8: "UTINYINT",
+        pl.UInt16: "USMALLINT",
+        pl.UInt32: "UINTEGER",
+        pl.UInt64: "UBIGINT",
+        pl.Float32: "FLOAT",
+        pl.Float64: "DOUBLE",
+        pl.Boolean: "BOOLEAN",
+        pl.Date: "DATE",
+        pl.Datetime: "TIMESTAMP",
+        pl.Time: "TIME",
+        pl.String: "VARCHAR",
+    }
+    for polars_type, duck in simple.items():
+        if dtype == polars_type:
+            return duck
+    if isinstance(dtype, pl.Decimal) or dtype == pl.Decimal:
+        precision = getattr(dtype, "precision", None) or 38
+        scale = getattr(dtype, "scale", None) or 0
+        return f"DECIMAL({precision},{scale})"
+    raise LakeError(f"Contract dtype {dtype} has no DuckDB cast.")
+
+
+def _try_cast(column: str, duck: str) -> str:
+    """``TRY_CAST`` of a text column that survives DuckDB's CSV cast pushdown.
+
+    A bare ``TRY_CAST(col AS T)`` over ``read_csv`` is pushed into the reader,
+    which then *raises* on the first bad value. ``NULLIF(col, '')`` (a no-op:
+    empty fields are already null) keeps the cast in the query plan.
+    """
+    return f"TRY_CAST(NULLIF({_ident(column)}, '') AS {duck})"
+
+
+def _materialize(src: Path, tmp: Path) -> list[Path]:
+    """Text files to read: the file itself, or the members of a ZIP/7z."""
+    suffix = src.suffix.lower()
+    if suffix in TEXT_SUFFIXES:
+        return [src]
+    if suffix == ".zip":
+        with zipfile.ZipFile(src) as archive:
+            members = [m for m in archive.infolist() if not m.is_dir()]
+            archive.extractall(tmp, members=members)
+    elif suffix == ".7z":
+        tool = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+        if tool is None:
+            raise LakeError("7z not found in PATH (required for .7z files)")
+        proc = subprocess.run(
+            [tool, "e", "-y", "-bd", f"-o{tmp}", str(src)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise LakeError(f"7z failed on {src.name}: {proc.stderr.strip()[-300:]}")
+    else:
+        raise LakeError(f"Unsupported format: {src.name}")
+    files = sorted(p for p in tmp.rglob("*") if p.is_file())
+    if not files:
+        raise LakeError(f"{src.name} contains no files")
+    return files
+
+
+def _read_csv_sql(
+    files: list[Path],
+    *,
+    separator: str,
+    encoding: str,
+    header: bool,
+    names: tuple[str, ...],
+) -> str:
+    args = [
+        "[" + ", ".join(_lit(str(f)) for f in files) + "]",
+        f"delim={_lit(separator)}",
+        f"header={'true' if header else 'false'}",
+        "all_varchar=true",
+        f"encoding={_lit(encoding)}",
+        "null_padding=true",
+        "strict_mode=false",
+    ]
+    if not header:
+        args.append("names=[" + ", ".join(_lit(n) for n in names) + "]")
+    return f"read_csv({', '.join(args)})"
+
+
+# --- parquet footer helpers --------------------------------------------------------
+
+
+def _footer(path: Path) -> dict[str, str]:
+    """File-level key/value metadata of a Parquet file (empty on any error).
+
+    Read from the Parquet footer itself: Polars stores custom metadata only
+    there, so ``pq.read_schema(...).metadata`` would miss it.
+    """
+    try:
+        raw = pq.ParquetFile(path).metadata.metadata or {}
+    except (OSError, pa.ArrowException):
+        return {}
+    return {k.decode(): v.decode(errors="replace") for k, v in raw.items()}
+
+
+def _part_files(directory: Path, key: str) -> list[Path]:
+    """Parquet files in ``directory`` that belong to ``key`` (by footer)."""
+    if not directory.is_dir():
+        return []
+    found = []
+    for path in sorted(directory.glob("*.parquet")):
+        match = _PART_NAME.match(path.name)
+        if match and match["key"] == key and _footer(path).get(META_FILE_KEY) == key:
+            found.append(path)
+    return found
+
+
+def origin_matches(
+    directory: Path,
+    key: str,
+    sha256: str,
+    *,
+    layout_version: int = LAYOUT_VERSION,
+    contract_version: int | None = None,
+) -> bool:
+    """Whether ``key`` is already in ``directory`` for this origin.
+
+    True when the existing parts form one complete set (a lone ``<key>.parquet``
+    or ``-001..-N`` without gaps) written in a single run, and every part
+    records the same ``sha256``, layout version and contract version.
+    """
+    parts = _part_files(directory, key)
+    if not parts:
+        return False
+    numbers = [_PART_NAME.match(p.name)["part"] for p in parts]
+    if numbers == [None]:
+        pass
+    elif None in numbers or [int(n) for n in numbers] != list(
+        range(1, len(numbers) + 1)
+    ):
+        return False
+    expected_contract = None if contract_version is None else str(contract_version)
+    runs = set()
+    for part in parts:
+        meta = _footer(part)
+        if (
+            meta.get(META_ORIGIN_SHA) != sha256
+            or meta.get(META_LAYOUT) != str(layout_version)
+            or meta.get(META_CONTRACT_VERSION) != expected_contract
+        ):
+            return False
+        runs.add(meta.get(META_CONVERTED_AT))
+    return len(runs) == 1
+
+
+# --- writer ------------------------------------------------------------------------
+
+
+class LakeWriter:
+    """Write raw files into one dataset of the lake.
+
+    Every write is idempotent per ``file_key`` (same ``sha256``, layout version
+    and contract version is skipped unless ``force``), holds the dataset lock,
+    publishes with ``os.replace`` and keeps ``_dataset.json`` up to date.
+
+    Publishing a multi-part output replaces the parts one at a time, highest
+    number first, and only then deletes the leftovers of a previous, larger
+    split. A crash in between leaves a set that :func:`origin_matches` rejects,
+    so the next run reconverts. The lake is not transactional across files:
+    a concurrent reader may briefly see old and new parts together.
+
+    Args:
+        dataset_dir: ``<lake>/<source_id>/<dataset_id>``.
+        descriptor: Descriptor to maintain in ``_dataset.json``. The writer
+            works on a copy. Empty ``partition_keys`` are adopted from the
+            first write.
+        force: Reconvert even when the origin is already in the lake.
+        max_part_bytes: Split the output into ``-NNN`` parts of about this
+            size. ``None`` writes a single file.
+    """
+
+    def __init__(
+        self,
+        dataset_dir: Path,
+        descriptor: DatasetDescriptor,
+        *,
+        force: bool = False,
+        max_part_bytes: int | None = None,
+    ) -> None:
+        if descriptor.partition_source != "file":
+            raise NotImplementedError(
+                "partition_source='rows' is not supported by LakeWriter yet."
+            )
+        if max_part_bytes is not None and max_part_bytes <= 0:
+            raise ValueError("max_part_bytes must be positive.")
+        self.dataset_dir = Path(dataset_dir)
+        self.descriptor = replace(
+            descriptor,
+            partition_keys=list(descriptor.partition_keys),
+            partition_types=dict(descriptor.partition_types),
+        )
+        self.force = force
+        self.max_part_bytes = max_part_bytes
+
+    # -- public API --
+
+    def write_duckdb(
+        self,
+        src: Path,
+        *,
+        partitions: dict[str, Any] | None = None,
+        separator: str = ";",
+        encoding: str = "utf-8",
+        header: bool = True,
+        names: tuple[str, ...] = (),
+        rename: dict[str, str] | None = None,
+        required: tuple[str, ...] = (),
+        contract: DataContract | None = None,
+        converter: str = "quantilica-analytics",
+    ) -> LakeWriteResult:
+        """Convert a CSV/TXT (or the members of a ZIP/7z) with DuckDB, streaming.
+
+        Columns are read as text, named from the header (normalized, then
+        ``rename``) or from ``names`` when ``header`` is false. ``required``
+        columns missing from the header raise :class:`LakeError` before
+        anything is written, which rejects an HTML error page saved as CSV.
+        Columns typed by ``contract`` go through ``TRY_CAST``; the failures
+        are counted in ``quantilica.cast_nulls`` (one extra pass over the
+        input).
+        """
+        src = Path(src)
+        rename = rename or {}
+        partitions = dict(partitions or {})
+        if not header and not names:
+            raise ValueError("names is required when header is False.")
+        digest = sha256_file(src)
+        key = file_key(src)
+        with dataset_lock(self.dataset_dir):
+            target = self._target(partitions)
+            skipped = self._skip_if_current(target, key, src, digest, contract)
+            if skipped:
+                return skipped
+            staging = self._staging_dir()
+            try:
+                result = self._duckdb_convert(
+                    src,
+                    target,
+                    key,
+                    digest,
+                    staging,
+                    partitions=partitions,
+                    separator=separator,
+                    encoding=encoding,
+                    header=header,
+                    names=names,
+                    rename=rename,
+                    required=required,
+                    contract=contract,
+                    converter=converter,
+                )
+            finally:
+                self._cleanup_staging(staging)
+            self._save_descriptor(partitions, contract, converter)
+        logger.info("lake: %s -> %s (%d rows)", src.name, target, result.rows)
+        return result
+
+    def write_polars(
+        self,
+        data: pl.DataFrame | pl.LazyFrame,
+        src: Path | None,
+        *,
+        partitions: dict[str, Any] | None = None,
+        file_key_name: str | None = None,
+        contract: DataContract | None = None,
+        converter: str = "quantilica-analytics",
+    ) -> LakeWriteResult:
+        """Write a DataFrame/LazyFrame that was read from ``src``.
+
+        ``src`` is the raw file the data came from: it provides the
+        ``sha256`` for idempotency (a skipped file never evaluates the plan),
+        the default file key and the provenance sidecar. Without ``src``,
+        ``file_key_name`` is required and the write is never skipped.
+
+        A LazyFrame is streamed with ``sink_parquet`` (Polars falls back to
+        the in-memory engine when the plan is not streamable). With
+        ``max_part_bytes`` the frame is collected and split by rows, sized by
+        its uncompressed estimate, so parts stay at or below the limit.
+        """
+        partitions = dict(partitions or {})
+        if src is None and not file_key_name:
+            raise ValueError("file_key_name is required when src is None.")
+        src = Path(src) if src is not None else None
+        key = file_key_name or file_key(src)  # type: ignore[arg-type]
+        digest = sha256_file(src) if src is not None else None
+        with dataset_lock(self.dataset_dir):
+            target = self._target(partitions)
+            if digest is not None:
+                skipped = self._skip_if_current(target, key, src, digest, contract)
+                if skipped:
+                    return skipped
+            if contract is not None:
+                contract.validate(data)
+            staging = self._staging_dir()
+            try:
+                result = self._polars_convert(
+                    data, src, target, key, digest, staging, contract, converter
+                )
+            finally:
+                self._cleanup_staging(staging)
+            self._save_descriptor(partitions, contract, converter)
+        logger.info("lake: %s -> %s (%d rows)", key, target, result.rows)
+        return result
+
+    # -- shared plumbing --
+
+    def _target(self, partitions: dict[str, Any]) -> Path:
+        """Partition directory for the write; validates keys against the descriptor."""
+        keys = list(partitions)
+        declared = self.descriptor.partition_keys
+        if declared and keys != declared:
+            raise LakeError(
+                f"Partitions {keys} do not match the dataset's keys {declared}."
+            )
+        return partition_dir(self.dataset_dir, partitions)
+
+    def _staging_dir(self) -> Path:
+        base = self.dataset_dir / TMP_DIRNAME
+        base.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(dir=base))
+
+    def _cleanup_staging(self, staging: Path) -> None:
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            staging.parent.rmdir()  # only when no other writer left anything
+        except OSError:
+            pass
+
+    def _skip_if_current(
+        self,
+        target: Path,
+        key: str,
+        src: Path | None,
+        digest: str,
+        contract: DataContract | None,
+    ) -> LakeWriteResult | None:
+        if self.force:
+            return None
+        version = contract.version if contract is not None else None
+        if origin_matches(
+            target,
+            key,
+            digest,
+            layout_version=self.descriptor.layout_version,
+            contract_version=version,
+        ):
+            return LakeWriteResult(src, _part_files(target, key), "skipped")
+        return None
+
+    def _metadata(
+        self,
+        key: str,
+        src: Path | None,
+        digest: str | None,
+        contract: DataContract | None,
+        converter: str,
+    ) -> dict[str, str]:
+        manifest = read_manifest_sidecar(src) if src is not None else None
+        meta = manifest_to_metadata(manifest)
+        meta.update(
+            {
+                "quantilica.source_id": self.descriptor.source_id,
+                "quantilica.dataset_id": self.descriptor.dataset_id,
+                META_LAYOUT: str(self.descriptor.layout_version),
+                META_FILE_KEY: key,
+                "quantilica.converter": converter,
+                "quantilica.writer": f"quantilica-analytics/{__version__}",
+                META_CONVERTED_AT: datetime.now(UTC).isoformat(timespec="seconds"),
+            }
+        )
+        if src is not None:
+            meta["quantilica.origin_file"] = src.name
+        if digest is not None:
+            meta[META_ORIGIN_SHA] = digest  # the file's own hash beats the manifest's
+        if contract is not None:
+            meta[META_CONTRACT_ID] = contract.dataset_id
+            meta[META_CONTRACT_VERSION] = str(contract.version)
+        return meta
+
+    def _publish(self, target: Path, key: str, staged: list[Path]) -> list[Path]:
+        """Move staged parts into ``target`` and drop leftovers of older splits."""
+        target.mkdir(parents=True, exist_ok=True)
+        names = (
+            [f"{key}.parquet"]
+            if len(staged) == 1
+            else [f"{key}-{i:03d}.parquet" for i in range(1, len(staged) + 1)]
+        )
+        outputs = [target / name for name in names]
+        for path in outputs:  # "a" split in parts collides with the key "a-001"
+            owner = _footer(path).get(META_FILE_KEY) if path.exists() else key
+            if owner not in (None, key):
+                raise LakeError(
+                    f"{path.name} already belongs to file key {owner!r}; "
+                    f"refusing to overwrite it with {key!r}"
+                )
+        # Highest part first: a partial publish never looks like a complete set.
+        for tmp, final in reversed(list(zip(staged, outputs, strict=True))):
+            os.replace(tmp, final)
+        keep = set(outputs)
+        for orphan in _part_files(target, key):
+            if orphan not in keep:
+                orphan.unlink()
+        return outputs
+
+    def _save_descriptor(
+        self,
+        partitions: dict[str, Any],
+        contract: DataContract | None,
+        converter: str,
+    ) -> None:
+        descriptor = self.descriptor
+        if not descriptor.partition_keys and partitions:
+            descriptor.partition_keys = list(partitions)
+        descriptor.partition_types = _declared_types(descriptor)
+        if contract is not None:
+            descriptor.contract_id = contract.dataset_id
+            descriptor.contract_version = contract.version
+        descriptor.converter = converter
+        descriptor.save(self.dataset_dir)
+
+    # -- DuckDB engine --
+
+    def _duckdb_convert(
+        self,
+        src: Path,
+        target: Path,
+        key: str,
+        digest: str,
+        staging: Path,
+        *,
+        partitions: dict[str, Any],
+        separator: str,
+        encoding: str,
+        header: bool,
+        names: tuple[str, ...],
+        rename: dict[str, str],
+        required: tuple[str, ...],
+        contract: DataContract | None,
+        converter: str,
+    ) -> LakeWriteResult:
+        conn = _connect(staging)
+        try:
+            files = _materialize(src, staging / "raw")
+            read = _read_csv_sql(
+                files,
+                separator=separator,
+                encoding=encoding,
+                header=header,
+                names=names,
+            )
+            columns = self._columns(conn, read, header, names, rename, required)
+            cast_nulls: dict[str, int] = {}
+            select = self._select_list(columns, contract)
+            if contract is not None:
+                cast_nulls = self._count_cast_nulls(conn, read, columns, contract)
+            meta = self._metadata(key, src, digest, contract, converter)
+            if cast_nulls:
+                meta[META_CAST_NULLS] = json.dumps(cast_nulls, sort_keys=True)
+            kv = ", ".join(f"{_lit(k)}: {_lit(v)}" for k, v in meta.items())
+            options = f"FORMAT parquet, COMPRESSION zstd, KV_METADATA {{{kv}}}"
+            query = f"SELECT {select} FROM {read}"
+            target.mkdir(parents=True, exist_ok=True)
+            if self.max_part_bytes is None:
+                tmp_out = target / f"{key}.parquet{TMP_SUFFIX}"
+                try:
+                    rows = conn.execute(
+                        f"COPY ({query}) TO {_lit(str(tmp_out))} ({options})"
+                    ).fetchone()[0]
+                    outputs = self._publish(target, key, [tmp_out])
+                except BaseException:
+                    tmp_out.unlink(missing_ok=True)
+                    raise
+            else:
+                out_dir = staging / "parts"
+                rows = conn.execute(
+                    f"COPY ({query}) TO {_lit(str(out_dir))} "
+                    f"({options}, FILE_SIZE_BYTES {self.max_part_bytes})"
+                ).fetchone()[0]
+                staged = sorted(
+                    out_dir.glob("*.parquet"),
+                    key=lambda p: int(_DUCKDB_PART_FILE.search(p.stem).group(1)),
+                )
+                if not staged:  # empty input: still publish one (empty) file
+                    tmp_out = staging / f"{key}.parquet"
+                    conn.execute(f"COPY ({query}) TO {_lit(str(tmp_out))} ({options})")
+                    staged = [tmp_out]
+                outputs = self._publish(target, key, staged)
+        finally:
+            conn.close()
+        return LakeWriteResult(src, outputs, "converted", int(rows or 0), cast_nulls)
+
+    def _columns(
+        self,
+        conn,
+        read: str,
+        header: bool,
+        names: tuple[str, ...],
+        rename: dict[str, str],
+        required: tuple[str, ...],
+    ) -> list[tuple[str, str]]:
+        """``(source column, output column)`` pairs, validating ``required``."""
+        if not header:
+            return [(n, n) for n in names]
+        raw = [r[0] for r in conn.execute(f"DESCRIBE SELECT * FROM {read}").fetchall()]
+        out = [rename.get(n, n) for n in _unique_names(raw)]
+        missing = [c for c in required if c not in out]
+        if missing:
+            raise LakeError(
+                f"Unexpected header in {self.descriptor.source_id}/"
+                f"{self.descriptor.dataset_id}: missing {missing} "
+                f"(columns: {out[:6]}...)"
+            )
+        return list(zip(raw, out, strict=True))
+
+    @staticmethod
+    def _typed(
+        columns: list[tuple[str, str]], contract: DataContract | None
+    ) -> list[tuple[str, str, str | None]]:
+        """``(source, output, duckdb type or None)`` for each column."""
+        types: dict[str, str] = {}
+        if contract is not None:
+            present = {out for _, out in columns}
+            absent = [
+                f.name for f in contract.fields if f.required and f.name not in present
+            ]
+            if absent:
+                raise LakeError(f"Contract {contract.dataset_id}: missing {absent}")
+            types = {
+                f.name: _duckdb_type(f.dtype)
+                for f in contract.fields
+                if f.name in present
+            }
+        return [(src, out, types.get(out)) for src, out in columns]
+
+    def _select_list(
+        self, columns: list[tuple[str, str]], contract: DataContract | None
+    ) -> str:
+        parts = []
+        for src, out, duck in self._typed(columns, contract):
+            expr = _ident(src) if duck in (None, "VARCHAR") else _try_cast(src, duck)
+            parts.append(f"{expr} AS {_ident(out)}")
+        return ", ".join(parts)
+
+    def _count_cast_nulls(
+        self, conn, read: str, columns: list[tuple[str, str]], contract: DataContract
+    ) -> dict[str, int]:
+        typed = [
+            (src, out, duck)
+            for src, out, duck in self._typed(columns, contract)
+            if duck not in (None, "VARCHAR")
+        ]
+        if not typed:
+            return {}
+        counts = ", ".join(
+            f"count(*) FILTER (WHERE {_ident(src)} IS NOT NULL "
+            f"AND {_try_cast(src, duck)} IS NULL)"
+            for src, _, duck in typed
+        )
+        row = conn.execute(f"SELECT {counts} FROM {read}").fetchone()
+        return {out: int(n) for (_, out, _), n in zip(typed, row, strict=True)}
+
+    # -- Polars engine --
+
+    def _polars_convert(
+        self,
+        data: pl.DataFrame | pl.LazyFrame,
+        src: Path | None,
+        target: Path,
+        key: str,
+        digest: str | None,
+        staging: Path,
+        contract: DataContract | None,
+        converter: str,
+    ) -> LakeWriteResult:
+        meta = self._metadata(key, src, digest, contract, converter)
+        target.mkdir(parents=True, exist_ok=True)
+        if self.max_part_bytes is None:
+            tmp_out = target / f"{key}.parquet{TMP_SUFFIX}"
+            try:
+                if isinstance(data, pl.LazyFrame):
+                    data.sink_parquet(tmp_out, compression="zstd", metadata=meta)
+                else:
+                    data.write_parquet(tmp_out, compression="zstd", metadata=meta)
+                rows = pq.ParquetFile(tmp_out).metadata.num_rows
+                outputs = self._publish(target, key, [tmp_out])
+            except BaseException:
+                tmp_out.unlink(missing_ok=True)
+                raise
+        else:
+            frame = data.collect() if isinstance(data, pl.LazyFrame) else data
+            rows = frame.height
+            chunks = max(1, math.ceil(frame.estimated_size() / self.max_part_bytes))
+            size = max(1, math.ceil(rows / chunks))
+            staged = []
+            for i, offset in enumerate(range(0, max(rows, 1), size)):
+                path = staging / f"part-{i:03d}.parquet"
+                frame.slice(offset, size).write_parquet(
+                    path, compression="zstd", metadata=meta
+                )
+                staged.append(path)
+            outputs = self._publish(target, key, staged)
+        return LakeWriteResult(src, outputs, "converted", int(rows))
+
+
+# --- readers ---------------------------------------------------------------------
+
+
+def scan_dataset(dataset_dir: Path) -> pl.LazyFrame:
+    """Lazily read a dataset with Hive partitions as columns.
+
+    Partition columns take the types declared in ``_dataset.json`` (so
+    ``mes=09`` stays ``"09"`` when declared ``varchar``); without a readable
+    descriptor Polars infers them.
+    """
+    dataset_dir = Path(dataset_dir)
+    kwargs: dict[str, Any] = {}
+    try:
+        descriptor = DatasetDescriptor.load(dataset_dir)
+    except (OSError, ValueError):
+        descriptor = None
+    if descriptor is not None and descriptor.partition_keys:
+        kwargs["hive_schema"] = {
+            key: _partition_type(key, declared)[1]
+            for key, declared in _declared_types(descriptor).items()
+        }
+    return pl.scan_parquet(
+        dataset_dir / "**/*.parquet", hive_partitioning=True, **kwargs
+    )
+
+
+def duckdb_view_sql(dataset_dir: Path, view_name: str | None = None) -> str:
+    """``CREATE OR REPLACE VIEW`` over a dataset, typed by its descriptor.
+
+    The view is named ``view_name`` or the descriptor's ``alias``, and reads
+    ``read_parquet('<dataset>/**/*.parquet', hive_partitioning = true,
+    hive_types = {...})`` with the declared partition types.
+    """
+    dataset_dir = Path(dataset_dir)
+    descriptor = DatasetDescriptor.load(dataset_dir)
+    name = view_name or descriptor.alias
+    options = ["hive_partitioning = true"]
+    if descriptor.partition_keys:
+        types = ", ".join(
+            f"{_lit(key)}: {_lit(_partition_type(key, declared)[0])}"
+            for key, declared in _declared_types(descriptor).items()
+        )
+        options.append(f"hive_types = {{{types}}}")
+    glob = _lit(str(dataset_dir / "**/*.parquet"))
+    return (
+        f"CREATE OR REPLACE VIEW {_ident(name)} AS\n"
+        f"SELECT * FROM read_parquet({glob}, {', '.join(options)});"
+    )
+
+
+# --- conformance checker ------------------------------------------------------------
+
+
+def check_dataset(dataset_dir: Path) -> list[str]:
+    """Verify a dataset against the lake contract; ``[]`` means conforming.
+
+    Checks, in order: ``_dataset.json`` loads; directory names are Hive
+    ``k=v`` following the descriptor's keys; Parquet names are
+    ``<file_key>[-NNN].parquet`` with contiguous parts; required ``quantilica.*``
+    footer metadata is present and consistent with the descriptor; partition
+    columns are not stored inside the files; and DuckDB, Polars and PyArrow
+    read the same number of rows with the declared partition types.
+    """
+    dataset_dir = Path(dataset_dir)
+    try:
+        descriptor = DatasetDescriptor.load(dataset_dir)
+    except FileNotFoundError:
+        return [f"{DESCRIPTOR_FILENAME} not found in {dataset_dir}"]
+    except (OSError, ValueError, TypeError) as exc:
+        return [f"{DESCRIPTOR_FILENAME} is invalid: {exc}"]
+
+    errors = _check_descriptor(descriptor)
+    files, layout_errors = _check_layout(dataset_dir, descriptor)
+    errors += layout_errors
+    errors += _check_footers(dataset_dir, descriptor, files)
+    if errors or not files:
+        return errors
+    return _check_readers(dataset_dir, descriptor, files)
+
+
+def _check_descriptor(descriptor: DatasetDescriptor) -> list[str]:
+    errors = []
+    if descriptor.layout_version != LAYOUT_VERSION:
+        errors.append(
+            f"layout_version {descriptor.layout_version} is not supported "
+            f"(expected {LAYOUT_VERSION})"
+        )
+    stray = sorted(set(descriptor.partition_types) - set(descriptor.partition_keys))
+    if stray:
+        errors.append(f"partition_types declares keys that are not partitions: {stray}")
+    for key, declared in _declared_types(descriptor).items():
+        try:
+            _partition_type(key, declared)
+        except LakeError as exc:
+            errors.append(str(exc))
+    return errors
+
+
+def _check_layout(
+    dataset_dir: Path, descriptor: DatasetDescriptor
+) -> tuple[list[Path], list[str]]:
+    errors: list[str] = []
+    files: list[Path] = []
+    expected = descriptor.partition_keys
+
+    def walk(directory: Path, depth: int) -> None:
+        for entry in sorted(directory.iterdir()):
+            rel = entry.relative_to(dataset_dir)
+            if entry.name.startswith("."):  # .lock, .tmp
+                continue
+            if entry.is_dir():
+                match = _PARTITION_DIR.match(entry.name)
+                if match is None:
+                    errors.append(f"{rel}: not a valid Hive 'key=value' directory")
+                    continue
+                if depth >= len(expected) or match["key"] != expected[depth]:
+                    want = expected[depth] if depth < len(expected) else "a file"
+                    errors.append(f"{rel}: expected {want} at level {depth + 1}")
+                    continue
+                walk(entry, depth + 1)
+            elif directory == dataset_dir and entry.name == DESCRIPTOR_FILENAME:
+                continue
+            elif entry.suffix == ".parquet" and _PART_NAME.match(entry.name):
+                if depth != len(expected):
+                    errors.append(f"{rel}: expected {len(expected)} partition levels")
+                else:
+                    files.append(entry)
+            else:
+                errors.append(f"{rel}: unexpected file (want <file_key>[-NNN].parquet)")
+
+    walk(dataset_dir, 0)
+
+    by_key: dict[tuple[Path, str], list[str | None]] = {}
+    for path in files:
+        match = _PART_NAME.match(path.name)
+        key = match["key"]
+        if file_key(key) != key:
+            errors.append(
+                f"{path.relative_to(dataset_dir)}: file key {key!r} keeps a raw "
+                "extension or @date suffix"
+            )
+        by_key.setdefault((path.parent, key), []).append(match["part"])
+    for (directory, key), parts in by_key.items():
+        where = directory.relative_to(dataset_dir) / key
+        if None in parts and len(parts) > 1:
+            errors.append(f"{where}: mixes an unsplit file with numbered parts")
+        elif None not in parts and sorted(int(p) for p in parts) != list(
+            range(1, len(parts) + 1)
+        ):
+            errors.append(f"{where}: part numbers are not contiguous from 001")
+    return files, errors
+
+
+def _check_footers(
+    dataset_dir: Path, descriptor: DatasetDescriptor, files: list[Path]
+) -> list[str]:
+    errors = []
+    for path in files:
+        rel = path.relative_to(dataset_dir)
+        try:
+            columns = pq.ParquetFile(path).schema_arrow.names
+        except (OSError, pa.ArrowException) as exc:
+            errors.append(f"{rel}: unreadable Parquet ({exc})")
+            continue
+        meta = _footer(path)
+        missing = [k for k in REQUIRED_METADATA if k not in meta]
+        if missing:
+            errors.append(f"{rel}: missing metadata {missing}")
+        expectations = {
+            META_LAYOUT: str(descriptor.layout_version),
+            "quantilica.source_id": descriptor.source_id,
+            "quantilica.dataset_id": descriptor.dataset_id,
+            META_FILE_KEY: _PART_NAME.match(path.name)["key"],
+        }
+        if descriptor.contract_id is not None:
+            expectations[META_CONTRACT_ID] = descriptor.contract_id
+        for name, want in expectations.items():
+            if name in meta and meta[name] != want:
+                errors.append(f"{rel}: {name} is {meta[name]!r}, expected {want!r}")
+        inside = sorted(set(descriptor.partition_keys) & set(columns))
+        if inside:
+            errors.append(f"{rel}: partition columns stored inside the file: {inside}")
+    return errors
+
+
+def _check_readers(
+    dataset_dir: Path, descriptor: DatasetDescriptor, files: list[Path]
+) -> list[str]:
+    import duckdb
+
+    errors: list[str] = []
+    expected_rows = sum(pq.ParquetFile(p).metadata.num_rows for p in files)
+    declared = _declared_types(descriptor)
+    counts: dict[str, int] = {}
+
+    # DuckDB, through the same view the consumers create.
+    try:
+        conn = duckdb.connect()
+        conn.execute(duckdb_view_sql(dataset_dir, "_lake_check"))
+        counts["duckdb"] = conn.execute("SELECT count(*) FROM _lake_check").fetchone()[
+            0
+        ]
+        described = {
+            r[0]: r[1].upper()
+            for r in conn.execute("DESCRIBE SELECT * FROM _lake_check").fetchall()
+        }
+        for key, declared_type in declared.items():
+            want = _partition_type(key, declared_type)[0]
+            if described.get(key) != want:
+                got = described.get(key)
+                errors.append(f"duckdb: partition {key!r} is {got}, expected {want}")
+    except Exception as exc:
+        errors.append(f"duckdb cannot read the dataset: {exc}")
+
+    # Polars, through scan_dataset.
+    try:
+        lazy = scan_dataset(dataset_dir)
+        counts["polars"] = lazy.select(pl.len()).collect().item()
+        schema = lazy.collect_schema()
+        for key, declared_type in declared.items():
+            want = _partition_type(key, declared_type)[1]
+            if schema.get(key) != want:
+                errors.append(
+                    f"polars: partition {key!r} is {schema.get(key)}, expected {want}"
+                )
+    except Exception as exc:
+        errors.append(f"polars cannot read the dataset: {exc}")
+
+    # PyArrow, with the declared partition schema.
+    try:
+        partitioning = None
+        if declared:
+            partitioning = pa_ds.partitioning(
+                pa.schema(
+                    [(key, _partition_type(key, t)[2]) for key, t in declared.items()]
+                ),
+                flavor="hive",
+            )
+        dataset = pa_ds.dataset(
+            dataset_dir, format="parquet", partitioning=partitioning
+        )
+        counts["pyarrow"] = dataset.count_rows()
+        for key, declared_type in declared.items():
+            want = _partition_type(key, declared_type)[2]
+            got = dataset.schema.field(key).type
+            if got != want:
+                errors.append(f"pyarrow: partition {key!r} is {got}, expected {want}")
+    except Exception as exc:
+        errors.append(f"pyarrow cannot read the dataset: {exc}")
+
+    for reader, count in counts.items():
+        if count != expected_rows:
+            errors.append(
+                f"{reader} reads {count} rows, the Parquet footers add up to "
+                f"{expected_rows}"
+            )
+    return errors

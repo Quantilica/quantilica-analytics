@@ -12,6 +12,14 @@ from .geo import (
     mun_6_to_7,
     mun_7_to_6,
 )
+from .lake import (
+    LakeError,
+    LakeWriter,
+    LakeWriteResult,
+    check_dataset,
+    duckdb_view_sql,
+    scan_dataset,
+)
 from .reader import (
     DEFAULT_BR_NA,
     SmartReader,
@@ -34,9 +42,14 @@ __all__ = [
     "DataContract",
     "Field",
     "IBGE_DV_EXCEPTIONS",
+    "LakeError",
+    "LakeWriteResult",
+    "LakeWriter",
     "SmartReader",
     "__version__",
     "calc_ibge_dv",
+    "check_dataset",
+    "duckdb_view_sql",
     "get_dim_geo",
     "get_dim_uf",
     "manifest_to_metadata",
@@ -44,5 +57,6 @@ __all__ = [
     "mun_7_to_6",
     "normalize_brazilian_numbers",
     "read_brazilian_csv",
+    "scan_dataset",
     "to_parquet",
 ]
