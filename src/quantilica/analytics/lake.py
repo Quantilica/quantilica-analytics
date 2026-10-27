@@ -262,6 +262,8 @@ def _read_csv_sql(
     encoding: str,
     header: bool,
     names: tuple[str, ...],
+    quote: str | None = None,
+    escape: str | None = None,
 ) -> str:
     args = [
         "[" + ", ".join(_lit(str(f)) for f in files) + "]",
@@ -272,6 +274,10 @@ def _read_csv_sql(
         "null_padding=true",
         "strict_mode=false",
     ]
+    if quote is not None:
+        args.append(f"quote={_lit(quote)}")
+    if escape is not None:
+        args.append(f"escape={_lit(escape)}")
     if not header:
         args.append("names=[" + ", ".join(_lit(n) for n in names) + "]")
     return f"read_csv({', '.join(args)})"
@@ -412,11 +418,15 @@ class LakeWriter:
         required: tuple[str, ...] = (),
         contract: DataContract | None = None,
         converter: str = "quantilica-analytics",
+        quote: str | None = None,
+        escape: str | None = None,
     ) -> LakeWriteResult:
         """Convert a CSV/TXT (or the members of a ZIP/7z) with DuckDB, streaming.
 
         Columns are read as text, named from the header (normalized, then
-        ``rename``) or from ``names`` when ``header`` is false. ``required``
+        ``rename``) or from ``names`` when ``header`` is false. ``quote`` and
+        ``escape`` fix DuckDB's CSV dialect; ``None`` keeps its auto-detection,
+        which can pick ``'`` as the escape of a file quoted with ``"``. ``required``
         columns missing from the header raise :class:`LakeError` before
         anything is written, which rejects an HTML error page saved as CSV.
         Columns typed by ``contract`` go through ``TRY_CAST``; the failures
@@ -452,6 +462,8 @@ class LakeWriter:
                     required=required,
                     contract=contract,
                     converter=converter,
+                    quote=quote,
+                    escape=escape,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -649,6 +661,8 @@ class LakeWriter:
         required: tuple[str, ...],
         contract: DataContract | None,
         converter: str,
+        quote: str | None = None,
+        escape: str | None = None,
     ) -> LakeWriteResult:
         conn = _connect(staging)
         try:
@@ -659,6 +673,8 @@ class LakeWriter:
                 encoding=encoding,
                 header=header,
                 names=names,
+                quote=quote,
+                escape=escape,
             )
             columns = self._columns(conn, read, header, names, rename, required)
             partition_keys = set(self.descriptor.partition_keys) | set(

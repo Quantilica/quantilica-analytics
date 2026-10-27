@@ -5,6 +5,12 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Unreleased]
+
+### Adicionado
+- `LakeWriter.write_duckdb` aceita `quote` e `escape` para fixar o dialeto do CSV.
+  Sem eles (padrão), o DuckDB segue detectando o dialeto sozinho.
+
 ## [0.5.0] - 2026-10-27
 
 ### Adicionado

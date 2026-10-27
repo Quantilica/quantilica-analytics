@@ -152,6 +152,30 @@ def test_duckdb_headerless_with_names(tmp_path, dataset_dir):
     assert df["codigo"].to_list() == ["0111", "0112"]  # text keeps leading zeros
 
 
+def test_duckdb_explicit_quote_and_escape(tmp_path, dataset_dir):
+    # Formato da Receita: tudo entre aspas duplas, apóstrofo literal no texto e
+    # aspas internas dobradas. Com quote/escape fixos, nada depende da detecção.
+    descriptor = DatasetDescriptor("rfb", "empresas", "empresas")
+    src = tmp_path / "K3241.EMPRECSV.csv"
+    src.write_text(
+        '"00000001";"D\'AGUA LTDA";"2062"\n"00000002";"BAR ""DO ZE"" O\'NEIL";"2135"\n',
+        encoding="latin-1",
+    )
+
+    result = LakeWriter(dataset_dir, descriptor).write_duckdb(
+        src,
+        header=False,
+        names=("cnpj_basico", "razao_social", "natureza_juridica"),
+        encoding="latin-1",
+        quote='"',
+        escape='"',
+    )
+
+    df = pl.read_parquet(result.output)
+    assert df["razao_social"].to_list() == ["D'AGUA LTDA", 'BAR "DO ZE" O\'NEIL']
+    assert df["natureza_juridica"].to_list() == ["2062", "2135"]
+
+
 def test_duckdb_headerless_requires_names(tmp_path, dataset_dir):
     src = tmp_path / "a.csv"
     src.write_text("1;2\n", encoding="utf-8")
