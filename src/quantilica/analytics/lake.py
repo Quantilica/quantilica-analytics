@@ -56,6 +56,9 @@ logger = logging.getLogger("quantilica.analytics.lake")
 TMP_DIRNAME = ".tmp"
 TMP_SUFFIX = ".tmp"
 TEXT_SUFFIXES = frozenset({".csv", ".txt"})
+# Diretório opcional para a extração de ZIP/7z e o temporário do DuckDB. Sem ele,
+# ambos ficam no staging do dataset, no mesmo disco do lake.
+LAKE_SCRATCH_ENV = "QUANTILICA_LAKE_SCRATCH"
 _LATIN1 = frozenset({"latin-1", "latin1", "iso-8859-1", "iso8859-1", "l1"})
 _C1_BYTES = re.compile(rb"[\x80-\x9f]")
 
@@ -227,6 +230,16 @@ def _try_cast(column: str, duck: str) -> str:
     empty fields are already null) keeps the cast in the query plan.
     """
     return f"TRY_CAST(NULLIF({_ident(column)}, '') AS {duck})"
+
+
+def _scratch_dir(staging: Path) -> Path:
+    """Work directory for extraction: a fresh one under ``QUANTILICA_LAKE_SCRATCH``
+    when set, else ``staging`` itself."""
+    base = os.environ.get(LAKE_SCRATCH_ENV)
+    if not base:
+        return staging
+    Path(base).mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(dir=base))
 
 
 def _materialize(src: Path, tmp: Path) -> list[Path]:
@@ -464,7 +477,10 @@ class LakeWriter:
         which can pick ``'`` as the escape of a file quoted with ``"``.
         ``parallel=False`` reads with a single thread, which DuckDB requires for
         quoted fields spanning lines. Latin-1 input with C1 bytes (0x80-0x9F),
-        which DuckDB's decoder rejects, is first transcoded to UTF-8. ``required``
+        which DuckDB's decoder rejects, is first transcoded to UTF-8.
+        ``QUANTILICA_LAKE_SCRATCH`` moves the archive extraction and DuckDB's
+        temporary files to another directory (a faster disk, say); the Parquet
+        output is still staged next to the dataset and published by rename. ``required``
         columns missing from the header raise :class:`LakeError` before
         anything is written, which rejects an HTML error page saved as CSV.
         Columns typed by ``contract`` go through ``TRY_CAST``; the failures
@@ -726,11 +742,12 @@ class LakeWriter:
         escape: str | None = None,
         parallel: bool = True,
     ) -> LakeWriteResult:
-        conn = _connect(staging)
+        scratch = _scratch_dir(staging)
+        conn = _connect(scratch)
         try:
-            files = _materialize(src, staging / "raw")
+            files = _materialize(src, scratch / "raw")
             if encoding.lower() in _LATIN1 and any(map(_has_c1_bytes, files)):
-                files = _latin1_to_utf8(files, staging / "utf8")
+                files = _latin1_to_utf8(files, scratch / "utf8")
                 encoding = "utf-8"
             read = _read_csv_sql(
                 files,
@@ -805,6 +822,8 @@ class LakeWriter:
                     outputs = self._publish(target, key, staged)
         finally:
             conn.close()
+            if scratch != staging:
+                shutil.rmtree(scratch, ignore_errors=True)
         return LakeWriteResult(src, outputs, "converted", int(rows or 0), cast_nulls)
 
     def _columns(

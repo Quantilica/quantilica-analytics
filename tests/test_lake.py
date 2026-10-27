@@ -229,6 +229,34 @@ def test_is_current_tracks_the_written_sha(tmp_path, dataset_dir, descriptor):
     assert not writer.is_current(src, partitions=partitions)
 
 
+def test_duckdb_scratch_dir_holds_the_extraction(
+    tmp_path, dataset_dir, descriptor, monkeypatch
+):
+    from quantilica.analytics import lake as lake_module
+
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
+    seen = []
+    original = lake_module._materialize
+
+    def spy(src, tmp):
+        seen.append(tmp)
+        return original(src, tmp)
+
+    monkeypatch.setattr(lake_module, "_materialize", spy)
+    src = tmp_path / "dados@20260101.zip"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("dados.csv", CSV_LATIN1)
+
+    result = LakeWriter(dataset_dir, descriptor).write_duckdb(
+        src, encoding="latin-1", partitions={"ano": "2026", "mes": "01"}
+    )
+
+    assert seen and seen[0].is_relative_to(scratch)
+    assert list(scratch.iterdir()) == []  # extraction removed after the write
+    assert pl.read_parquet(result.output).height == 2
+
+
 def test_duckdb_headerless_requires_names(tmp_path, dataset_dir):
     src = tmp_path / "a.csv"
     src.write_text("1;2\n", encoding="utf-8")

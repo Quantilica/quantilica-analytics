@@ -12,6 +12,9 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   Sem eles (padrão), o DuckDB segue detectando o dialeto sozinho.
 - `LakeWriter.is_current(src, partitions=...)` informa se o arquivo já está no lake com o
   mesmo `sha256`, para o conversor pular uma leitura cara antes de fazê-la.
+- Variável `QUANTILICA_LAKE_SCRATCH`: quando definida, a extração de ZIP/7z e o
+  temporário do DuckDB vão para esse diretório em vez do staging do dataset; o Parquet
+  continua sendo montado ao lado do dataset e publicado por renomeação.
 - `LakeWriter.write_duckdb` aceita `parallel=False` para ler com uma só thread, exigido
   pelo DuckDB quando há campos entre aspas com quebra de linha.
 
