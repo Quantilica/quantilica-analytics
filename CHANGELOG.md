@@ -10,6 +10,13 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ### Adicionado
 - `LakeWriter.write_duckdb` aceita `quote` e `escape` para fixar o dialeto do CSV.
   Sem eles (padrão), o DuckDB segue detectando o dialeto sozinho.
+- `LakeWriter.write_duckdb` aceita `parallel=False` para ler com uma só thread, exigido
+  pelo DuckDB quando há campos entre aspas com quebra de linha.
+
+### Corrigido
+- `write_duckdb` converte para UTF-8, antes da leitura, a entrada Latin-1 que contém
+  bytes entre 0x80 e 0x9F. O decodificador `latin-1` do DuckDB rejeita esses bytes
+  ("File is not latin-1 encoded"), embora sejam válidos em Latin-1.
 
 ## [0.5.0] - 2026-10-27
 

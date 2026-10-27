@@ -56,6 +56,8 @@ logger = logging.getLogger("quantilica.analytics.lake")
 TMP_DIRNAME = ".tmp"
 TMP_SUFFIX = ".tmp"
 TEXT_SUFFIXES = frozenset({".csv", ".txt"})
+_LATIN1 = frozenset({"latin-1", "latin1", "iso-8859-1", "iso8859-1", "l1"})
+_C1_BYTES = re.compile(rb"[\x80-\x9f]")
 
 META_ORIGIN_SHA = "quantilica.origin_sha256"
 META_LAYOUT = "quantilica.lake.layout_version"
@@ -255,6 +257,35 @@ def _materialize(src: Path, tmp: Path) -> list[Path]:
     return files
 
 
+def _has_c1_bytes(path: Path) -> bool:
+    """Whether ``path`` holds a byte in 0x80-0x9F (a C1 control in Latin-1)."""
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 24):
+            if _C1_BYTES.search(chunk):
+                return True
+    return False
+
+
+def _latin1_to_utf8(files: list[Path], tmp: Path) -> list[Path]:
+    """UTF-8 copies of Latin-1 ``files``.
+
+    DuckDB's ``latin-1`` decoder rejects C1 bytes (0x80-0x9F) with "File is
+    not latin-1 encoded", although Latin-1 maps every byte; Python's codec
+    reads them as the control characters U+0080-U+009F.
+    """
+    tmp.mkdir(parents=True, exist_ok=True)
+    out = []
+    for i, src in enumerate(files):
+        dst = tmp / f"{i:04d}-{src.name}"
+        with (
+            open(src, encoding="latin-1", newline="") as reader,
+            open(dst, "w", encoding="utf-8", newline="") as writer,
+        ):
+            shutil.copyfileobj(reader, writer, 1 << 24)
+        out.append(dst)
+    return out
+
+
 def _read_csv_sql(
     files: list[Path],
     *,
@@ -264,6 +295,7 @@ def _read_csv_sql(
     names: tuple[str, ...],
     quote: str | None = None,
     escape: str | None = None,
+    parallel: bool = True,
 ) -> str:
     args = [
         "[" + ", ".join(_lit(str(f)) for f in files) + "]",
@@ -278,6 +310,8 @@ def _read_csv_sql(
         args.append(f"quote={_lit(quote)}")
     if escape is not None:
         args.append(f"escape={_lit(escape)}")
+    if not parallel:
+        args.append("parallel=false")
     if not header:
         args.append("names=[" + ", ".join(_lit(n) for n in names) + "]")
     return f"read_csv({', '.join(args)})"
@@ -420,13 +454,17 @@ class LakeWriter:
         converter: str = "quantilica-analytics",
         quote: str | None = None,
         escape: str | None = None,
+        parallel: bool = True,
     ) -> LakeWriteResult:
         """Convert a CSV/TXT (or the members of a ZIP/7z) with DuckDB, streaming.
 
         Columns are read as text, named from the header (normalized, then
         ``rename``) or from ``names`` when ``header`` is false. ``quote`` and
         ``escape`` fix DuckDB's CSV dialect; ``None`` keeps its auto-detection,
-        which can pick ``'`` as the escape of a file quoted with ``"``. ``required``
+        which can pick ``'`` as the escape of a file quoted with ``"``.
+        ``parallel=False`` reads with a single thread, which DuckDB requires for
+        quoted fields spanning lines. Latin-1 input with C1 bytes (0x80-0x9F),
+        which DuckDB's decoder rejects, is first transcoded to UTF-8. ``required``
         columns missing from the header raise :class:`LakeError` before
         anything is written, which rejects an HTML error page saved as CSV.
         Columns typed by ``contract`` go through ``TRY_CAST``; the failures
@@ -464,6 +502,7 @@ class LakeWriter:
                     converter=converter,
                     quote=quote,
                     escape=escape,
+                    parallel=parallel,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -663,10 +702,14 @@ class LakeWriter:
         converter: str,
         quote: str | None = None,
         escape: str | None = None,
+        parallel: bool = True,
     ) -> LakeWriteResult:
         conn = _connect(staging)
         try:
             files = _materialize(src, staging / "raw")
+            if encoding.lower() in _LATIN1 and any(map(_has_c1_bytes, files)):
+                files = _latin1_to_utf8(files, staging / "utf8")
+                encoding = "utf-8"
             read = _read_csv_sql(
                 files,
                 separator=separator,
@@ -675,6 +718,7 @@ class LakeWriter:
                 names=names,
                 quote=quote,
                 escape=escape,
+                parallel=parallel,
             )
             columns = self._columns(conn, read, header, names, rename, required)
             partition_keys = set(self.descriptor.partition_keys) | set(

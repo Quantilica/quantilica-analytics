@@ -176,6 +176,41 @@ def test_duckdb_explicit_quote_and_escape(tmp_path, dataset_dir):
     assert df["natureza_juridica"].to_list() == ["2062", "2135"]
 
 
+def test_duckdb_latin1_with_c1_bytes(tmp_path, dataset_dir):
+    # 0x8F é válido em Latin-1 (controle C1), mas o decodificador do DuckDB o
+    # rejeita; o arquivo é convertido para UTF-8 antes da leitura.
+    descriptor = DatasetDescriptor("rfb", "estabelecimentos", "estabelecimentos")
+    src = tmp_path / "K3241.ESTABELE.csv"
+    src.write_bytes(b'"1";"RUA S\xc3O\x8fJOS\xc9"\n"2";"CAF\xc9"\n')
+
+    result = LakeWriter(dataset_dir, descriptor).write_duckdb(
+        src, header=False, names=("id", "logradouro"), encoding="latin-1"
+    )
+
+    df = pl.read_parquet(result.output)
+    assert df["logradouro"].to_list() == ["RUA SÃO\x8fJOSÉ", "CAFÉ"]
+
+
+def test_duckdb_quoted_newline_without_parallel(tmp_path, dataset_dir):
+    descriptor = DatasetDescriptor("rfb", "estabelecimentos", "estabelecimentos")
+    src = tmp_path / "K3241.ESTABELE.csv"
+    src.write_text('"1";"ANDAR 16\nSALA 2";"SP"\n"2";"";"RJ"\n', encoding="latin-1")
+
+    result = LakeWriter(dataset_dir, descriptor).write_duckdb(
+        src,
+        header=False,
+        names=("id", "complemento", "uf"),
+        encoding="latin-1",
+        quote='"',
+        escape='"',
+        parallel=False,
+    )
+
+    df = pl.read_parquet(result.output)
+    assert df["complemento"].to_list() == ["ANDAR 16\nSALA 2", None]
+    assert df["uf"].to_list() == ["SP", "RJ"]
+
+
 def test_duckdb_headerless_requires_names(tmp_path, dataset_dir):
     src = tmp_path / "a.csv"
     src.write_text("1;2\n", encoding="utf-8")
