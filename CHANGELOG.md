@@ -10,6 +10,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ### Adicionado
 - `LakeWriter.write_duckdb` aceita `quote` e `escape` para fixar o dialeto do CSV.
   Sem eles (padrão), o DuckDB segue detectando o dialeto sozinho.
+- `LakeWriter.is_current(src, partitions=...)` informa se o arquivo já está no lake com o
+  mesmo `sha256`, para o conversor pular uma leitura cara antes de fazê-la.
 - `LakeWriter.write_duckdb` aceita `parallel=False` para ler com uma só thread, exigido
   pelo DuckDB quando há campos entre aspas com quebra de linha.
 

@@ -211,6 +211,24 @@ def test_duckdb_quoted_newline_without_parallel(tmp_path, dataset_dir):
     assert df["uf"].to_list() == ["SP", "RJ"]
 
 
+def test_is_current_tracks_the_written_sha(tmp_path, dataset_dir, descriptor):
+    src = tmp_path / "dados@20260101.csv"
+    src.write_bytes(CSV_LATIN1)
+    kwargs = dict(encoding="latin-1", partitions={"ano": "2026", "mes": "01"})
+    writer = LakeWriter(dataset_dir, descriptor)
+    partitions = kwargs["partitions"]
+
+    assert not writer.is_current(src, partitions=partitions)
+    writer.write_duckdb(src, **kwargs)
+    assert writer.is_current(src, partitions=partitions)
+    assert not LakeWriter(dataset_dir, descriptor, force=True).is_current(
+        src, partitions=partitions
+    )
+
+    src.write_bytes(CSV_LATIN1 + "Bauru;30\n".encode("latin-1"))
+    assert not writer.is_current(src, partitions=partitions)
+
+
 def test_duckdb_headerless_requires_names(tmp_path, dataset_dir):
     src = tmp_path / "a.csv"
     src.write_text("1;2\n", encoding="utf-8")

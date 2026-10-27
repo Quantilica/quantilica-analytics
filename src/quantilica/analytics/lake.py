@@ -510,6 +510,28 @@ class LakeWriter:
         logger.info("lake: %s -> %s (%d rows)", src.name, target, result.rows)
         return result
 
+    def is_current(
+        self,
+        src: Path,
+        *,
+        partitions: dict[str, Any] | None = None,
+        contract: DataContract | None = None,
+    ) -> bool:
+        """Whether ``src`` is already in the lake with its current ``sha256``.
+
+        The same test the writers run before writing, exposed so a converter
+        can skip an expensive read (a DBC decode, say) for a file that would be
+        skipped anyway. Always ``False`` with ``force``.
+        """
+        if self.force:
+            return False
+        src = Path(src)
+        target = self._target(dict(partitions or {}))
+        skipped = self._skip_if_current(
+            target, file_key(src), src, sha256_file(src), contract
+        )
+        return skipped is not None
+
     def write_polars(
         self,
         data: pl.DataFrame | pl.LazyFrame,
