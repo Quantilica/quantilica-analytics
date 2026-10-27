@@ -1,6 +1,6 @@
 [project]
 name = "quantilica-analytics"
-version = "0.4.0"
+version = "0.5.0"
 description = "Analytical data processing and conversion layer for Quantilica"
 readme = "README.md"
 authors = [
