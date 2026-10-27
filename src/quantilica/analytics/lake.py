@@ -297,10 +297,11 @@ def _part_files(directory: Path, key: str) -> list[Path]:
     """Parquet files in ``directory`` that belong to ``key`` (by footer)."""
     if not directory.is_dir():
         return []
+    pattern = re.compile(rf"^{re.escape(key)}(?:-(\d{{3}}))?\.parquet$")
     found = []
     for path in sorted(directory.glob("*.parquet")):
-        match = _PART_NAME.match(path.name)
-        if match and match["key"] == key and _footer(path).get(META_FILE_KEY) == key:
+        match = pattern.match(path.name)
+        if match and _footer(path).get(META_FILE_KEY) == key:
             found.append(path)
     return found
 
@@ -322,7 +323,11 @@ def origin_matches(
     parts = _part_files(directory, key)
     if not parts:
         return False
-    numbers = [_PART_NAME.match(p.name)["part"] for p in parts]
+    pattern = re.compile(rf"^{re.escape(key)}(?:-(\d{{3}}))?\.parquet$")
+    numbers = []
+    for p in parts:
+        m = pattern.match(p.name)
+        numbers.append(m.group(1) if m else None)
     if numbers == [None]:
         pass
     elif None in numbers or [int(n) for n in numbers] != list(
@@ -493,7 +498,15 @@ class LakeWriter:
             staging = self._staging_dir()
             try:
                 result = self._polars_convert(
-                    data, src, target, key, digest, staging, contract, converter
+                    data,
+                    src,
+                    target,
+                    key,
+                    digest,
+                    staging,
+                    contract,
+                    converter,
+                    partitions=partitions,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -648,10 +661,26 @@ class LakeWriter:
                 names=names,
             )
             columns = self._columns(conn, read, header, names, rename, required)
+            partition_keys = set(self.descriptor.partition_keys) | set(
+                partitions.keys()
+            )
+            if partition_keys:
+                columns = [
+                    (src_col, out_col)
+                    for src_col, out_col in columns
+                    if out_col not in partition_keys
+                ]
+            if not columns:
+                raise LakeError(
+                    "No payload columns left to write after dropping partition "
+                    f"keys {partition_keys}"
+                )
             cast_nulls: dict[str, int] = {}
-            select = self._select_list(columns, contract)
+            select = self._select_list(columns, contract, partition_keys=partition_keys)
             if contract is not None:
-                cast_nulls = self._count_cast_nulls(conn, read, columns, contract)
+                cast_nulls = self._count_cast_nulls(
+                    conn, read, columns, contract, partition_keys=partition_keys
+                )
             meta = self._metadata(key, src, digest, contract, converter)
             if cast_nulls:
                 meta[META_CAST_NULLS] = json.dumps(cast_nulls, sort_keys=True)
@@ -660,7 +689,7 @@ class LakeWriter:
             query = f"SELECT {select} FROM {read}"
             target.mkdir(parents=True, exist_ok=True)
             if self.max_part_bytes is None:
-                tmp_out = target / f"{key}.parquet{TMP_SUFFIX}"
+                tmp_out = staging / f"{key}.parquet{TMP_SUFFIX}"
                 try:
                     rows = conn.execute(
                         f"COPY ({query}) TO {_lit(str(tmp_out))} ({options})"
@@ -670,20 +699,28 @@ class LakeWriter:
                     tmp_out.unlink(missing_ok=True)
                     raise
             else:
-                out_dir = staging / "parts"
-                rows = conn.execute(
-                    f"COPY ({query}) TO {_lit(str(out_dir))} "
-                    f"({options}, FILE_SIZE_BYTES {self.max_part_bytes})"
-                ).fetchone()[0]
-                staged = sorted(
-                    out_dir.glob("*.parquet"),
-                    key=lambda p: int(_DUCKDB_PART_FILE.search(p.stem).group(1)),
-                )
-                if not staged:  # empty input: still publish one (empty) file
-                    tmp_out = staging / f"{key}.parquet"
-                    conn.execute(f"COPY ({query}) TO {_lit(str(tmp_out))} ({options})")
-                    staged = [tmp_out]
-                outputs = self._publish(target, key, staged)
+                with tempfile.TemporaryDirectory() as duck_tmp:
+                    out_dir = Path(duck_tmp) / "parts"
+                    rows = conn.execute(
+                        f"COPY ({query}) TO {_lit(str(out_dir))} "
+                        f"({options}, FILE_SIZE_BYTES {self.max_part_bytes})"
+                    ).fetchone()[0]
+                    raw_parts = sorted(
+                        out_dir.glob("*.parquet"),
+                        key=lambda p: int(_DUCKDB_PART_FILE.search(p.stem).group(1)),
+                    )
+                    staged = []
+                    for idx, raw_part in enumerate(raw_parts, 1):
+                        part_tmp = staging / f"{key}-{idx:03d}.parquet{TMP_SUFFIX}"
+                        shutil.move(str(raw_part), str(part_tmp))
+                        staged.append(part_tmp)
+                    if not staged:  # empty input: still publish one (empty) file
+                        tmp_out = staging / f"{key}.parquet{TMP_SUFFIX}"
+                        conn.execute(
+                            f"COPY ({query}) TO {_lit(str(tmp_out))} ({options})"
+                        )
+                        staged = [tmp_out]
+                    outputs = self._publish(target, key, staged)
         finally:
             conn.close()
         return LakeWriteResult(src, outputs, "converted", int(rows or 0), cast_nulls)
@@ -713,14 +750,19 @@ class LakeWriter:
 
     @staticmethod
     def _typed(
-        columns: list[tuple[str, str]], contract: DataContract | None
+        columns: list[tuple[str, str]],
+        contract: DataContract | None,
+        partition_keys: set[str] | None = None,
     ) -> list[tuple[str, str, str | None]]:
         """``(source, output, duckdb type or None)`` for each column."""
         types: dict[str, str] = {}
         if contract is not None:
             present = {out for _, out in columns}
+            ignored = partition_keys or set()
             absent = [
-                f.name for f in contract.fields if f.required and f.name not in present
+                f.name
+                for f in contract.fields
+                if f.required and f.name not in present and f.name not in ignored
             ]
             if absent:
                 raise LakeError(f"Contract {contract.dataset_id}: missing {absent}")
@@ -732,20 +774,32 @@ class LakeWriter:
         return [(src, out, types.get(out)) for src, out in columns]
 
     def _select_list(
-        self, columns: list[tuple[str, str]], contract: DataContract | None
+        self,
+        columns: list[tuple[str, str]],
+        contract: DataContract | None,
+        partition_keys: set[str] | None = None,
     ) -> str:
         parts = []
-        for src, out, duck in self._typed(columns, contract):
+        for src, out, duck in self._typed(
+            columns, contract, partition_keys=partition_keys
+        ):
             expr = _ident(src) if duck in (None, "VARCHAR") else _try_cast(src, duck)
             parts.append(f"{expr} AS {_ident(out)}")
         return ", ".join(parts)
 
     def _count_cast_nulls(
-        self, conn, read: str, columns: list[tuple[str, str]], contract: DataContract
+        self,
+        conn,
+        read: str,
+        columns: list[tuple[str, str]],
+        contract: DataContract,
+        partition_keys: set[str] | None = None,
     ) -> dict[str, int]:
         typed = [
             (src, out, duck)
-            for src, out, duck in self._typed(columns, contract)
+            for src, out, duck in self._typed(
+                columns, contract, partition_keys=partition_keys
+            )
             if duck not in (None, "VARCHAR")
         ]
         if not typed:
@@ -770,11 +824,35 @@ class LakeWriter:
         staging: Path,
         contract: DataContract | None,
         converter: str,
+        partitions: dict[str, Any] | None = None,
     ) -> LakeWriteResult:
+        partition_keys = set(self.descriptor.partition_keys)
+        if partitions:
+            partition_keys.update(partitions.keys())
+        if partition_keys:
+            if isinstance(data, pl.LazyFrame):
+                cols = set(data.collect_schema().names())
+                drop_cols = [c for c in partition_keys if c in cols]
+                if drop_cols:
+                    data = data.drop(drop_cols)
+            else:
+                drop_cols = [c for c in partition_keys if c in data.columns]
+                if drop_cols:
+                    data = data.drop(drop_cols)
+        remaining_cols = (
+            data.collect_schema().names()
+            if isinstance(data, pl.LazyFrame)
+            else data.columns
+        )
+        if not remaining_cols:
+            raise LakeError(
+                "No payload columns left to write after dropping partition "
+                f"keys {partition_keys}"
+            )
         meta = self._metadata(key, src, digest, contract, converter)
         target.mkdir(parents=True, exist_ok=True)
         if self.max_part_bytes is None:
-            tmp_out = target / f"{key}.parquet{TMP_SUFFIX}"
+            tmp_out = staging / f"{key}.parquet{TMP_SUFFIX}"
             try:
                 if isinstance(data, pl.LazyFrame):
                     data.sink_parquet(tmp_out, compression="zstd", metadata=meta)
@@ -791,8 +869,8 @@ class LakeWriter:
             chunks = max(1, math.ceil(frame.estimated_size() / self.max_part_bytes))
             size = max(1, math.ceil(rows / chunks))
             staged = []
-            for i, offset in enumerate(range(0, max(rows, 1), size)):
-                path = staging / f"part-{i:03d}.parquet"
+            for i, offset in enumerate(range(0, max(rows, 1), size), 1):
+                path = staging / f"{key}-{i:03d}.parquet{TMP_SUFFIX}"
                 frame.slice(offset, size).write_parquet(
                     path, compression="zstd", metadata=meta
                 )
@@ -935,14 +1013,28 @@ def _check_layout(
 
     by_key: dict[tuple[Path, str], list[str | None]] = {}
     for path in files:
-        match = _PART_NAME.match(path.name)
-        key = match["key"]
+        key = _footer(path).get(META_FILE_KEY)
+        part = None
+        if key:
+            key_pattern = re.compile(rf"^{re.escape(key)}(?:-(\d{{3}}))?\.parquet$")
+            m = key_pattern.match(path.name)
+            if m:
+                part = m.group(1)
+            else:
+                match = _PART_NAME.match(path.name)
+                key = match["key"] if match else path.stem
+                part = match["part"] if match else None
+        else:
+            match = _PART_NAME.match(path.name)
+            key = match["key"] if match else path.stem
+            part = match["part"] if match else None
+
         if file_key(key) != key:
             errors.append(
                 f"{path.relative_to(dataset_dir)}: file key {key!r} keeps a raw "
                 "extension or @date suffix"
             )
-        by_key.setdefault((path.parent, key), []).append(match["part"])
+        by_key.setdefault((path.parent, key), []).append(part)
     for (directory, key), parts in by_key.items():
         where = directory.relative_to(dataset_dir) / key
         if None in parts and len(parts) > 1:
@@ -969,17 +1061,26 @@ def _check_footers(
         missing = [k for k in REQUIRED_METADATA if k not in meta]
         if missing:
             errors.append(f"{rel}: missing metadata {missing}")
+        file_key_val = meta.get(META_FILE_KEY)
         expectations = {
             META_LAYOUT: str(descriptor.layout_version),
             "quantilica.source_id": descriptor.source_id,
             "quantilica.dataset_id": descriptor.dataset_id,
-            META_FILE_KEY: _PART_NAME.match(path.name)["key"],
         }
         if descriptor.contract_id is not None:
             expectations[META_CONTRACT_ID] = descriptor.contract_id
         for name, want in expectations.items():
             if name in meta and meta[name] != want:
                 errors.append(f"{rel}: {name} is {meta[name]!r}, expected {want!r}")
+        if file_key_val is not None:
+            key_pattern = re.compile(
+                rf"^{re.escape(file_key_val)}(?:-(\d{{3}}))?\.parquet$"
+            )
+            if not key_pattern.match(path.name):
+                errors.append(
+                    f"{rel}: {META_FILE_KEY} is {file_key_val!r}, "
+                    "which does not match filename"
+                )
         inside = sorted(set(descriptor.partition_keys) & set(columns))
         if inside:
             errors.append(f"{rel}: partition columns stored inside the file: {inside}")

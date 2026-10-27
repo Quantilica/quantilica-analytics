@@ -771,3 +771,185 @@ def test_duckdb_view_sql_custom_name_and_unpartitioned(tmp_path):
     conn.execute(sql)
     assert conn.execute('SELECT count(*) FROM "my""view"').fetchone()[0] == 2
     assert 'VIEW "short"' in duckdb_view_sql(dataset_dir)
+
+
+# --- remediation tests (R-02, R-03, R-04) -------------------------------------------
+
+
+def test_staging_multipart_polars_no_staged_parquet(tmp_path, dataset_dir, descriptor):
+    writer = LakeWriter(dataset_dir, descriptor, max_part_bytes=20_000)
+    df = pl.DataFrame({"texto": ["x" * 100 for _ in range(1000)]})
+    staged_names = []
+    orig_publish = writer._publish
+
+    def spy_publish(target, key, staged):
+        staged_names.extend([p.name for p in staged])
+        # Staged files in .tmp must never end in .parquet
+        assert all(p.name.endswith(".parquet.tmp") for p in staged)
+        return orig_publish(target, key, staged)
+
+    writer._publish = spy_publish
+    result = writer.write_polars(
+        df, None, file_key_name="parts_test", partitions={"ano": 2025, "mes": "01"}
+    )
+    assert len(result.outputs) > 1
+    assert all(p.name.endswith(".parquet") for p in result.outputs)
+    assert len(staged_names) == len(result.outputs)
+    assert all(name.endswith(".parquet.tmp") for name in staged_names)
+
+
+def test_staging_multipart_duckdb_no_staged_parquet(tmp_path, dataset_dir, descriptor):
+    src = big_csv(tmp_path / "big_input.csv", rows=150_000)
+    writer = LakeWriter(dataset_dir, descriptor, max_part_bytes=50_000)
+    staged_names = []
+    orig_publish = writer._publish
+
+    def spy_publish(target, key, staged):
+        staged_names.extend([p.name for p in staged])
+        # Staged files must use temporary extension and not match *.parquet
+        assert all(p.name.endswith(".parquet.tmp") for p in staged)
+        return orig_publish(target, key, staged)
+
+    writer._publish = spy_publish
+    result = writer.write_duckdb(
+        src, partitions={"ano": 2025, "mes": "01"}, separator=";"
+    )
+    assert len(result.outputs) > 1
+    assert all(p.name.endswith(".parquet") for p in result.outputs)
+    assert len(staged_names) == len(result.outputs)
+    assert all(name.endswith(".parquet.tmp") for name in staged_names)
+
+
+def test_file_key_ending_in_three_digits_caged_001(tmp_path, dataset_dir, descriptor):
+    src = big_csv(tmp_path / "caged-001.csv", rows=150_000)
+    writer = LakeWriter(dataset_dir, descriptor)
+
+    # 1. First write converts
+    res1 = writer.write_duckdb(
+        src, partitions={"ano": 2024, "mes": "01"}, separator=";"
+    )
+    assert res1.status == "converted"
+    assert res1.output.name == "caged-001.parquet"
+    assert footer(res1.output)["quantilica.file_key"] == "caged-001"
+
+    # 2. Second write detects origin_matches and skips
+    res2 = writer.write_duckdb(
+        src, partitions={"ano": 2024, "mes": "01"}, separator=";"
+    )
+    assert res2.status == "skipped"
+    assert res2.outputs == res1.outputs
+
+    # 3. check_dataset approves without part number or file_key mismatch errors
+    errors = check_dataset(dataset_dir)
+    assert errors == []
+
+    # 4. Multi-part split with key ending in -001, then prune orphans
+    writer_split = LakeWriter(
+        dataset_dir, descriptor, force=True, max_part_bytes=50_000
+    )
+    res_split = writer_split.write_duckdb(
+        src, partitions={"ano": 2024, "mes": "01"}, separator=";"
+    )
+    assert res_split.status == "converted"
+    assert len(res_split.outputs) > 1
+    assert res_split.outputs[0].name == "caged-001-001.parquet"
+    assert check_dataset(dataset_dir) == []
+
+    # Republish smaller unsplit and check orphan pruning
+    src.write_text("id;texto\n1;a\n2;b\n", encoding="utf-8")
+    res_unsplit = writer.write_duckdb(
+        src, partitions={"ano": 2024, "mes": "01"}, separator=";"
+    )
+    assert res_unsplit.status == "converted"
+    assert res_unsplit.outputs == [res1.output]
+    target_dir = dataset_dir / "ano=2024" / "mes=01"
+    target_files = [p.name for p in target_dir.glob("*.parquet")]
+    assert target_files == ["caged-001.parquet"]
+    assert check_dataset(dataset_dir) == []
+
+
+def test_drop_partition_columns_duckdb(tmp_path, dataset_dir, descriptor):
+    src = tmp_path / "data_with_partitions.csv"
+    src.write_text("ano;mes;municipio;valor\n2025;09;Campinas;15\n", encoding="utf-8")
+    writer = LakeWriter(dataset_dir, descriptor)
+
+    result = writer.write_duckdb(
+        src,
+        partitions={"ano": 2025, "mes": "09"},
+        separator=";",
+        required=("ano", "mes", "municipio", "valor"),
+    )
+    assert result.status == "converted"
+    # Physical parquet schema must omit partition columns
+    df = pl.read_parquet(result.output)
+    assert "ano" not in df.columns
+    assert "mes" not in df.columns
+    assert df.columns == ["municipio", "valor"]
+    # check_dataset must pass cleanly
+    assert check_dataset(dataset_dir) == []
+    # scan_dataset reads partition columns back from Hive folder structure
+    scanned = scan_dataset(dataset_dir).collect()
+    assert set(scanned.columns) == {"ano", "mes", "municipio", "valor"}
+    assert scanned["ano"].to_list() == [2025]
+    assert scanned["mes"].to_list() == ["09"]
+
+
+def test_drop_partition_columns_polars(tmp_path, dataset_dir, descriptor):
+    df = pl.DataFrame(
+        {
+            "ano": [2025, 2025],
+            "mes": ["01", "01"],
+            "estacao": ["A", "B"],
+            "temp": [19.0, 22.5],
+        }
+    )
+    writer = LakeWriter(dataset_dir, descriptor)
+    result = writer.write_polars(
+        df,
+        None,
+        file_key_name="inmet_part_test",
+        partitions={"ano": 2025, "mes": "01"},
+    )
+    assert result.status == "converted"
+    # Physical parquet schema must omit partition columns
+    pq_df = pl.read_parquet(result.output)
+    assert "ano" not in pq_df.columns
+    assert "mes" not in pq_df.columns
+    assert pq_df.columns == ["estacao", "temp"]
+    # check_dataset approves
+    assert check_dataset(dataset_dir) == []
+
+
+def test_drop_partition_columns_polars_lazy(tmp_path, dataset_dir, descriptor):
+    lf = pl.DataFrame(
+        {
+            "ano": [2025],
+            "mes": ["02"],
+            "valor": [42],
+        }
+    ).lazy()
+    writer = LakeWriter(dataset_dir, descriptor)
+    result = writer.write_polars(
+        lf,
+        None,
+        file_key_name="lazy_part_test",
+        partitions={"ano": 2025, "mes": "02"},
+    )
+    assert result.status == "converted"
+    pq_df = pl.read_parquet(result.output)
+    assert pq_df.columns == ["valor"]
+    assert check_dataset(dataset_dir) == []
+
+
+def test_drop_partition_columns_error_when_no_payload(
+    tmp_path, dataset_dir, descriptor
+):
+    df = pl.DataFrame({"ano": [2025], "mes": ["01"]})
+    writer = LakeWriter(dataset_dir, descriptor)
+    with pytest.raises(LakeError, match="No payload columns left to write"):
+        writer.write_polars(
+            df,
+            None,
+            file_key_name="empty_payload",
+            partitions={"ano": 2025, "mes": "01"},
+        )
