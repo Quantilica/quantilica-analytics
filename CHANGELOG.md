@@ -9,7 +9,7 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ### Adicionado
 
-- `lake`: novo módulo `quantilica.analytics.lake` para gravar e ler o lake Parquet particionado no estilo Hive (`<fonte>/<dataset>/<chave>=<valor>/<file_key>[-NNN].parquet`, com `_dataset.json`). Depende do módulo `quantilica.core.lake` (ainda não publicado).
+- `lake`: novo módulo `quantilica.analytics.lake` para gravar e ler o lake Parquet particionado no estilo Hive (`<fonte>/<dataset>/<chave>=<valor>/<file_key>[-NNN].parquet`, com `_dataset.json`). Depende do módulo `quantilica.core.lake` (pin `quantilica-core>=0.13.0`).
   - `LakeWriter.write_duckdb()`: converte CSV/TXT, ZIP e 7z em streaming com DuckDB (qualquer encoding, com ou sem cabeçalho, `rename`). `required` recusa páginas de erro HTML salvas como CSV antes de gravar qualquer coisa. Colunas tipadas por um `DataContract` passam por `TRY_CAST`, e as falhas viram nulo contado em `quantilica.cast_nulls`.
   - `LakeWriter.write_polars()`: grava `DataFrame` ou `LazyFrame` (`sink_parquet` em streaming quando o plano permite) com as mesmas garantias.
   - Ambos gravam de forma atômica (`.tmp` + `os.replace`), seguram o lock do dataset, apagam partes `-NNN` órfãs de uma divisão anterior do mesmo `file_key`, recusam sobrescrever o arquivo de outro `file_key` e atualizam o `_dataset.json`. `max_part_bytes` divide a saída em partes.
