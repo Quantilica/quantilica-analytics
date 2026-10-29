@@ -69,6 +69,12 @@ META_CONTRACT_VERSION = "quantilica.contract.version"
 META_CAST_NULLS = "quantilica.cast_nulls"
 META_FILE_KEY = "quantilica.file_key"
 META_CONVERTED_AT = "quantilica.converted_at"
+# Grouped files (one Parquet per partition holding several raw files): the
+# footer maps each member's file key to its provenance, and every row carries
+# the member's file key in ORIGIN_COLUMN.
+META_MEMBERS = "quantilica.members"
+META_MEMBER_COLUMNS = "quantilica.member_columns"
+ORIGIN_COLUMN = "_origem"
 # Metadata that every Parquet in the lake must carry.
 REQUIRED_METADATA = (
     META_LAYOUT,
@@ -78,6 +84,7 @@ REQUIRED_METADATA = (
     META_CONVERTED_AT,
 )
 
+_DATE_IN_NAME = re.compile(r"@[0-9T]+")
 _PART_NAME = re.compile(r"^(?P<key>.+?)(?:-(?P<part>\d{3}))?\.parquet$")
 _PARTITION_DIR = re.compile(r"^(?P<key>[a-z][a-z0-9_]*)=(?P<value>[0-9A-Za-z._-]+)$")
 _DUCKDB_PART_FILE = re.compile(r"(\d+)")
@@ -401,6 +408,38 @@ def origin_matches(
     return len(runs) == 1
 
 
+def _members(path: Path, group_key: str) -> dict[str, dict[str, Any]] | None:
+    """Members of the grouped file ``path``; ``None`` if it is not ``group_key``."""
+    meta = _footer(path)
+    if meta.get(META_FILE_KEY) != group_key or META_MEMBERS not in meta:
+        return None
+    return json.loads(meta[META_MEMBERS])
+
+
+def member_matches(
+    path: Path,
+    group_key: str,
+    key: str,
+    sha256: str,
+    *,
+    layout_version: int = LAYOUT_VERSION,
+) -> bool:
+    """Whether raw file ``key`` is in the grouped file ``path`` with ``sha256``."""
+    if not path.is_file():
+        return False
+    if _footer(path).get(META_LAYOUT) != str(layout_version):
+        return False
+    members = _members(path, group_key) or {}
+    return members.get(key, {}).get("origin_sha256") == sha256
+
+
+def _kv_options(meta: dict[str, str]) -> str:
+    kv = ", ".join(f"{_lit(k)}: {_lit(v)}" for k, v in meta.items())
+    return (
+        f"FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880, KV_METADATA {{{kv}}}"
+    )
+
+
 # --- writer ------------------------------------------------------------------------
 
 
@@ -602,6 +641,160 @@ class LakeWriter:
             self._save_descriptor(partitions, contract, converter)
         logger.info("lake: %s -> %s (%d rows)", key, target, result.rows)
         return result
+
+    def is_current_member(
+        self,
+        src: Path,
+        *,
+        group_key: str,
+        partitions: dict[str, Any] | None = None,
+    ) -> bool:
+        """Whether ``src`` is already a member of the grouped file with its ``sha256``.
+
+        The grouped counterpart of :meth:`is_current`. Always ``False`` with ``force``.
+        """
+        if self.force:
+            return False
+        src = Path(src)
+        target = self._target(dict(partitions or {}))
+        return member_matches(
+            target / f"{group_key}.parquet",
+            group_key,
+            file_key(src),
+            sha256_file(src),
+            layout_version=self.descriptor.layout_version,
+        )
+
+    def write_member(
+        self,
+        data: pl.DataFrame | pl.LazyFrame,
+        src: Path,
+        *,
+        group_key: str,
+        partitions: dict[str, Any] | None = None,
+        member_columns: dict[str, str] | None = None,
+        converter: str = "quantilica-analytics",
+    ) -> LakeWriteResult:
+        """Write ``src`` into the partition's grouped file ``<group_key>.parquet``.
+
+        One Parquet per partition holds the rows of several raw files (the
+        DATASUS publishes one file per state and month, most of them tiny).
+        ``member_columns`` become literal columns (``{"uf": "sp"}``), every row
+        gets the raw file's key in ``_origem`` and the rows are sorted by the
+        member columns, so a filter on them skips row groups by their
+        statistics. Writing a member replaces only its own rows; the footer's
+        ``quantilica.members`` keeps the provenance of each one. The merge runs
+        in DuckDB, spilling to disk, under the dataset lock.
+        """
+        src = Path(src)
+        partitions = dict(partitions or {})
+        member_columns = dict(member_columns or {})
+        key = file_key(src)
+        digest = sha256_file(src)
+        with dataset_lock(self.dataset_dir):
+            target = self._target(partitions)
+            path = target / f"{group_key}.parquet"
+            if not self.force and member_matches(
+                path,
+                group_key,
+                key,
+                digest,
+                layout_version=self.descriptor.layout_version,
+            ):
+                return LakeWriteResult(src, [path], "skipped")
+            staging = self._staging_dir()
+            try:
+                result = self._member_convert(
+                    data,
+                    src,
+                    key,
+                    digest,
+                    path,
+                    staging,
+                    group_key=group_key,
+                    partitions=partitions,
+                    member_columns=member_columns,
+                    converter=converter,
+                )
+            finally:
+                self._cleanup_staging(staging)
+            self._save_descriptor(partitions, None, converter)
+        logger.info("lake: %s -> %s (%d rows)", src.name, path, result.rows)
+        return result
+
+    def _member_convert(
+        self,
+        data: pl.DataFrame | pl.LazyFrame,
+        src: Path,
+        key: str,
+        digest: str,
+        path: Path,
+        staging: Path,
+        *,
+        group_key: str,
+        partitions: dict[str, Any],
+        member_columns: dict[str, str],
+        converter: str,
+    ) -> LakeWriteResult:
+        frame = data.collect() if isinstance(data, pl.LazyFrame) else data
+        reserved = [*partitions, *member_columns, ORIGIN_COLUMN]
+        frame = frame.drop([c for c in reserved if c in frame.columns])
+        if not frame.columns:
+            raise LakeError(f"{src.name}: no payload columns to write")
+        frame = frame.with_columns(
+            *(pl.lit(v, dtype=pl.String).alias(k) for k, v in member_columns.items()),
+            pl.lit(key, dtype=pl.String).alias(ORIGIN_COLUMN),
+        )
+        members: dict[str, dict[str, Any]] = {}
+        existing = None
+        if path.exists():
+            members = _members(path, group_key)
+            if members is None:
+                owner = _footer(path).get(META_FILE_KEY)
+                raise LakeError(
+                    f"{path.name} is not the grouped file {group_key!r} "
+                    f"(file key {owner!r}); refusing to overwrite it"
+                )
+            existing = path
+        members[key] = {
+            "origin_file": src.name,
+            "origin_sha256": digest,
+            "rows": frame.height,
+            "converted_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            **member_columns,
+        }
+        meta = self._metadata(group_key, None, None, None, converter)
+        meta[META_MEMBERS] = json.dumps(members, sort_keys=True, ensure_ascii=False)
+        meta[META_MEMBER_COLUMNS] = json.dumps(list(member_columns))
+        order = ", ".join(_ident(c) for c in [*member_columns, ORIGIN_COLUMN])
+        query = "SELECT * FROM novo"
+        if existing is not None:
+            query = (
+                f"SELECT * FROM read_parquet({_lit(str(existing))}, "
+                "hive_partitioning=false) "
+                f"WHERE {_ident(ORIGIN_COLUMN)} <> {_lit(key)} "
+                f"UNION ALL BY NAME {query}"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_out = staging / f"{group_key}.parquet{TMP_SUFFIX}"
+        scratch = _scratch_dir(staging)
+        conn = _connect(scratch)
+        try:
+            conn.register("novo", frame.to_arrow())
+            conn.execute(
+                f"COPY ({query} ORDER BY {order}) TO {_lit(str(tmp_out))} "
+                f"({_kv_options(meta)})"
+            )
+            rows = pq.ParquetFile(tmp_out).metadata.num_rows
+            os.replace(tmp_out, path)
+        except BaseException:
+            tmp_out.unlink(missing_ok=True)
+            raise
+        finally:
+            conn.close()
+            if scratch != staging:
+                shutil.rmtree(scratch, ignore_errors=True)
+        return LakeWriteResult(src, [path], "converted", int(rows))
 
     # -- shared plumbing --
 
@@ -978,6 +1171,154 @@ class LakeWriter:
                 staged.append(path)
             outputs = self._publish(target, key, staged)
         return LakeWriteResult(src, outputs, "converted", int(rows))
+
+
+# --- compaction --------------------------------------------------------------------
+
+
+def compact_members(
+    dataset_dir: Path,
+    member_keys: tuple[str, ...] = ("uf",),
+    *,
+    group_key: Any = None,
+    converter: str = "quantilica-analytics",
+) -> dict[str, int]:
+    """Rewrite a dataset partitioned by ``member_keys`` into grouped files.
+
+    The migration path to :meth:`LakeWriter.write_member`: the member keys stop
+    being partitions (``uf=sp/ano=2020/mes=01`` becomes ``ano=2020/mes=01``),
+    each remaining partition gets one Parquet with the rows of all its files,
+    sorted by the member keys and ``_origem``, and ``quantilica.members`` is
+    built from the old footers, so nothing is converted again. Each group is
+    written before its old files are deleted; a rerun after a crash rebuilds
+    the groups that still have old files.
+
+    Args:
+        dataset_dir: ``<lake>/<source_id>/<dataset_id>``.
+        member_keys: Partition keys that become columns.
+        group_key: ``f(dataset_id, values) -> str`` naming each grouped file;
+            defaults to ``<dataset_id>_<value1><value2>...``.
+        converter: Recorded in the footer and the descriptor.
+
+    Returns:
+        Counts of ``groups`` written and old ``files`` removed.
+    """
+    dataset_dir = Path(dataset_dir)
+    descriptor = DatasetDescriptor.load(dataset_dir)
+    old_keys = list(descriptor.partition_keys)
+    members_in = [k for k in member_keys if k in old_keys]
+    if not members_in:
+        return {"groups": 0, "files": 0}
+    new_keys = [k for k in old_keys if k not in members_in]
+    name_for = group_key or (
+        lambda ds, values: "_".join([ds, "".join(values)]) if values else ds
+    )
+    groups: dict[tuple[str, ...], list[tuple[Path, dict[str, str]]]] = {}
+    for path in sorted(dataset_dir.rglob("*.parquet")):
+        rel = path.relative_to(dataset_dir)
+        if TMP_DIRNAME in rel.parts:
+            continue
+        values = dict(part.split("=", 1) for part in rel.parts[:-1] if "=" in part)
+        if not all(k in values for k in old_keys):
+            continue  # already grouped
+        groups.setdefault(tuple(values[k] for k in new_keys), []).append((path, values))
+    written = removed = 0
+    with dataset_lock(dataset_dir):
+        for group_values, files in sorted(groups.items()):
+            partitions = dict(zip(new_keys, group_values, strict=True))
+            gkey = name_for(descriptor.dataset_id, list(group_values))
+            target = partition_dir(dataset_dir, partitions)
+            # Por chave do bruto, só a versão mais nova: antes de o file_key tirar
+            # a data dos DBCs, cada republicação ficava ao lado da anterior.
+            newest: dict[str, tuple[str, str]] = {}
+            footers = {}
+            for path, _values in files:
+                meta = footers[path] = _footer(path)
+                origin = meta.get("quantilica.origin_file") or path.stem
+                key = file_key(origin)
+                version = (_DATE_IN_NAME.search(origin) or [""])[0]
+                rank = (version, meta.get(META_CONVERTED_AT) or "")
+                if key not in newest or rank > newest[key]:
+                    newest[key] = rank
+            members: dict[str, dict[str, Any]] = {}
+            origin_of: list[tuple[str, str]] = []
+            for path, values in files:
+                meta = footers[path]
+                origin = meta.get("quantilica.origin_file") or path.stem
+                key = file_key(origin)
+                version = (_DATE_IN_NAME.search(origin) or [""])[0]
+                if (version, meta.get(META_CONVERTED_AT) or "") != newest[key]:
+                    continue  # versão superada: só é apagada
+                entry = members.setdefault(
+                    key,
+                    {
+                        "origin_file": meta.get("quantilica.origin_file"),
+                        "origin_sha256": meta.get(META_ORIGIN_SHA),
+                        "rows": 0,
+                        "converted_at": meta.get(META_CONVERTED_AT),
+                        **{k: values[k] for k in members_in},
+                    },
+                )
+                entry["rows"] += pq.ParquetFile(path).metadata.num_rows
+                origin_of.append((path.as_posix(), key))
+            meta = {
+                "quantilica.source_id": descriptor.source_id,
+                "quantilica.dataset_id": descriptor.dataset_id,
+                META_LAYOUT: str(descriptor.layout_version),
+                META_FILE_KEY: gkey,
+                "quantilica.converter": converter,
+                "quantilica.writer": f"quantilica-analytics/{__version__}",
+                META_CONVERTED_AT: datetime.now(UTC).isoformat(timespec="seconds"),
+                META_MEMBERS: json.dumps(members, sort_keys=True, ensure_ascii=False),
+                META_MEMBER_COLUMNS: json.dumps(members_in),
+            }
+            staging = dataset_dir / TMP_DIRNAME
+            staging.mkdir(parents=True, exist_ok=True)
+            tmp_out = staging / f"{gkey}.parquet{TMP_SUFFIX}"
+            sources = "[" + ", ".join(_lit(p) for p, _ in origin_of) + "]"
+            mapping = ", ".join(f"({_lit(p)}, {_lit(k)})" for p, k in origin_of)
+            hive_types = ", ".join(f"{_lit(k)}: 'VARCHAR'" for k in old_keys)
+            drop = ", ".join(_ident(k) for k in ["filename", *new_keys])
+            order = ", ".join(_ident(c) for c in [*members_in, ORIGIN_COLUMN])
+            query = (
+                f"SELECT t.* EXCLUDE ({drop}), m.origem AS {_ident(ORIGIN_COLUMN)} "
+                f"FROM read_parquet({sources}, hive_partitioning=true, "
+                f"hive_types={{{hive_types}}}, union_by_name=true, filename=true) t "
+                f"JOIN (VALUES {mapping}) m(arquivo, origem) "
+                f"ON replace(t.filename, '\\', '/') = m.arquivo"
+            )
+            scratch = _scratch_dir(staging)
+            conn = _connect(scratch)
+            try:
+                conn.execute(
+                    f"COPY ({query} ORDER BY {order}) TO {_lit(str(tmp_out))} "
+                    f"({_kv_options(meta)})"
+                )
+                target.mkdir(parents=True, exist_ok=True)
+                os.replace(tmp_out, target / f"{gkey}.parquet")
+            except BaseException:
+                tmp_out.unlink(missing_ok=True)
+                raise
+            finally:
+                conn.close()
+                if scratch != staging:
+                    shutil.rmtree(scratch, ignore_errors=True)
+            written += 1
+            for path, _ in files:
+                path.unlink()
+                removed += 1
+                parent = path.parent
+                while parent != dataset_dir and not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
+        shutil.rmtree(dataset_dir / TMP_DIRNAME, ignore_errors=True)
+        descriptor.partition_keys = new_keys
+        descriptor.partition_types = {
+            k: v for k, v in descriptor.partition_types.items() if k in new_keys
+        }
+        descriptor.converter = converter
+        descriptor.save(dataset_dir)
+    return {"groups": written, "files": removed}
 
 
 # --- readers ---------------------------------------------------------------------

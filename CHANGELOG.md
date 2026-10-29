@@ -5,6 +5,20 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Unreleased]
+
+### Adicionado
+- Arquivos agrupados no lake: `LakeWriter.write_member` grava um arquivo bruto no Parquet
+  da partição (`<grupo>.parquet`), que reúne as linhas de vários brutos. Cada linha leva o
+  `file_key` do bruto em `_origem`, as colunas de membro (como `uf`) entram como colunas
+  literais, as linhas são ordenadas por elas e o rodapé guarda a proveniência de cada
+  membro em `quantilica.members`. Regravar um membro troca só as suas linhas.
+  `LakeWriter.is_current_member` pula o bruto que já está no grupo com o mesmo `sha256`.
+- `compact_members(dataset_dir, member_keys)` converte um dataset particionado por essas
+  chaves (por exemplo `uf=`) em arquivos agrupados, a partir dos Parquets existentes e
+  sem reconverter os brutos. Quando há mais de uma versão do mesmo bruto, fica a mais
+  nova.
+
 ## [0.6.0] - 2026-10-29
 
 ### Adicionado
