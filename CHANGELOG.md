@@ -19,6 +19,10 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   sem reconverter os brutos. Quando há mais de uma versão do mesmo bruto, fica a mais
   nova. `workers` grava vários grupos ao mesmo tempo.
 
+### Corrigido
+- O `LakeWriter` grava o Parquet em disco (`fsync`) antes de publicá-lo por rename. Sem
+  isso, uma queda de energia logo depois podia deixar o arquivo publicado truncado.
+
 ## [0.6.0] - 2026-10-29
 
 ### Adicionado

@@ -433,6 +433,18 @@ def member_matches(
     return members.get(key, {}).get("origin_sha256") == sha256
 
 
+def _durable_replace(tmp: Path, final: Path) -> None:
+    """``os.replace`` after flushing ``tmp`` to disk.
+
+    Without the flush, a power loss right after the rename can leave ``final``
+    with a truncated body (seen on Windows: "Parquet magic bytes not found"),
+    and in a grouped file the old per-member files are already gone.
+    """
+    with open(tmp, "rb+") as fh:
+        os.fsync(fh.fileno())
+    os.replace(tmp, final)
+
+
 def _kv_options(meta: dict[str, str]) -> str:
     kv = ", ".join(f"{_lit(k)}: {_lit(v)}" for k, v in meta.items())
     return (
@@ -786,7 +798,7 @@ class LakeWriter:
                 f"({_kv_options(meta)})"
             )
             rows = pq.ParquetFile(tmp_out).metadata.num_rows
-            os.replace(tmp_out, path)
+            _durable_replace(tmp_out, path)
         except BaseException:
             tmp_out.unlink(missing_ok=True)
             raise
@@ -889,7 +901,7 @@ class LakeWriter:
                 )
         # Highest part first: a partial publish never looks like a complete set.
         for tmp, final in reversed(list(zip(staged, outputs, strict=True))):
-            os.replace(tmp, final)
+            _durable_replace(tmp, final)
         keep = set(outputs)
         for orphan in _part_files(target, key):
             if orphan not in keep:
@@ -1304,7 +1316,7 @@ def compact_members(
                 f"COPY ({query}) TO {_lit(str(tmp_out))} ({_kv_options(meta)})"
             )
             target.mkdir(parents=True, exist_ok=True)
-            os.replace(tmp_out, target / f"{gkey}.parquet")
+            _durable_replace(tmp_out, target / f"{gkey}.parquet")
         except BaseException:
             tmp_out.unlink(missing_ok=True)
             raise
