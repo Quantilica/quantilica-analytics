@@ -167,6 +167,8 @@ def test_compact_members_migra_o_layout_por_uf(tmp_path: Path) -> None:
 
     after = scan_dataset(dataset).collect()
     assert after.height == expected
+    jan = after.filter(pl.col("mes") == "01")
+    assert jan["uf"].to_list() == sorted(jan["uf"].to_list())  # ordenado sem ORDER BY
     cols = ["uf", "ano", "mes", "valor"]
     assert after.select(cols).sort(cols).equals(before.select(cols).sort(cols))
     members = _members(dataset / "ano=2020" / "mes=01" / "sih-rd_202001.parquet")

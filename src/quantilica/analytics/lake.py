@@ -1262,7 +1262,11 @@ def compact_members(
                 },
             )
             entry["rows"] += pq.ParquetFile(path).metadata.num_rows
-            origin_of.append((path.as_posix(), key))
+            origin_of.append((path.as_posix(), key, *(values[k] for k in members_in)))
+        # Os brutos já vêm separados por membro: lidos nessa ordem, com a ordem de
+        # inserção preservada, o arquivo sai ordenado sem ORDER BY (que, num mês do
+        # SIA-PA, despeja gigabytes em disco).
+        origin_of.sort(key=lambda item: (*item[2:], item[1], item[0]))
         meta = {
             "quantilica.source_id": descriptor.source_id,
             "quantilica.dataset_id": descriptor.dataset_id,
@@ -1277,26 +1281,27 @@ def compact_members(
         staging = dataset_dir / TMP_DIRNAME
         staging.mkdir(parents=True, exist_ok=True)
         tmp_out = staging / f"{gkey}.parquet{TMP_SUFFIX}"
-        sources = "[" + ", ".join(_lit(p) for p, _ in origin_of) + "]"
-        mapping = ", ".join(f"({_lit(p)}, {_lit(k)})" for p, k in origin_of)
+        sources = "[" + ", ".join(_lit(item[0]) for item in origin_of) + "]"
+        cases = " ".join(
+            f"WHEN {_lit(item[0])} THEN {_lit(item[1])}" for item in origin_of
+        )
         hive_types = ", ".join(f"{_lit(k)}: 'VARCHAR'" for k in old_keys)
         drop = ", ".join(_ident(k) for k in ["filename", *new_keys])
-        order = ", ".join(_ident(c) for c in [*members_in, ORIGIN_COLUMN])
         query = (
-            f"SELECT t.* EXCLUDE ({drop}), m.origem AS {_ident(ORIGIN_COLUMN)} "
+            f"SELECT t.* EXCLUDE ({drop}), "
+            f"CASE replace(t.filename, '\\', '/') {cases} END "
+            f"AS {_ident(ORIGIN_COLUMN)} "
             f"FROM read_parquet({sources}, hive_partitioning=true, "
-            f"hive_types={{{hive_types}}}, union_by_name=true, filename=true) t "
-            f"JOIN (VALUES {mapping}) m(arquivo, origem) "
-            f"ON replace(t.filename, '\\', '/') = m.arquivo"
+            f"hive_types={{{hive_types}}}, union_by_name=true, filename=true) t"
         )
         scratch = _scratch_dir(staging)
         if scratch == staging:  # um temporário por grupo: os grupos rodam juntos
             scratch = Path(tempfile.mkdtemp(dir=staging))
         conn = _connect(scratch)
         try:
+            conn.execute("SET preserve_insertion_order = true")
             conn.execute(
-                f"COPY ({query} ORDER BY {order}) TO {_lit(str(tmp_out))} "
-                f"({_kv_options(meta)})"
+                f"COPY ({query}) TO {_lit(str(tmp_out))} ({_kv_options(meta)})"
             )
             target.mkdir(parents=True, exist_ok=True)
             os.replace(tmp_out, target / f"{gkey}.parquet")
