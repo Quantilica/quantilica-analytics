@@ -1182,6 +1182,7 @@ def compact_members(
     *,
     group_key: Any = None,
     converter: str = "quantilica-analytics",
+    workers: int = 1,
 ) -> dict[str, int]:
     """Rewrite a dataset partitioned by ``member_keys`` into grouped files.
 
@@ -1199,6 +1200,8 @@ def compact_members(
         group_key: ``f(dataset_id, values) -> str`` naming each grouped file;
             defaults to ``<dataset_id>_<value1><value2>...``.
         converter: Recorded in the footer and the descriptor.
+        workers: Groups written at the same time, each with its own DuckDB
+            connection (writing one Parquet is single-threaded).
 
     Returns:
         Counts of ``groups`` written and old ``files`` removed.
@@ -1222,95 +1225,112 @@ def compact_members(
         if not all(k in values for k in old_keys):
             continue  # already grouped
         groups.setdefault(tuple(values[k] for k in new_keys), []).append((path, values))
+
+    def compact_group(group_values: tuple[str, ...], files: list) -> int:
+        partitions = dict(zip(new_keys, group_values, strict=True))
+        gkey = name_for(descriptor.dataset_id, list(group_values))
+        target = partition_dir(dataset_dir, partitions)
+        # Por chave do bruto, só a versão mais nova: antes de o file_key tirar
+        # a data dos DBCs, cada republicação ficava ao lado da anterior.
+        newest: dict[str, tuple[str, str]] = {}
+        footers = {}
+        for path, _values in files:
+            meta = footers[path] = _footer(path)
+            origin = meta.get("quantilica.origin_file") or path.stem
+            key = file_key(origin)
+            version = (_DATE_IN_NAME.search(origin) or [""])[0]
+            rank = (version, meta.get(META_CONVERTED_AT) or "")
+            if key not in newest or rank > newest[key]:
+                newest[key] = rank
+        members: dict[str, dict[str, Any]] = {}
+        origin_of: list[tuple[str, str]] = []
+        for path, values in files:
+            meta = footers[path]
+            origin = meta.get("quantilica.origin_file") or path.stem
+            key = file_key(origin)
+            version = (_DATE_IN_NAME.search(origin) or [""])[0]
+            if (version, meta.get(META_CONVERTED_AT) or "") != newest[key]:
+                continue  # versão superada: só é apagada
+            entry = members.setdefault(
+                key,
+                {
+                    "origin_file": meta.get("quantilica.origin_file"),
+                    "origin_sha256": meta.get(META_ORIGIN_SHA),
+                    "rows": 0,
+                    "converted_at": meta.get(META_CONVERTED_AT),
+                    **{k: values[k] for k in members_in},
+                },
+            )
+            entry["rows"] += pq.ParquetFile(path).metadata.num_rows
+            origin_of.append((path.as_posix(), key))
+        meta = {
+            "quantilica.source_id": descriptor.source_id,
+            "quantilica.dataset_id": descriptor.dataset_id,
+            META_LAYOUT: str(descriptor.layout_version),
+            META_FILE_KEY: gkey,
+            "quantilica.converter": converter,
+            "quantilica.writer": f"quantilica-analytics/{__version__}",
+            META_CONVERTED_AT: datetime.now(UTC).isoformat(timespec="seconds"),
+            META_MEMBERS: json.dumps(members, sort_keys=True, ensure_ascii=False),
+            META_MEMBER_COLUMNS: json.dumps(members_in),
+        }
+        staging = dataset_dir / TMP_DIRNAME
+        staging.mkdir(parents=True, exist_ok=True)
+        tmp_out = staging / f"{gkey}.parquet{TMP_SUFFIX}"
+        sources = "[" + ", ".join(_lit(p) for p, _ in origin_of) + "]"
+        mapping = ", ".join(f"({_lit(p)}, {_lit(k)})" for p, k in origin_of)
+        hive_types = ", ".join(f"{_lit(k)}: 'VARCHAR'" for k in old_keys)
+        drop = ", ".join(_ident(k) for k in ["filename", *new_keys])
+        order = ", ".join(_ident(c) for c in [*members_in, ORIGIN_COLUMN])
+        query = (
+            f"SELECT t.* EXCLUDE ({drop}), m.origem AS {_ident(ORIGIN_COLUMN)} "
+            f"FROM read_parquet({sources}, hive_partitioning=true, "
+            f"hive_types={{{hive_types}}}, union_by_name=true, filename=true) t "
+            f"JOIN (VALUES {mapping}) m(arquivo, origem) "
+            f"ON replace(t.filename, '\\', '/') = m.arquivo"
+        )
+        scratch = _scratch_dir(staging)
+        if scratch == staging:  # um temporário por grupo: os grupos rodam juntos
+            scratch = Path(tempfile.mkdtemp(dir=staging))
+        conn = _connect(scratch)
+        try:
+            conn.execute(
+                f"COPY ({query} ORDER BY {order}) TO {_lit(str(tmp_out))} "
+                f"({_kv_options(meta)})"
+            )
+            target.mkdir(parents=True, exist_ok=True)
+            os.replace(tmp_out, target / f"{gkey}.parquet")
+        except BaseException:
+            tmp_out.unlink(missing_ok=True)
+            raise
+        finally:
+            conn.close()
+            shutil.rmtree(scratch, ignore_errors=True)
+        for path, _ in files:
+            path.unlink()
+            parent = path.parent
+            while parent != dataset_dir:
+                try:
+                    parent.rmdir()  # só vazio; outro mês pode ter acabado de apagar
+                except OSError:
+                    break
+                parent = parent.parent
+        return len(files)
+
     written = removed = 0
     with dataset_lock(dataset_dir):
-        for group_values, files in sorted(groups.items()):
-            partitions = dict(zip(new_keys, group_values, strict=True))
-            gkey = name_for(descriptor.dataset_id, list(group_values))
-            target = partition_dir(dataset_dir, partitions)
-            # Por chave do bruto, só a versão mais nova: antes de o file_key tirar
-            # a data dos DBCs, cada republicação ficava ao lado da anterior.
-            newest: dict[str, tuple[str, str]] = {}
-            footers = {}
-            for path, _values in files:
-                meta = footers[path] = _footer(path)
-                origin = meta.get("quantilica.origin_file") or path.stem
-                key = file_key(origin)
-                version = (_DATE_IN_NAME.search(origin) or [""])[0]
-                rank = (version, meta.get(META_CONVERTED_AT) or "")
-                if key not in newest or rank > newest[key]:
-                    newest[key] = rank
-            members: dict[str, dict[str, Any]] = {}
-            origin_of: list[tuple[str, str]] = []
-            for path, values in files:
-                meta = footers[path]
-                origin = meta.get("quantilica.origin_file") or path.stem
-                key = file_key(origin)
-                version = (_DATE_IN_NAME.search(origin) or [""])[0]
-                if (version, meta.get(META_CONVERTED_AT) or "") != newest[key]:
-                    continue  # versão superada: só é apagada
-                entry = members.setdefault(
-                    key,
-                    {
-                        "origin_file": meta.get("quantilica.origin_file"),
-                        "origin_sha256": meta.get(META_ORIGIN_SHA),
-                        "rows": 0,
-                        "converted_at": meta.get(META_CONVERTED_AT),
-                        **{k: values[k] for k in members_in},
-                    },
-                )
-                entry["rows"] += pq.ParquetFile(path).metadata.num_rows
-                origin_of.append((path.as_posix(), key))
-            meta = {
-                "quantilica.source_id": descriptor.source_id,
-                "quantilica.dataset_id": descriptor.dataset_id,
-                META_LAYOUT: str(descriptor.layout_version),
-                META_FILE_KEY: gkey,
-                "quantilica.converter": converter,
-                "quantilica.writer": f"quantilica-analytics/{__version__}",
-                META_CONVERTED_AT: datetime.now(UTC).isoformat(timespec="seconds"),
-                META_MEMBERS: json.dumps(members, sort_keys=True, ensure_ascii=False),
-                META_MEMBER_COLUMNS: json.dumps(members_in),
-            }
-            staging = dataset_dir / TMP_DIRNAME
-            staging.mkdir(parents=True, exist_ok=True)
-            tmp_out = staging / f"{gkey}.parquet{TMP_SUFFIX}"
-            sources = "[" + ", ".join(_lit(p) for p, _ in origin_of) + "]"
-            mapping = ", ".join(f"({_lit(p)}, {_lit(k)})" for p, k in origin_of)
-            hive_types = ", ".join(f"{_lit(k)}: 'VARCHAR'" for k in old_keys)
-            drop = ", ".join(_ident(k) for k in ["filename", *new_keys])
-            order = ", ".join(_ident(c) for c in [*members_in, ORIGIN_COLUMN])
-            query = (
-                f"SELECT t.* EXCLUDE ({drop}), m.origem AS {_ident(ORIGIN_COLUMN)} "
-                f"FROM read_parquet({sources}, hive_partitioning=true, "
-                f"hive_types={{{hive_types}}}, union_by_name=true, filename=true) t "
-                f"JOIN (VALUES {mapping}) m(arquivo, origem) "
-                f"ON replace(t.filename, '\\', '/') = m.arquivo"
-            )
-            scratch = _scratch_dir(staging)
-            conn = _connect(scratch)
-            try:
-                conn.execute(
-                    f"COPY ({query} ORDER BY {order}) TO {_lit(str(tmp_out))} "
-                    f"({_kv_options(meta)})"
-                )
-                target.mkdir(parents=True, exist_ok=True)
-                os.replace(tmp_out, target / f"{gkey}.parquet")
-            except BaseException:
-                tmp_out.unlink(missing_ok=True)
-                raise
-            finally:
-                conn.close()
-                if scratch != staging:
-                    shutil.rmtree(scratch, ignore_errors=True)
-            written += 1
-            for path, _ in files:
-                path.unlink()
-                removed += 1
-                parent = path.parent
-                while parent != dataset_dir and not any(parent.iterdir()):
-                    parent.rmdir()
-                    parent = parent.parent
+        items = sorted(groups.items())
+        if workers <= 1:
+            for group_values, files in items:
+                removed += compact_group(group_values, files)
+                written += 1
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(workers) as pool:
+                for count in pool.map(lambda item: compact_group(*item), items):
+                    removed += count
+                    written += 1
         shutil.rmtree(dataset_dir / TMP_DIRNAME, ignore_errors=True)
         descriptor.partition_keys = new_keys
         descriptor.partition_types = {

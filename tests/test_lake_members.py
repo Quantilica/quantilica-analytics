@@ -153,7 +153,7 @@ def test_compact_members_migra_o_layout_por_uf(tmp_path: Path) -> None:
         file_key_name=old.name,
     )
 
-    counts = compact_members(dataset)
+    counts = compact_members(dataset, workers=2)
     assert counts == {"groups": 2, "files": 4}
     assert sorted(
         f.relative_to(dataset).as_posix() for f in dataset.rglob("*.parquet")

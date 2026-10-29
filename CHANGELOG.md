@@ -17,7 +17,7 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - `compact_members(dataset_dir, member_keys)` converte um dataset particionado por essas
   chaves (por exemplo `uf=`) em arquivos agrupados, a partir dos Parquets existentes e
   sem reconverter os brutos. Quando há mais de uma versão do mesmo bruto, fica a mais
-  nova.
+  nova. `workers` grava vários grupos ao mesmo tempo.
 
 ## [0.6.0] - 2026-10-29
 
