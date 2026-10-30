@@ -235,6 +235,16 @@ def test_ledger_ok_and_mismatch(corpus, tmp_path: Path, fmt: str) -> None:
     assert categories(report) == {"sha256_divergente": 1}
 
 
+def test_stale_raw_copy_is_a_note_when_the_ledger_agrees(corpus, tmp_path) -> None:
+    ledger = write_ledger(corpus, tmp_path / "ledger.jsonl")  # what the lake holds
+    plant_sha_mismatch(corpus, how="file")  # the local copy changed afterwards
+    assert categories(audit(corpus, readers=False)) == {"sha256_divergente": 1}
+    report = audit(corpus, ledger=ledger, readers=False)
+    assert report.ok, report.to_text()
+    assert report.counts["stale_raw_files"] == 1
+    assert any("bruto local desatualizado" in n for n in report.notes)
+
+
 def test_ledger_missing_origin(corpus, tmp_path: Path) -> None:
     ledger = write_ledger(corpus, tmp_path / "ledger.jsonl")
     lines = [

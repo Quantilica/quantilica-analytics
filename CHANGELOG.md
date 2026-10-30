@@ -27,7 +27,11 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   versão vigente do mesmo arquivo, só com outro carimbo de data no nome, não é
   `origem_superada` e o arquivo vigente conta como coberto. `versao_duplicada` é o mesmo
   (nome, `sha256`) em mais de um Parquet ou membro, ou duas versões do mesmo arquivo
-  (pasta, chave) no lake; nunca o mesmo nome em pastas diferentes.
+  (pasta, chave) no lake; nunca o mesmo nome em pastas diferentes, nem o mesmo arquivo que a
+  fonte publicou em duas pastas.
+- Com `input_dir` e `ledger` juntos, o ledger é a referência: uma origem que bate com o
+  ledger, mas não com o arquivo do bruto local, não reprova; vira aviso de bruto local
+  desatualizado (`counts["stale_raw_files"]`).
 - Cobertura só nas fontes com conversor (`converters`, ou os entry points `quantilica.lake`
   quando `None`) ou com diretório no lake. Os arquivos das outras fontes só são contados
   (`counts["files_without_converter"]` e um aviso) e não reprovam. Arquivos sob pastas cujo

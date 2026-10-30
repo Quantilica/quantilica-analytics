@@ -755,6 +755,7 @@ def lake_audit(
     raw: _Raw | None = None  # the raw side that decides dirs, digests and coverage
     matches: dict[_Origin, _Match] = {}
     gone: set[_Origin] = set()
+    flagged: list[_Flagged] = []
     if input_path is not None:
         current = _current(_list_files(input_path, wanted))
         lap("listagem")
@@ -762,14 +763,30 @@ def lake_audit(
             traced, current, input_path, rehash, n_workers, step
         )
         gone = {o for o, m in matches.items() if m.status in ("superada", "sem_bruto")}
-        findings += _group(flagged)
         lap("sha256")
     if ledger_shas is not None:
         ledger_raw = _Raw(ledger_shas, ledger_shas)
         ledger_matches = {o: _match(o, ledger_raw) for o in traced}
+        if input_path is not None:
+            # The ledger is the reference: where the lake matches it, a raw file
+            # with other bytes is a stale local copy, not a defect of the lake.
+            stale = [
+                f
+                for f in flagged
+                if f[1] == "sha256_divergente"
+                and ledger_matches[f[0]].status in ("ok", "alias")
+            ]
+            if stale:
+                flagged = [f for f in flagged if f not in stale]
+                report.counts["stale_raw_files"] = len(stale)
+                report.notes.append(
+                    f"bruto local desatualizado: {len(stale)} origens batem com o "
+                    "ledger, mas não com o arquivo do bruto"
+                )
         findings += _group(_check_ledger(traced, ledger_matches, ledger_shas, gone))
         if raw is None:
             raw, matches = ledger_raw, ledger_matches
+    findings += _group(flagged)
     findings += _check_duplicates(traced, raw)
     sides = [
         n for n, v in (("bruto", current), ("ledger", ledger_shas)) if v is not None
