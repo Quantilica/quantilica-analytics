@@ -5,6 +5,16 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Unreleased]
+
+### Corrigido
+- `scan_dataset` (e o leitor Polars de `check_dataset`) lê datasets cujo esquema muda
+  entre arquivos, como uma coluna que a fonte passou a publicar em anos posteriores.
+  Antes, o Polars tomava o esquema do primeiro arquivo e recusava os demais ("extra
+  column in file outside of expected schema"). Os arquivos passam a ser combinados pelo
+  nome da coluna, com supertipos e nulos nas colunas ausentes, como o `union_by_name` do
+  DuckDB; quando todos têm o mesmo esquema, a leitura continua num `scan_parquet` só.
+
 ## [0.7.0] - 2026-10-30
 
 ### Adicionado

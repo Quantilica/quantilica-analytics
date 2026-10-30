@@ -182,3 +182,32 @@ def test_compact_members_migra_o_layout_por_uf(tmp_path: Path) -> None:
         src, group_key="sih-rd_202001", partitions={"ano": "2020", "mes": "01"}
     )
     assert compact_members(dataset) == {"groups": 0, "files": 0}
+
+
+def test_esquema_que_muda_entre_periodos(tmp_path: Path) -> None:
+    # Coluna nova a partir de 2021 e tipo que muda: Polars lê como o DuckDB.
+    lake = tmp_path / "lake"
+    writer = _writer(lake, ["ano"])
+    old = _raw(tmp_path, "sih-rd_2020-sp@20210101.dbc", "a")
+    new = _raw(tmp_path, "sih-rd_2021-sp@20220101.dbc", "b")
+    writer.write_member(
+        pl.DataFrame({"valor": [1, 2], "codigo": [10, 11]}),
+        old,
+        group_key="sih-rd_2020",
+        partitions={"ano": "2020"},
+        member_columns={"uf": "sp"},
+    )
+    writer.write_member(
+        pl.DataFrame({"valor": [3], "codigo": ["A1"], "nat_jur": ["2062"]}),
+        new,
+        group_key="sih-rd_2021",
+        partitions={"ano": "2021"},
+        member_columns={"uf": "sp"},
+    )
+    dataset = lake / "datasus" / "sih-rd"
+    assert check_dataset(dataset) == []
+    df = scan_dataset(dataset).collect().sort("valor")
+    assert df["valor"].to_list() == [1, 2, 3]
+    assert df["nat_jur"].to_list() == [None, None, "2062"]
+    assert df["codigo"].to_list() == ["10", "11", "A1"]
+    assert df["ano"].to_list() == ["2020", "2020", "2021"]

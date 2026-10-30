@@ -35,6 +35,7 @@ import pyarrow.parquet as pq
 from quantilica.core.files import sha256_file
 from quantilica.core.lake import (
     DESCRIPTOR_FILENAME,
+    HIVE_DEFAULT_PARTITION,
     LAYOUT_VERSION,
     DatasetDescriptor,
     dataset_lock,
@@ -1361,27 +1362,64 @@ def compact_members(
 # --- readers ---------------------------------------------------------------------
 
 
+def _dataset_files(dataset_dir: Path) -> list[Path]:
+    return sorted(
+        p
+        for p in dataset_dir.rglob("*.parquet")
+        if TMP_DIRNAME not in p.relative_to(dataset_dir).parts
+    )
+
+
 def scan_dataset(dataset_dir: Path) -> pl.LazyFrame:
     """Lazily read a dataset with Hive partitions as columns.
 
     Partition columns take the types declared in ``_dataset.json`` (so
     ``mes=09`` stays ``"09"`` when declared ``varchar``); without a readable
     descriptor Polars infers them.
+
+    When the files do not share one schema (a column the source added in later
+    years, a type that changed), the files are read one by one and combined by
+    column name, with supertypes and nulls for the missing columns, as DuckDB's
+    ``union_by_name`` does. ``pl.scan_parquet`` alone takes the first file's
+    schema and rejects the others.
     """
     dataset_dir = Path(dataset_dir)
-    kwargs: dict[str, Any] = {}
     try:
         descriptor = DatasetDescriptor.load(dataset_dir)
     except (OSError, ValueError):
         descriptor = None
+    hive_schema: dict[str, Any] = {}
     if descriptor is not None and descriptor.partition_keys:
-        kwargs["hive_schema"] = {
+        hive_schema = {
             key: _partition_type(key, declared)[1]
             for key, declared in _declared_types(descriptor).items()
         }
-    return pl.scan_parquet(
-        dataset_dir / "**/*.parquet", hive_partitioning=True, **kwargs
-    )
+    files = _dataset_files(dataset_dir)
+    schemas = {
+        pq.read_schema(p).remove_metadata() for p in files
+    }  # set: pyarrow schemas hash by fields
+    if len(schemas) <= 1:
+        kwargs: dict[str, Any] = {"hive_schema": hive_schema} if hive_schema else {}
+        return pl.scan_parquet(
+            dataset_dir / "**/*.parquet", hive_partitioning=True, **kwargs
+        )
+    frames = []
+    for path in files:
+        values = dict(
+            part.split("=", 1)
+            for part in path.relative_to(dataset_dir).parts[:-1]
+            if "=" in part
+        )
+        frame = pl.scan_parquet(path, hive_partitioning=False)
+        frames.append(
+            frame.with_columns(
+                pl.lit(None if value == HIVE_DEFAULT_PARTITION else value)
+                .cast(hive_schema.get(key, pl.String))
+                .alias(key)
+                for key, value in values.items()
+            )
+        )
+    return pl.concat(frames, how="diagonal_relaxed")
 
 
 def duckdb_view_sql(dataset_dir: Path, view_name: str | None = None) -> str:
