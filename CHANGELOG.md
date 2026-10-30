@@ -5,6 +5,23 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Adicionado
+- `lake_audit(lake_dir, input_dir=..., ledger=..., ...)` audita um lake e devolve um
+  `AuditReport` (`ok`, `to_dict()`, `to_json()`, `to_text()`). Confere, sem ler os
+  arquivos inteiros: os rodapés de todos os Parquets (incluindo os membros dos arquivos
+  agrupados) e a integridade do último row group; o `sha256` de cada origem contra o
+  bruto (manifesto ao lado do arquivo, ou o hash dele) e/ou contra um export do ledger
+  em JSONL ou CSV (`caminho`, `sha256`); a cobertura (todo arquivo vigente do bruto tem
+  Parquet, salvo gêmeos de formato, arquivos não tabulares, exceções conhecidas e o que
+  o `inventory()` do conversor declarar ignorado); versões duplicadas; profundidade de
+  partição uniforme por dataset; restos de escrita (`.tmp`); e o `check_dataset` de cada
+  dataset. Junções e links de diretório não são contados duas vezes. Os rodapés são lidos
+  em threads.
+- `footer_from_metadata` em `quantilica.analytics.lake`: o mesmo dicionário de `_footer`,
+  a partir de um rodapé já aberto.
+
 ## [0.7.1] - 2026-10-30
 
 ### Corrigido

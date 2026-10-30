@@ -348,10 +348,21 @@ def _footer(path: Path) -> dict[str, str]:
     there, so ``pq.read_schema(...).metadata`` would miss it.
     """
     try:
-        raw = pq.ParquetFile(path).metadata.metadata or {}
+        return footer_from_metadata(pq.ParquetFile(path).metadata)
     except (OSError, pa.ArrowException):
         return {}
-    return {k.decode(): v.decode(errors="replace") for k, v in raw.items()}
+
+
+def footer_from_metadata(metadata: pq.FileMetaData) -> dict[str, str]:
+    """File-level key/value metadata of an already opened Parquet footer.
+
+    For callers that open the file themselves (the lake audit reads the footer
+    and the last row group in one open) and would otherwise parse it twice.
+    """
+    return {
+        k.decode(): v.decode(errors="replace")
+        for k, v in (metadata.metadata or {}).items()
+    }
 
 
 def _part_files(directory: Path, key: str) -> list[Path]:

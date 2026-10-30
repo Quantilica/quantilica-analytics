@@ -20,6 +20,7 @@ from .lake import (
     duckdb_view_sql,
     scan_dataset,
 )
+from .lake_audit import AuditFinding, AuditReport, lake_audit
 from .reader import (
     DEFAULT_BR_NA,
     SmartReader,
@@ -35,6 +36,8 @@ except PackageNotFoundError:
     __version__ = "0.0.0"
 
 __all__ = [
+    "AuditFinding",
+    "AuditReport",
     "DEFAULT_BR_NA",
     "DEFAULT_NULL_SENTINELS",
     "DIM_GEO_CONTRACT",
@@ -52,6 +55,7 @@ __all__ = [
     "duckdb_view_sql",
     "get_dim_geo",
     "get_dim_uf",
+    "lake_audit",
     "manifest_to_metadata",
     "mun_6_to_7",
     "mun_7_to_6",
