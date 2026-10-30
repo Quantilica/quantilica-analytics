@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 
 import pytest
 from lake_corpus import (
     FakeConverter,
+    add_raw,
     build_corpus,
+    convert,
     plant_directory_link,
     plant_duplicate_member,
     plant_duplicate_version,
@@ -19,6 +22,7 @@ from lake_corpus import (
     plant_tmp_leftover,
     plant_truncated_parquet,
 )
+from quantilica.core.manifests import DownloadManifest, write_manifest_sidecar
 
 from quantilica.analytics import AuditReport, lake_audit
 from quantilica.analytics.lake_audit import read_ledger
@@ -486,14 +490,25 @@ def test_json_and_text(corpus) -> None:
         "findings",
         "links",
         "notes",
+        "timings",
     }
+    # sha256_divergente carries both digests in full; the others have no details
     assert set(data["findings"][0]) == {
         "category",
         "source",
         "dataset",
         "path",
         "message",
+        "details",
     }
+    assert set(data["findings"][1]) == {
+        "category",
+        "source",
+        "dataset",
+        "path",
+        "message",
+    }
+    assert {"rodapes", "listagem", "sha256", "cobertura"} <= set(data["timings"])
     text = report.to_text()
     assert "REPROVADO (2 achados)" in text
     assert "sha256_divergente: 1" in text
@@ -520,3 +535,208 @@ def test_progress_callback(corpus) -> None:
     seen = []
     audit(corpus, progress=lambda stage, done, total: seen.append(stage))
     assert {"rodapés", "sha256", "leitores"} <= set(seen)
+
+
+# --- same name in many folders ---------------------------------------------------
+
+
+def two_folders(corpus, *, convert_both: bool = True) -> tuple[Path, Path]:
+    """``eps/2025-01/Dados@20260101.zip`` and ``eps/2025-02/...``, other content."""
+    one = add_raw(corpus, "eps", "2025-01", "Dados@20260101.zip")
+    two = add_raw(corpus, "eps", "2025-02", "Dados@20260101.zip")
+    convert(corpus, one, "eps", "dados", {"mes": "01"})
+    if convert_both:
+        convert(corpus, two, "eps", "dados", {"mes": "02"})
+    return one, two
+
+
+def test_same_name_in_two_folders_is_clean(corpus) -> None:
+    two_folders(corpus)
+    report = audit(corpus, readers=False)
+    assert report.ok, report.to_text()
+    assert report.counts["expected_files"] == 15
+
+
+def test_same_name_other_folder_without_parquet_is_not_covered(corpus) -> None:
+    _, two = two_folders(corpus, convert_both=False)
+    report = audit(corpus, readers=False)
+    # the name alone does not cover the other folder: the digest has to match
+    assert categories(report) == {"sem_parquet": 1}
+    assert paths(report, "sem_parquet") == ["eps/2025-02/Dados@20260101.zip"]
+
+
+def test_same_name_sha_divergence_needs_no_file_to_match(corpus) -> None:
+    one, two = two_folders(corpus)
+    # Neither folder holds what the second Parquet was converted from any more.
+    two.write_text("mudou\n")
+    one_manifest = two.parent / (two.name + ".manifest.json")
+    changed = DownloadManifest.from_file(
+        source_id="eps", dataset_id="2025-02", url="x", file_path=two
+    )
+    write_manifest_sidecar(two, changed)
+    assert one_manifest.exists()
+    report = audit(corpus, readers=False)
+    (finding,) = [f for f in report.findings if f.category == "sha256_divergente"]
+    assert finding.path == "eps/dados/mes=02/Dados.parquet"
+    details = finding.details
+    assert details is not None
+    assert len(details["footer_sha256"]) == 64
+    assert len(details["raw_sha256"]) == 2  # both folders' digests, in full
+    assert details["footer_sha256"] not in details["raw_sha256"]
+    assert set(details["raw_files"]) == {
+        "eps/2025-01/Dados@20260101.zip",
+        "eps/2025-02/Dados@20260101.zip",
+    }
+    assert "versao_duplicada" not in categories(report)
+    assert json.loads(report.to_json())["findings"][0]["details"] == details
+
+
+def test_same_file_converted_twice_is_a_duplicate(corpus) -> None:
+    one, _ = two_folders(corpus)
+    convert(corpus, one, "eps", "dados", {"mes": "03"})
+    report = audit(corpus, readers=False)
+    assert categories(report) == {"versao_duplicada": 1}
+    (finding,) = report.findings
+    assert "Dados@20260101.zip" in finding.message
+    assert "2 lugares" in finding.message
+
+
+def test_two_versions_in_the_same_folder_are_a_duplicate(corpus) -> None:
+    old = add_raw(corpus, "eps", "2025-01", "Dados@20250101.zip", view=False)
+    new = add_raw(corpus, "eps", "2025-01", "Dados@20260101.zip")
+    convert(corpus, new, "eps", "dados", {"mes": "01"})
+    convert(corpus, old, "eps", "dados", {"mes": "00"})
+    report = audit(corpus, readers=False)
+    assert "versao_duplicada" in categories(report)
+    (finding,) = [f for f in report.findings if f.category == "versao_duplicada"]
+    assert "Dados@20250101.zip" in finding.message
+    assert "Dados@20260101.zip" in finding.message
+
+
+def test_versions_in_different_folders_are_not_duplicates(corpus) -> None:
+    # Dados@20260101 in one folder and Dados@20260201 in another: two periods.
+    one = add_raw(corpus, "eps", "2025-01", "Dados@20260101.zip")
+    two = add_raw(corpus, "eps", "2025-02", "Dados@20260201.zip")
+    convert(corpus, one, "eps", "dados", {"mes": "01"})
+    convert(corpus, two, "eps", "dados", {"mes": "02"})
+    assert audit(corpus, readers=False).ok
+
+
+# --- same content under another stamp ------------------------------------------------
+
+
+def test_origin_with_the_current_digest_is_an_alias(corpus) -> None:
+    content = "valor\n9\n"
+    old = add_raw(corpus, "eps", "td", "inv@20260503T000000.csv", content, view=False)
+    add_raw(corpus, "eps", "td", "inv@20260503T124826.csv", content)
+    convert(corpus, old, "eps", "inv", {"periodo": "2021"})
+    report = audit(corpus, readers=False)
+    assert report.ok, report.to_text()
+    assert report.counts["expected_files"] == 14
+
+
+def test_origin_with_another_digest_is_superseded(corpus) -> None:
+    old = add_raw(corpus, "eps", "td", "inv@20260503T000000.csv", "a\n", view=False)
+    add_raw(corpus, "eps", "td", "inv@20260503T124826.csv", "b\n")
+    convert(corpus, old, "eps", "inv", {"periodo": "2021"})
+    report = audit(corpus, readers=False)
+    assert categories(report) == {"origem_superada": 1, "sem_parquet": 1}
+
+
+def test_alias_also_holds_against_the_ledger(corpus, tmp_path: Path) -> None:
+    content = "valor\n9\n"
+    old = add_raw(corpus, "eps", "td", "inv@20260503T000000.csv", content, view=False)
+    add_raw(corpus, "eps", "td", "inv@20260503T124826.csv", content)
+    convert(corpus, old, "eps", "inv", {"periodo": "2021"})
+    ledger = write_ledger(corpus, tmp_path / "ledger.jsonl")
+    report = lake_audit(corpus.lake, ledger=ledger, readers=False, converters={})
+    assert report.ok, report.to_text()
+
+
+# --- sources without a converter ----------------------------------------------------
+
+
+def test_source_without_converter_is_not_coverage(corpus) -> None:
+    add_raw(corpus, "zeta", "dados", "a@20261021.csv")
+    add_raw(corpus, "zeta", "dados", "b@20261021.csv")
+    report = audit(corpus, readers=False)
+    assert report.ok, report.to_text()
+    assert report.counts["expected_files"] == 13
+    assert report.counts["files_without_converter"] == 2
+    assert report.counts["sources_without_converter"] == 1
+    assert any(n.startswith("fontes sem conversor: 2 arquivos") for n in report.notes)
+    assert "zeta=2" in report.to_text()
+
+
+def test_explicit_converter_puts_the_source_under_coverage(corpus) -> None:
+    add_raw(corpus, "zeta", "dados", "a@20261021.csv")
+    report = audit(corpus, readers=False, converters={"zeta": object()})
+    assert paths(report, "sem_parquet") == ["zeta/dados/a@20261021.csv"]
+    assert "files_without_converter" not in report.counts
+
+
+def test_entry_point_converter_puts_the_source_under_coverage(
+    corpus, monkeypatch
+) -> None:
+    module = importlib.import_module("quantilica.analytics.lake_audit")
+
+    add_raw(corpus, "zeta", "dados", "a@20261021.csv")
+    add_raw(corpus, "omega", "dados", "a@20261021.csv")
+    monkeypatch.setattr(
+        module, "load_lake_converter", lambda s: object() if s == "zeta" else None
+    )
+    report = audit(corpus, readers=False, converters=None)
+    assert paths(report, "sem_parquet") == ["zeta/dados/a@20261021.csv"]
+    assert report.counts["files_without_converter"] == 1  # omega
+
+
+def test_source_with_a_lake_directory_is_covered(corpus) -> None:
+    # No converter at all (converters={}), but the lake has the source.
+    plant_missing_parquet(corpus)
+    assert categories(audit(corpus, readers=False)) == {"sem_parquet": 1}
+
+
+def test_ledger_only_also_skips_sources_without_converter(corpus, tmp_path) -> None:
+    add_raw(corpus, "zeta", "dados", "a@20261021.csv")
+    ledger = write_ledger(corpus, tmp_path / "ledger.jsonl")
+    report = lake_audit(corpus.lake, ledger=ledger, readers=False, converters={})
+    assert report.ok, report.to_text()
+    assert report.counts["files_without_converter"] == 1
+
+
+# --- helper folders -----------------------------------------------------------------
+
+
+def test_underscore_folders_are_auxiliary(corpus) -> None:
+    add_raw(corpus, "alfa", "_documentacao/layouts", "layout@20261021.csv")
+    add_raw(corpus, "alfa", "_auxiliar", "tabela@20261021.xlsx")
+    report = audit(corpus, readers=False)
+    assert report.ok, report.to_text()
+    assert report.ignored["auxiliar"] == 2
+    assert "auxiliar=2" in report.to_text()
+
+
+def test_inventory_prevails_over_underscore_folders(corpus) -> None:
+    add_raw(corpus, "alfa", "_documentacao", "layout@20261021.csv")
+    converter = FakeConverter("alfa", {"layout@20261021.csv": "documentacao"})
+    report = audit(corpus, readers=False, converters={"alfa": converter})
+    assert paths(report, "sem_parquet") == ["alfa/_documentacao/layout@20261021.csv"]
+
+
+# --- cost ---------------------------------------------------------------------------
+
+
+def test_manifest_files_are_not_hashed(corpus, monkeypatch) -> None:
+    module = importlib.import_module("quantilica.analytics.lake_audit")
+    hashed = []
+    real = module.sha256_file
+    monkeypatch.setattr(module, "sha256_file", lambda p: hashed.append(p) or real(p))
+    assert audit(corpus, readers=False).ok
+    assert hashed == []  # every digest came from a manifest
+    # a file with no manifest is hashed, once (the DBC case)
+    add_raw(corpus, "eps", "2025-01", "Dados@20260101.zip")
+    manifest = corpus.view / "eps" / "2025-01" / "Dados@20260101.zip.manifest.json"
+    manifest.unlink()
+    convert(corpus, corpus.view / "eps" / "2025-01" / "Dados@20260101.zip", "eps", "d")
+    assert audit(corpus, readers=False).ok
+    assert len(hashed) == 1

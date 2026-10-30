@@ -11,14 +11,31 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - `lake_audit(lake_dir, input_dir=..., ledger=..., ...)` audita um lake e devolve um
   `AuditReport` (`ok`, `to_dict()`, `to_json()`, `to_text()`). Confere, sem ler os
   arquivos inteiros: os rodapés de todos os Parquets (incluindo os membros dos arquivos
-  agrupados) e a integridade do último row group; o `sha256` de cada origem contra o
-  bruto (manifesto ao lado do arquivo, ou o hash dele) e/ou contra um export do ledger
-  em JSONL ou CSV (`caminho`, `sha256`); a cobertura (todo arquivo vigente do bruto tem
-  Parquet, salvo gêmeos de formato, arquivos não tabulares, exceções conhecidas e o que
-  o `inventory()` do conversor declarar ignorado); versões duplicadas; profundidade de
-  partição uniforme por dataset; restos de escrita (`.tmp`); e o `check_dataset` de cada
-  dataset. Junções e links de diretório não são contados duas vezes. Os rodapés são lidos
-  em threads.
+  agrupados) e a integridade do último row group (lê só a coluna mais barata dele); o
+  `sha256` de cada origem contra o bruto (manifesto ao lado do arquivo, ou o hash dele) e/ou
+  contra um export do ledger em JSONL ou CSV (`caminho`, `sha256`); a cobertura; versões
+  duplicadas; profundidade de partição uniforme por dataset; restos de escrita (`.tmp`); e o
+  `check_dataset` de cada dataset. Junções e links de diretório não são contados duas
+  vezes. Os rodapés são lidos em threads, o hash dos brutos sem manifesto também, e os
+  brutos com manifesto nunca são relidos (`rehash=True` força). `report.timings` traz os
+  segundos de cada etapa.
+- A origem de um Parquet é casada por nome **e** `sha256`, não só pelo nome: o rodapé guarda
+  o nome do arquivo sem a pasta, e uma fonte pode repetir o mesmo nome em várias pastas com
+  conteúdos diferentes (`rfb-cnpj`). A proveniência está correta se algum arquivo bruto com
+  aquele nome tiver o `sha256`; `sha256_divergente` só quando nenhum tiver, e o achado traz
+  os `sha256` completos dos dois lados em `details` (no JSON). Origem com o `sha256` da
+  versão vigente do mesmo arquivo, só com outro carimbo de data no nome, não é
+  `origem_superada` e o arquivo vigente conta como coberto. `versao_duplicada` é o mesmo
+  (nome, `sha256`) em mais de um Parquet ou membro, ou duas versões do mesmo arquivo
+  (pasta, chave) no lake; nunca o mesmo nome em pastas diferentes.
+- Cobertura só nas fontes com conversor (`converters`, ou os entry points `quantilica.lake`
+  quando `None`) ou com diretório no lake. Os arquivos das outras fontes só são contados
+  (`counts["files_without_converter"]` e um aviso) e não reprovam. Arquivos sob pastas cujo
+  nome começa com `_` (`_documentacao`, `_auxiliar`) contam como ignorados (`auxiliar`)
+  quando o conversor não tem `inventory()` que os cubra; o `inventory()` prevalece.
+  Arquivos vigentes sem Parquet, não ignorados, continuam sendo `sem_parquet`; os gêmeos de
+  formato, os não tabulares, as exceções conhecidas e o que o `inventory()` declarar
+  ignorado não reprovam.
 - `footer_from_metadata` em `quantilica.analytics.lake`: o mesmo dicionário de `_footer`,
   a partir de um rodapé já aberto.
 - `quantilica.analytics.lake_build.lake_build(input_dir, lake_dir, ...)`: constrói o lake

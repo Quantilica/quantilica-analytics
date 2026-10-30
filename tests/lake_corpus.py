@@ -47,6 +47,13 @@ Planted defects (each mutates the corpus and returns the path it touched):
 ``plant_sha_mismatch``        the view's digest no longer matches the lake's
 ``plant_directory_link``      a directory symlink into the lake (or to outside it)
 
+Extra raw files (``add_raw``, which writes the file and its sidecar into the raw
+tree and, unless ``view=False``, into the view) and ``convert`` (a raw file into
+the lake, whatever its location) build the cases the base corpus does not hold:
+the same file name in two folders with different content, a version that only
+differs from the current one in its stamp, a source with no lake directory, a
+helper folder (``_documentacao``).
+
 Also ``FakeConverter``: a converter with an ``inventory()`` built from
 ``{file name: dataset id or skip reason}``.
 """
@@ -398,6 +405,64 @@ def plant_directory_link(corpus: Corpus, *, outside: bool = False) -> Path:
     except OSError:
         pytest.skip("cannot create directory symlinks here")
     return link
+
+
+def add_raw(
+    corpus: Corpus,
+    source: str,
+    folder: str,
+    name: str,
+    content: str | None = None,
+    *,
+    view: bool = True,
+) -> Path:
+    """Write a raw file (and its manifest) into the raw tree and, by default, the view.
+
+    The content defaults to something unique to ``source/folder/name``. Returns
+    the path in the view (or in the raw tree with ``view=False``).
+    """
+    text = (
+        content if content is not None else f"{CSV_CONTENT}# {source}/{folder}/{name}\n"
+    )
+    paths = []
+    for root in (corpus.raw, corpus.view) if view else (corpus.raw,):
+        path = root / source / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        manifest = DownloadManifest.from_file(
+            source_id=source,
+            dataset_id=folder or source,
+            url=f"https://example.invalid/{source}/{folder}/{name}",
+            file_path=path,
+        )
+        write_manifest_sidecar(path, manifest)
+        paths.append(path)
+    return paths[-1]
+
+
+def convert(
+    corpus: Corpus,
+    raw_file: Path,
+    source: str,
+    dataset: str,
+    partitions: dict[str, str] | None = None,
+) -> Path:
+    """Convert any raw file into ``lake/<source>/<dataset>``; returns the Parquet."""
+    partitions = partitions or {}
+    writer = LakeWriter(
+        corpus.dataset_dir(source, dataset),
+        DatasetDescriptor(
+            source_id=source,
+            dataset_id=dataset,
+            alias=dataset,
+            partition_keys=list(partitions),
+            partition_types={k: "varchar" for k in partitions},
+        ),
+    )
+    result = writer.write_polars(
+        pl.DataFrame({"valor": [1, 2, 3]}), raw_file, partitions=partitions
+    )
+    return result.output
 
 
 class FakeConverter:

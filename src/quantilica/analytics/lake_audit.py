@@ -11,22 +11,41 @@ grouped files included) and checks, in this order:
    ``origem_superada``, ``origem_fora_do_ledger``): the ``sha256`` each footer
    records for its raw origin must match the raw file in ``input_dir`` (the
    manifest sidecar's digest, else the file's hash) and/or the ``ledger`` export.
-3. **Duplicates** (``versao_duplicada``): the same raw file (by file key) must
-   not feed two Parquets of a dataset, as when two versions of it were converted
-   into different partitions.
-4. **Coverage** (``sem_parquet``): every current raw file of ``input_dir`` has a
-   Parquet, unless it is *ignored*: the converter's ``inventory()`` says so
-   (:class:`quantilica.core.lake.Planned`), or, without one, the heuristic does
-   (format twins and non-tabular files, see :data:`NON_TABULAR_SUFFIXES`), or
-   the caller listed it in ``known_exceptions``.
+   A footer keeps the origin's *name* only, not its folder, and a source may
+   repeat a name in many folders with different content (``rfb-cnpj``), so an
+   origin is matched on ``(name, sha256)``: it is fine when *any* raw file of
+   that name has that digest, and ``sha256_divergente`` is raised only when
+   none has (the finding's ``details`` hold both sides' digests in full). An
+   origin whose name is not in the raw but whose digest is that of the current
+   version of the same file key is the same content under an older stamp (an
+   *alias*): it is neither superseded nor missing.
+3. **Duplicates** (``versao_duplicada``): the same ``(origin name, sha256)`` in
+   more than one Parquet or member of a dataset, or two versions (different
+   names) of one raw file, that is, of the same ``(folder, file_key)``, in the
+   lake. The same file key in different folders is never a duplicate.
+4. **Coverage** (``sem_parquet``): every current raw file of a source *under
+   coverage* has a Parquet, unless it is *ignored*. A file is covered when some
+   Parquet or member has an origin with its name and its digest. A source is
+   under coverage when it has a converter (``converters``, or the
+   ``quantilica.lake`` entry points) or a directory in the lake; files of the
+   other sources are only counted (``counts["files_without_converter"]`` and a
+   note), and do not fail the audit. A file is ignored when the converter's
+   ``inventory()`` says so (:class:`quantilica.core.lake.Planned`); without one,
+   when the heuristic does (format twins, non-tabular files, see
+   :data:`NON_TABULAR_SUFFIXES`, and files under a folder whose name starts
+   with ``_``, such as ``_documentacao`` or ``_auxiliar``, reason ``auxiliar``);
+   or when the caller listed it in ``known_exceptions``.
 5. **Structure** (``particao_mista``, ``tmp_sobrando``, ``fora_do_layout``): one
    partition depth per dataset, no staging leftovers.
 6. **Readers** (``leitores``): :func:`~quantilica.analytics.lake.check_dataset`
    on every dataset (DuckDB, Polars and PyArrow agree). Expensive;
    ``readers=False`` skips it.
 
-Only footers are read (plus one column of one row group per file), never whole
-files, and the footers are read by a thread pool. Directory symlinks and
+Only footers are read (plus the cheapest column of the last row group of each
+file), never whole files, and the footers are read by a thread pool. Raw files
+with a manifest are never hashed (``rehash=True`` forces it); those without one
+are hashed in threads, once, and only when an origin names them. The seconds
+each stage took are in ``report.timings``. Directory symlinks and
 junctions are never counted twice: one that points inside the lake is skipped
 (its target is reached in place), and one that points outside is followed once
 per real destination.
@@ -95,10 +114,10 @@ CATEGORIES: dict[str, str] = {
     "sem_proveniencia": "Parquet sem origin_file e origin_sha256 no rodapé",
     "sha256_divergente": "sha256 da origem difere do bruto ou do ledger",
     "origem_sem_bruto": "origem que não está no bruto",
-    "origem_superada": "origem é uma versão anterior à vigente",
+    "origem_superada": "origem é uma versão anterior à vigente, com outro conteúdo",
     "origem_fora_do_ledger": "origem que não está no ledger",
-    "versao_duplicada": "o mesmo arquivo bruto em mais de um Parquet",
-    "sem_parquet": "arquivo bruto vigente sem Parquet e não ignorado",
+    "versao_duplicada": "o mesmo arquivo bruto, ou duas versões dele, no lake",
+    "sem_parquet": "arquivo bruto vigente de fonte com conversor, sem Parquet",
     "particao_mista": "dataset com Parquets em profundidades de partição diferentes",
     "tmp_sobrando": "restos de escrita (.tmp) no lake",
     "fora_do_layout": "Parquet fora de <fonte>/<dataset>/",
@@ -146,7 +165,9 @@ class AuditFinding:
 
     ``path`` is relative to the lake for everything found in it, and relative to
     the raw input for ``sem_parquet``. ``source`` and ``dataset`` are empty when
-    the finding does not belong to a dataset.
+    the finding does not belong to a dataset. ``details`` carries what the
+    message abbreviates (for ``sha256_divergente``: the full digests of both
+    sides) and is left out of the JSON when empty.
     """
 
     category: str
@@ -154,15 +175,19 @@ class AuditFinding:
     path: str | None = None
     source: str | None = None
     dataset: str | None = None
+    details: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "category": self.category,
             "source": self.source,
             "dataset": self.dataset,
             "path": self.path,
             "message": self.message,
         }
+        if self.details:  # only where there is more to say (sha256_divergente)
+            out["details"] = dict(self.details)
+        return out
 
 
 @dataclass
@@ -186,6 +211,7 @@ class AuditReport:
     findings: list[AuditFinding] = field(default_factory=list)
     links: list[dict[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    timings: dict[str, float] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -213,6 +239,7 @@ class AuditReport:
             "findings": [f.to_dict() for f in self.findings],
             "links": [dict(link) for link in self.links],
             "notes": list(self.notes),
+            "timings": dict(self.timings),
         }
 
     def to_json(self, *, indent: int | None = 2) -> str:
@@ -230,7 +257,8 @@ class AuditReport:
         ]
         if "expected_files" in c:
             lines.append(
-                f"  cobertura: {c['expected_files']} arquivos vigentes, "
+                f"  cobertura: {c['expected_files']} arquivos vigentes de fontes com "
+                f"conversor, "
                 f"{c.get('with_parquet', 0)} com Parquet, "
                 f"{sum(self.ignored.values())} ignorados"
                 + (
@@ -436,14 +464,32 @@ def _inspect(item: tuple[tuple[str, ...], Path], integrity: bool) -> _FileInfo:
                     if md.num_rows:
                         info.error = "sem row groups, mas o rodapé declara linhas"
                 elif pf.schema_arrow.names:
+                    last = pf.num_row_groups - 1
                     pf.read_row_group(
-                        pf.num_row_groups - 1,
-                        columns=[pf.schema_arrow.names[0]],
+                        last,
+                        columns=[_cheapest_column(pf, last)],
                         use_threads=False,
                     )
     except (OSError, ValueError, pa.ArrowException) as exc:
         info.error = f"{type(exc).__name__}: {str(exc)[:150]}"
     return info
+
+
+def _cheapest_column(pf: pq.ParquetFile, row_group: int) -> str:
+    """The column of ``row_group`` with the fewest compressed bytes.
+
+    Reading (and decoding) one column of the last row group is the integrity
+    check; the smallest one proves the same thing for a fraction of the I/O. With
+    nested columns (leaf columns and fields do not line up) it falls back to the
+    first field.
+    """
+    names, md = pf.schema_arrow.names, pf.metadata
+    if len(names) == md.num_columns > 1:
+        group = md.row_group(row_group)
+        return names[
+            min(range(len(names)), key=lambda i: group.column(i).total_compressed_size)
+        ]
+    return names[0]
 
 
 # --- raw input ---------------------------------------------------------------------
@@ -481,16 +527,6 @@ def _is_non_tabular(name: str) -> bool:
     )
 
 
-def _index(paths: Iterable[str]) -> tuple[dict, dict]:
-    by_name: dict[tuple[str, str], list[str]] = defaultdict(list)
-    by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
-    for rel in paths:
-        name = rel.rpartition("/")[2]
-        by_name[(_source_of(rel), name)].append(rel)
-        by_key[(_source_of(rel), file_key(name))].append(rel)
-    return by_name, by_key
-
-
 @dataclass(frozen=True)
 class _Origin:
     """The raw origin a Parquet (or a member of one) declares in its footer."""
@@ -504,20 +540,93 @@ class _Origin:
     lake_rel: str
 
 
-def _group(findings: list[tuple[_Origin, str, str]]) -> list[AuditFinding]:
+class _Raw:
+    """Raw files (paths relative to the raw root) with their digests.
+
+    ``shas`` maps a path to every digest known for it (one for a file of the
+    view, several where a ledger lists a path more than once). Files are
+    indexed by ``(source, name)`` and by ``(source, file_key)``: a name alone
+    is not an identity, since one source may keep the same file name in many
+    folders (``rfb-cnpj`` repeats ``Cnaes@20250520.zip`` in every competence).
+    """
+
+    def __init__(self, paths: Iterable[str], shas: Mapping[str, Collection[str]]):
+        self.shas: dict[str, frozenset[str]] = {
+            p: frozenset(shas.get(p, ())) for p in paths
+        }
+        self.by_name: dict[tuple[str, str], list[str]] = defaultdict(list)
+        self.by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for rel in self.shas:
+            name = rel.rpartition("/")[2]
+            self.by_name[(_source_of(rel), name)].append(rel)
+            self.by_key[(_source_of(rel), file_key(name))].append(rel)
+
+
+@dataclass(frozen=True)
+class _Match:
+    """How one declared origin relates to the raw files.
+
+    * ``ok``: a file of that name has the origin's digest (``files``: those);
+    * ``alias``: no file has that name, but a file of the same key has the
+      origin's digest, i.e. the same content under another version stamp;
+    * ``divergente``: files have that name, none has the digest (``files``: all);
+    * ``superada``: only other versions of the key exist (``files``: them);
+    * ``sem_bruto``: nothing with that name or key.
+    """
+
+    status: str
+    files: tuple[str, ...] = ()
+
+    @property
+    def covered(self) -> tuple[str, ...]:
+        """The raw files this origin accounts for in the coverage check.
+
+        A single file of that name with another digest is also accounted for:
+        the ``sha256_divergente`` it raised already points at it. With the
+        same name in several folders, only the files with the digest count.
+        """
+        if self.status in ("ok", "alias"):
+            return self.files
+        if self.status == "divergente" and len(self.files) == 1:
+            return self.files
+        return ()
+
+
+def _match(origin: _Origin, raw: _Raw) -> _Match:
+    named = raw.by_name.get((origin.source, origin.name))
+    if named:
+        same = tuple(f for f in named if origin.sha256 in raw.shas[f])
+        return _Match("ok", same) if same else _Match("divergente", tuple(named))
+    keyed = raw.by_key.get((origin.source, file_key(origin.name)), [])
+    same = tuple(f for f in keyed if origin.sha256 in raw.shas[f])
+    if same:
+        return _Match("alias", same)
+    return _Match("superada", tuple(keyed)) if keyed else _Match("sem_bruto")
+
+
+def _short(digests: Iterable[str]) -> str:
+    return ", ".join(sorted(d[:12] for d in digests))
+
+
+_Flagged = tuple[_Origin, str, str, Mapping[str, Any] | None]
+
+
+def _group(findings: list[_Flagged]) -> list[AuditFinding]:
     """One finding per (category, dataset, origin, detail), counting the files."""
     grouped: dict[tuple[str, str, str, str, str], list[_Origin]] = {}
-    messages: dict[tuple[str, str, str, str, str], str] = {}
-    for origin, category, message in findings:
+    extras: dict[tuple[str, str, str, str, str], Mapping[str, Any] | None] = {}
+    for origin, category, message, details in findings:
         k = (category, origin.source, origin.dataset, origin.name, message)
         grouped.setdefault(k, []).append(origin)
-        messages[k] = message
+        extras[k] = details
     out = []
     for k, origins in grouped.items():
-        message = messages[k]
+        message = k[4]
         if len(origins) > 1:
             message += f" ({len(origins)} arquivos)"
-        out.append(AuditFinding(k[0], message, origins[0].lake_rel, k[1], k[2]))
+        out.append(
+            AuditFinding(k[0], message, origins[0].lake_rel, k[1], k[2], extras[k])
+        )
     return out
 
 
@@ -561,9 +670,12 @@ def lake_audit(
             patterns allowed) that are known to have no Parquet, such as files
             corrupt at the source. They are not reported by the coverage check.
         converters: ``source_id -> converter`` whose ``inventory()`` decides what
-            is ignored. ``None`` looks each source up in the ``quantilica.lake``
-            entry points; pass ``{}`` to use the heuristic everywhere. A source
-            whose converter has no ``inventory()`` uses the heuristic.
+            is ignored; the keys are also the sources that have a converter (the
+            others, if they have no directory in the lake, are not held to
+            coverage). ``None`` looks each source up in the ``quantilica.lake``
+            entry points; pass ``{}`` to use the heuristic on the sources that
+            are in the lake. A source whose converter has no ``inventory()``
+            uses the heuristic.
         rehash: Always hash the raw files instead of trusting the digest in
             their manifest sidecar.
         workers: Threads reading footers (default: twice the CPUs, up to 32).
@@ -595,9 +707,17 @@ def lake_audit(
             progress(stage, done, total)
 
     n_workers = workers or min(32, (os.cpu_count() or 4) * 2)
+    mark = time.monotonic()
+
+    def lap(stage: str) -> None:
+        nonlocal mark
+        now = time.monotonic()
+        report.timings[stage] = round(report.timings.get(stage, 0.0) + now - mark, 2)
+        mark = now
 
     # footers, integrity and structure
     scan = _scan_lake(lake_path, wanted)
+    lap("varredura")
     report.links = scan.links
     foot = _read_footprint(scan, integrity, n_workers, step)
     findings = foot.findings
@@ -617,7 +737,8 @@ def lake_audit(
     report.checks["integridade"] = "ok" if integrity else "desligada (só o rodapé)"
     report.checks["estrutura"] = "ok"
 
-    # provenance and duplicates
+    # provenance, duplicates and coverage
+    lap("rodapes")
     traced = [o for o in foot.origins if o.name and o.sha256]
     findings += [
         AuditFinding(
@@ -630,17 +751,26 @@ def lake_audit(
         for o in foot.origins
         if not (o.name and o.sha256)
     ]
-    findings += _check_duplicates(traced)
-    current = None
+    current: list[str] | None = None
+    raw: _Raw | None = None  # the raw side that decides dirs, digests and coverage
+    matches: dict[_Origin, _Match] = {}
     gone: set[_Origin] = set()
     if input_path is not None:
         current = _current(_list_files(input_path, wanted))
-        flagged, gone = _check_input(
+        lap("listagem")
+        raw, matches, flagged = _check_input(
             traced, current, input_path, rehash, n_workers, step
         )
+        gone = {o for o, m in matches.items() if m.status in ("superada", "sem_bruto")}
         findings += _group(flagged)
+        lap("sha256")
     if ledger_shas is not None:
-        findings += _group(_check_ledger(traced, ledger_shas, gone))
+        ledger_raw = _Raw(ledger_shas, ledger_shas)
+        ledger_matches = {o: _match(o, ledger_raw) for o in traced}
+        findings += _group(_check_ledger(traced, ledger_matches, ledger_shas, gone))
+        if raw is None:
+            raw, matches = ledger_raw, ledger_matches
+    findings += _check_duplicates(traced, raw)
     sides = [
         n for n, v in (("bruto", current), ("ledger", ledger_shas)) if v is not None
     ]
@@ -649,28 +779,32 @@ def lake_audit(
         if sides
         else "não executada (sem input_dir nem ledger)"
     )
+    lap("proveniencia")
 
-    # coverage
     expected = current
     if expected is None and ledger_shas is not None:
         expected = _current(ledger_shas)
     if expected is None:
         report.checks["cobertura"] = "não executada (sem input_dir nem ledger)"
     else:
+        accounted = {f for m in matches.values() for f in m.covered}
         findings += _coverage(
             report,
             expected,
-            {(o.source, o.name) for o in traced},
+            accounted,
             input_path if current is not None else None,
             known_exceptions,
             converters,
+            {s for s, _ in scan.datasets} | {o.source for o in foot.origins},
         )
         report.checks["cobertura"] = "ok"
+    lap("cobertura")
 
     # readers
     if readers:
         findings += _check_readers(scan, step)
         report.checks["leitores"] = "ok"
+        lap("leitores")
     else:
         report.checks["leitores"] = "desligada"
 
@@ -698,6 +832,7 @@ def lake_audit(
         members=foot.members,
         findings=len(report.findings),
     )
+    lap("relatorio")
     report.seconds = time.monotonic() - started
     return report
 
@@ -849,28 +984,73 @@ def _check_depth(foot: _Footprint, scan: _LakeScan) -> list[AuditFinding]:
     return out
 
 
-def _check_duplicates(traced: list[_Origin]) -> list[AuditFinding]:
-    """``versao_duplicada``: one raw file in more than one place of a dataset."""
-    by_key: dict[tuple[str, str, str], list[_Origin]] = defaultdict(list)
-    for origin in traced:
-        by_key[(origin.source, origin.dataset, origin.key)].append(origin)
+def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFinding]:
+    """``versao_duplicada``: one raw file, or two versions of it, in the lake.
+
+    Two cases, both inside one dataset:
+
+    * the same ``(origin name, sha256)`` in more than one Parquet or member;
+    * two versions (different names) of the same raw file, a *raw file* being
+      ``(folder, file_key)`` of the raw side. The folder is found through the
+      raw side (the file of that name and digest; failing that, the only folder
+      holding the key), so an origin it cannot place is left out. Without a raw
+      side, only the first case is checked.
+
+    The same file key in different folders is never a duplicate: it is how
+    sources repeat file names from one period to the next.
+    """
     out = []
-    for (source, dataset, key), group in sorted(by_key.items()):
-        units = {o.unit for o in group}
-        if len(units) > 1 or len({(o.name, o.sha256) for o in group}) > 1:
+    same: dict[tuple[str, str, str, str], list[_Origin]] = defaultdict(list)
+    for origin in traced:
+        same[(origin.source, origin.dataset, origin.name, origin.sha256)].append(origin)
+    for (source, dataset, name, sha), group in sorted(same.items()):
+        units = sorted({o.unit for o in group})
+        if len(units) > 1:
             where = sorted({o.lake_rel for o in group})
-            names = sorted({o.name for o in group})
             out.append(
                 AuditFinding(
                     "versao_duplicada",
-                    f"{key!r} está em {len(units)} lugares "
-                    f"({', '.join(names)}): {', '.join(where[:4])}",
+                    f"{name} (sha256 {sha[:12]}) está em {len(units)} lugares: "
+                    f"{', '.join(where[:4])}",
+                    where[0],
+                    source,
+                    dataset,
+                )
+            )
+    if raw is None:
+        return out
+    versions: dict[tuple[str, str, str, str], list[_Origin]] = defaultdict(list)
+    for origin in traced:
+        folder = _folder_of(origin, raw)
+        if folder is not None:
+            versions[
+                (origin.source, origin.dataset, folder, file_key(origin.name))
+            ].append(origin)
+    for (source, dataset, folder, key), group in sorted(versions.items()):
+        names = sorted({o.name for o in group})
+        if len(names) > 1:
+            where = sorted({o.lake_rel for o in group})
+            out.append(
+                AuditFinding(
+                    "versao_duplicada",
+                    f"{key!r} de {folder or '.'} tem {len(names)} versões no "
+                    f"lake ({', '.join(names)}): {', '.join(where[:4])}",
                     where[0],
                     source,
                     dataset,
                 )
             )
     return out
+
+
+def _folder_of(origin: _Origin, raw: _Raw) -> str | None:
+    """The raw folder an origin comes from, or ``None`` when it is ambiguous."""
+    files = raw.by_name.get((origin.source, origin.name)) or raw.by_key.get(
+        (origin.source, file_key(origin.name)), []
+    )
+    exact = [f for f in files if origin.sha256 in raw.shas[f]]
+    folders = {f.rpartition("/")[0] for f in exact or files}
+    return next(iter(folders)) if len(folders) == 1 else None
 
 
 def _check_input(
@@ -880,68 +1060,89 @@ def _check_input(
     rehash: bool,
     n_workers: int,
     step: Progress,
-) -> tuple[list[tuple[_Origin, str, str]], set[_Origin]]:
-    """Origins against the raw input; also the origins with no current file."""
-    by_name, by_file_key = _index(current)
-    need = sorted({rel for o in traced for rel in by_name.get((o.source, o.name), ())})
+) -> tuple[_Raw, dict[_Origin, _Match], list[_Flagged]]:
+    """Origins against the raw input: the index, each match and the findings."""
+    names = _Raw(current, {})
+    need: set[str] = set()
+    for o in traced:
+        need.update(
+            names.by_name.get((o.source, o.name))
+            or names.by_key.get((o.source, file_key(o.name)), ())
+        )
 
     def digest_of(rel: str) -> tuple[str, str]:
-        if not rehash:
+        if not rehash:  # the manifest's digest stands for the file
             manifest = read_manifest_sidecar(input_path / rel)
             if manifest is not None and manifest.sha256:
                 return rel, manifest.sha256.lower()
         return rel, sha256_file(input_path / rel).lower()
 
-    digests: dict[str, str] = {}
+    digests: dict[str, set[str]] = {}
+    todo = sorted(need)
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for i, (rel, digest) in enumerate(pool.map(digest_of, need), start=1):
-            digests[rel] = digest
-            if i % 100 == 0 or i == len(need):
-                step("sha256", i, len(need))
-    flagged: list[tuple[_Origin, str, str]] = []
-    gone: set[_Origin] = set()
-    for o in traced:
-        files = by_name.get((o.source, o.name))
-        if files:
-            if o.sha256 not in {digests[f] for f in files}:
-                flagged.append(
-                    (
-                        o,
-                        "sha256_divergente",
-                        f"{o.name}: o rodapé tem {o.sha256[:12]}, o bruto "
-                        f"{digests[files[0]][:12]}",
-                    )
-                )
-            continue
-        gone.add(o)
-        newest = by_file_key.get((o.source, file_key(o.name)))
-        if newest:
-            message = f"{o.name} não é a versão vigente ({newest[0]})"
-            flagged.append((o, "origem_superada", message))
-        else:
-            flagged.append((o, "origem_sem_bruto", f"{o.name} não existe no bruto"))
-    return flagged, gone
-
-
-def _check_ledger(
-    traced: list[_Origin], ledger: dict[str, set[str]], gone: set[_Origin]
-) -> list[tuple[_Origin, str, str]]:
-    """Origins against the ledger (skipping those already flagged as gone)."""
-    by_name, _ = _index(ledger)
-    flagged: list[tuple[_Origin, str, str]] = []
-    for o in traced:
-        if o in gone:
-            continue
-        files = by_name.get((o.source, o.name))
-        if not files:
-            flagged.append((o, "origem_fora_do_ledger", f"{o.name} não está no ledger"))
-        elif o.sha256 not in {s for f in files for s in ledger[f]}:
+        for i, (rel, digest) in enumerate(pool.map(digest_of, todo), start=1):
+            digests[rel] = {digest}
+            if i % 100 == 0 or i == len(todo):
+                step("sha256", i, len(todo))
+    raw = _Raw(current, digests)
+    matches = {o: _match(o, raw) for o in traced}
+    flagged: list[_Flagged] = []
+    for o, m in matches.items():
+        if m.status == "divergente":
+            theirs = {s for f in m.files for s in raw.shas[f]}
             flagged.append(
                 (
                     o,
                     "sha256_divergente",
-                    f"{o.name}: o rodapé tem {o.sha256[:12]}, o ledger tem outro",
+                    f"{o.name}: o rodapé tem {o.sha256[:12]}, o bruto {_short(theirs)}",
+                    {
+                        "origin_file": o.name,
+                        "footer_sha256": o.sha256,
+                        "raw_sha256": sorted(theirs),
+                        "raw_files": {f: sorted(raw.shas[f]) for f in m.files},
+                    },
                 )
+            )
+        elif m.status == "superada":
+            message = f"{o.name} não é a versão vigente ({m.files[0]})"
+            flagged.append((o, "origem_superada", message, None))
+        elif m.status == "sem_bruto":
+            message = f"{o.name} não existe no bruto"
+            flagged.append((o, "origem_sem_bruto", message, None))
+    return raw, matches, flagged
+
+
+def _check_ledger(
+    traced: list[_Origin],
+    matches: dict[_Origin, _Match],
+    ledger: dict[str, set[str]],
+    gone: set[_Origin],
+) -> list[_Flagged]:
+    """Origins against the ledger (skipping those already flagged as gone)."""
+    flagged: list[_Flagged] = []
+    for o in traced:
+        m = matches[o]
+        if o in gone or m.status in ("ok", "alias"):
+            continue
+        if m.status == "divergente":
+            theirs = {s for f in m.files for s in ledger[f]}
+            flagged.append(
+                (
+                    o,
+                    "sha256_divergente",
+                    f"{o.name}: o rodapé tem {o.sha256[:12]}, o ledger "
+                    f"{_short(theirs)}",
+                    {
+                        "origin_file": o.name,
+                        "footer_sha256": o.sha256,
+                        "ledger_sha256": sorted(theirs),
+                        "ledger_files": {f: sorted(ledger[f]) for f in m.files},
+                    },
+                )
+            )
+        else:
+            flagged.append(
+                (o, "origem_fora_do_ledger", f"{o.name} não está no ledger", None)
             )
     return flagged
 
@@ -987,68 +1188,86 @@ def _where(parts: tuple[str, ...]) -> tuple[str | None, str | None]:
 def _coverage(
     report: AuditReport,
     expected: list[str],
-    covered_names: set[tuple[str, str]],
+    accounted: set[str],
     input_path: Path | None,
     known_exceptions: Collection[str],
     converters: Mapping[str, Any] | None,
+    lake_sources: Collection[str],
 ) -> list[AuditFinding]:
-    """``sem_parquet`` for current raw files with no Parquet that are not ignored."""
+    """``sem_parquet`` for current raw files with no Parquet that are not ignored.
+
+    ``accounted`` holds the raw files some origin accounts for (same name and
+    digest, see :class:`_Match`). Only the sources that have a converter, or a
+    directory in the lake, are held to coverage; the others are summed up in
+    ``report.notes`` and ``counts["files_without_converter"]``.
+    """
     exceptions = [_norm_rel(p) for p in known_exceptions]
     planned: dict[str, str | None] = {}  # rel -> skip reason (None: expects Parquet)
-    if input_path is not None:
-        for source in sorted({_source_of(r) for r in expected} - {""}):
-            converter = (
-                converters.get(source)
-                if converters is not None
-                else _discover(source, report.notes)
+    sources = sorted({_source_of(r) for r in expected})
+    in_scope: set[str] = set()
+    for source in sources:
+        if not source:  # loose files at the root belong to no source
+            continue
+        if converters is not None:
+            found, converter = source in converters, converters.get(source)
+        else:
+            found, converter = _discover(source, report.notes)
+        if not (found or source in lake_sources):
+            continue
+        in_scope.add(source)
+        if input_path is None or converter is None:
+            continue
+        try:
+            inventory = converter_inventory(converter, input_path / source)
+        except Exception as exc:  # noqa: BLE001 - fall back to the heuristic
+            report.notes.append(
+                f"inventory() de {source} falhou ({type(exc).__name__}: {exc}); "
+                "usando a heurística"
             )
-            if converter is None:
-                continue
+            continue
+        if inventory is None:
+            continue
+        for item in inventory:
+            path = Path(item.path)
+            if not path.is_absolute():
+                path = input_path / source / path
             try:
-                inventory = converter_inventory(converter, input_path / source)
-            except Exception as exc:  # noqa: BLE001 - fall back to the heuristic
-                report.notes.append(
-                    f"inventory() de {source} falhou ({type(exc).__name__}: {exc}); "
-                    "usando a heurística"
-                )
+                rel = path.relative_to(input_path).as_posix()
+            except ValueError:
                 continue
-            if inventory is None:
-                continue
-            for item in inventory:
-                path = Path(item.path)
-                if not path.is_absolute():
-                    path = input_path / source / path
-                try:
-                    rel = path.relative_to(input_path).as_posix()
-                except ValueError:
-                    continue
-                planned[rel] = item.skip_reason
+            planned[rel] = item.skip_reason
 
+    unscoped: Counter[str] = Counter()
     ignored: Counter[str] = Counter()
     missing: list[AuditFinding] = []
     covered = 0
+    scoped = 0
     groups: dict[tuple[str, str], list[str]] = defaultdict(list)
     for rel in expected:
-        name = rel.rpartition("/")[2]
         source = _source_of(rel)
+        if source not in in_scope:
+            unscoped[source or "(raiz)"] += 1
+            continue
+        scoped += 1
+        name = rel.rpartition("/")[2]
         if _matches(rel, exceptions):
             ignored["excecao_conhecida"] += 1
         elif rel in planned:
             reason = planned[rel]
             if reason is not None:
                 ignored[reason] += 1
-            elif (source, name) in covered_names:
+            elif rel in accounted:
                 covered += 1
             else:
                 missing.append(_missing(rel, "o conversor espera um Parquet"))
+        elif _is_auxiliary(rel):
+            ignored["auxiliar"] += 1
         elif _is_non_tabular(name):
             ignored["nao_tabular"] += 1
         else:
             groups[(rel.rpartition("/")[0], file_key(name))].append(rel)
     for files in (groups[k] for k in sorted(groups)):
-        have = [
-            f for f in files if (_source_of(f), f.rpartition("/")[2]) in covered_names
-        ]
+        have = [f for f in files if f in accounted]
         if have:
             covered += len(have)
             if len(files) > len(have):
@@ -1057,21 +1276,37 @@ def _coverage(
             for rel in files:
                 twins = f" (gêmeos: {len(files)})" if len(files) > 1 else ""
                 missing.append(_missing(rel, f"sem Parquet{twins}"))
+    if unscoped:
+        total = sum(unscoped.values())
+        detail = ", ".join(f"{s}={n}" for s, n in unscoped.most_common())
+        report.notes.append(
+            f"fontes sem conversor: {total} arquivos em {len(unscoped)} fontes "
+            f"({detail}); não entram na cobertura"
+        )
+        report.counts["files_without_converter"] = total
+        report.counts["sources_without_converter"] = len(unscoped)
     report.ignored = dict(ignored)
-    report.counts["expected_files"] = len(expected)
+    report.counts["expected_files"] = scoped
     report.counts["with_parquet"] = covered
     return missing
+
+
+def _is_auxiliary(rel: str) -> bool:
+    """A file under a folder whose name starts with ``_`` (inside its source)."""
+    return any(part.startswith("_") for part in rel.split("/")[1:-1])
 
 
 def _missing(rel: str, message: str) -> AuditFinding:
     return AuditFinding("sem_parquet", message, rel, _source_of(rel) or None)
 
 
-def _discover(source: str, notes: list[str]) -> Any | None:
+def _discover(source: str, notes: list[str]) -> tuple[bool, Any | None]:
+    """``(has a converter, converter)``; a plugin that fails to load still counts."""
     try:
-        return load_lake_converter(source)
+        converter = load_lake_converter(source)
     except Exception as exc:  # noqa: BLE001 - a broken plugin must not stop the audit
         notes.append(
             f"conversor de {source} não carregou ({type(exc).__name__}: {exc})"
         )
-        return None
+        return True, None
+    return converter is not None, converter
