@@ -1,6 +1,6 @@
 [project]
 name = "quantilica-analytics"
-version = "0.7.1"
+version = "0.8.0"
 description = "Analytical data processing and conversion layer for Quantilica"
 readme = "README.md"
 authors = [
@@ -32,7 +32,7 @@ dependencies = [
     "duckdb>=1.2.0",
     "polars>=1.0.0",
     "pyarrow>=15.0.0",
-    "quantilica-core>=0.14.1",
+    "quantilica-core>=0.15.0",
 ]
 
 [project.urls]
