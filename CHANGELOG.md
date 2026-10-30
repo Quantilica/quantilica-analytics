@@ -14,6 +14,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   column in file outside of expected schema"). Os arquivos passam a ser combinados pelo
   nome da coluna, com supertipos e nulos nas colunas ausentes, como o `union_by_name` do
   DuckDB; quando todos têm o mesmo esquema, a leitura continua num `scan_parquet` só.
+- `check_dataset` conta as linhas no Polars por partição: num dataset com mais de 4,29
+  bilhões de linhas, a contagem única estourava o inteiro de 32 bits do Polars.
 
 ## [0.7.0] - 2026-10-30
 

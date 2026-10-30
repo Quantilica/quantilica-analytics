@@ -211,3 +211,25 @@ def test_esquema_que_muda_entre_periodos(tmp_path: Path) -> None:
     assert df["nat_jur"].to_list() == [None, None, "2062"]
     assert df["codigo"].to_list() == ["10", "11", "A1"]
     assert df["ano"].to_list() == ["2020", "2020", "2021"]
+
+
+def test_check_dataset_conta_por_particao_acima_do_limite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import quantilica.analytics.lake as lake_mod
+
+    lake = tmp_path / "lake"
+    writer = _writer(lake, ["ano"])
+    for ano, rows in (("2020", 3), ("2021", 2)):
+        src = _raw(tmp_path, f"sih-rd_{ano}-sp@20220101.dbc", ano)
+        writer.write_member(
+            pl.DataFrame({"valor": list(range(rows))}),
+            src,
+            group_key=f"sih-rd_{ano}",
+            partitions={"ano": ano},
+            member_columns={"uf": "sp"},
+        )
+    monkeypatch.setattr(
+        lake_mod, "_POLARS_MAX_COUNT", 4
+    )  # força o caminho por partição
+    assert check_dataset(lake / "datasus" / "sih-rd") == []

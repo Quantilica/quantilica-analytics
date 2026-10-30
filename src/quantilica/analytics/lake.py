@@ -1604,6 +1604,10 @@ def _check_footers(
     return errors
 
 
+# Linhas acima das quais o Polars (índice u32) não conta o dataset de uma vez.
+_POLARS_MAX_COUNT = 2**32
+
+
 def _check_readers(
     dataset_dir: Path, descriptor: DatasetDescriptor, files: list[Path]
 ) -> list[str]:
@@ -1636,7 +1640,29 @@ def _check_readers(
     # Polars, through scan_dataset.
     try:
         lazy = scan_dataset(dataset_dir)
-        counts["polars"] = lazy.select(pl.len()).collect().item()
+        if declared and expected_rows >= _POLARS_MAX_COUNT:
+            # Sem o build de 64 bits, o Polars conta em u32 e estoura acima de
+            # 4,29 bilhões de linhas (o SIA-PA tem 7,6 bilhões): conta uma partição
+            # por vez. Um group_by sobre o dataset inteiro materializa tudo.
+            first = next(iter(declared))
+            values = sorted(
+                {
+                    part.split("=", 1)[1]
+                    for p in files
+                    for part in p.relative_to(dataset_dir).parts[:-1]
+                    if part.startswith(f"{first}=")
+                }
+            )
+            want = _partition_type(first, declared[first])[1]
+            counts["polars"] = sum(
+                lazy.filter(pl.col(first) == pl.lit(v).cast(want))
+                .select(pl.len())
+                .collect()
+                .item()
+                for v in values
+            )
+        else:
+            counts["polars"] = lazy.select(pl.len()).collect().item()
         schema = lazy.collect_schema()
         for key, declared_type in declared.items():
             want = _partition_type(key, declared_type)[1]
