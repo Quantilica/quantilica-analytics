@@ -23,6 +23,10 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - O `LakeWriter` grava o Parquet em disco (`fsync`) antes de publicá-lo por rename. Sem
   isso, uma queda de energia logo depois podia deixar o arquivo publicado truncado.
 
+### Alterado
+- Exige `quantilica-core>=0.14.1`, cujo `file_key` tira a data dos DBCs: `compact_members`
+  depende disso para manter só a versão mais nova de cada bruto.
+
 ## [0.6.0] - 2026-10-29
 
 ### Adicionado
