@@ -601,6 +601,18 @@ def test_same_file_converted_twice_is_a_duplicate(corpus) -> None:
     assert "2 lugares" in finding.message
 
 
+def test_same_file_published_in_two_folders_is_not_a_duplicate(corpus) -> None:
+    # The source publishes the very same bytes in two competences.
+    content = "valor\n7\n"
+    one = add_raw(corpus, "eps", "2025-01", "Dados@20260101.zip", content)
+    two = add_raw(corpus, "eps", "2025-02", "Dados@20260101.zip", content)
+    convert(corpus, one, "eps", "dados", {"mes": "01"})
+    convert(corpus, two, "eps", "dados", {"mes": "02"})
+    assert audit(corpus, readers=False).ok
+    convert(corpus, one, "eps", "dados", {"mes": "03"})
+    assert categories(audit(corpus, readers=False)) == {"versao_duplicada": 1}
+
+
 def test_two_versions_in_the_same_folder_are_a_duplicate(corpus) -> None:
     old = add_raw(corpus, "eps", "2025-01", "Dados@20250101.zip", view=False)
     new = add_raw(corpus, "eps", "2025-01", "Dados@20260101.zip")

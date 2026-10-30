@@ -989,7 +989,9 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
 
     Two cases, both inside one dataset:
 
-    * the same ``(origin name, sha256)`` in more than one Parquet or member;
+    * the same ``(origin name, sha256)`` in more Parquets or members than the raw
+      side has files of that name and digest (a source may publish the very same
+      file in two folders, e.g. two competences);
     * two versions (different names) of the same raw file, a *raw file* being
       ``(folder, file_key)`` of the raw side. The folder is found through the
       raw side (the file of that name and digest; failing that, the only folder
@@ -1005,7 +1007,11 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
         same[(origin.source, origin.dataset, origin.name, origin.sha256)].append(origin)
     for (source, dataset, name, sha), group in sorted(same.items()):
         units = sorted({o.unit for o in group})
-        if len(units) > 1:
+        copies = 1
+        if raw is not None:
+            files = raw.by_name.get((source, name), [])
+            copies = max(1, sum(sha in raw.shas[f] for f in files))
+        if len(units) > copies:
             where = sorted({o.lake_rel for o in group})
             out.append(
                 AuditFinding(
