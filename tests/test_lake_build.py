@@ -33,11 +33,16 @@ def _raw(tmp_path: Path, *folders: str) -> Path:
     return root
 
 
-def _records(lake: Path) -> list[dict]:
+def _all_lines(lake: Path) -> list[dict]:
+    """Every line of the state files, closing lines included."""
     rows = []
-    for path in sorted((lake / ".build").glob("*.jsonl")):
-        rows += [json.loads(line) for line in path.read_text().splitlines()]
+    for run in lb._load_runs(lake / ".build"):  # oldest first
+        rows += [json.loads(line) for line in run.path.read_text().splitlines()]
     return rows
+
+
+def _task_lines(lake: Path) -> list[dict]:
+    return [r for r in _all_lines(lake) if "event" not in r]
 
 
 def _build(tmp_path: Path, converters: dict, **kwargs):
@@ -88,7 +93,7 @@ def test_failures_are_isolated_recorded_and_retried(tmp_path):
     sums = summary.sources["src"]
     assert sums.tasks_ok == 2 and sums.tasks_failed == 4
     assert sorted(sums.failed_datasets) == ["crash", "memory", "partial", "raises"]
-    by_ds = {r["dataset"]: r for r in _records(tmp_path / "lake")}
+    by_ds = {r["dataset"]: r for r in _task_lines(tmp_path / "lake")}
     assert {d: r["status"] for d, r in by_ds.items()} == {
         "good-1": "ok",
         "good-2": "ok",
@@ -108,25 +113,23 @@ def test_failures_are_isolated_recorded_and_retried(tmp_path):
     }  # fmt: skip
     assert by_ds["good-1"]["converted"] == 1 and by_ds["good-1"]["errors"] == 0
 
-    # Segunda execução, sem retry_errors: não refaz nada, mas continua falhando.
-    again = _build(tmp_path, {"src": conv})
-    assert again.has_errors
-    assert sorted(ds for _, ds in again.previous_failures) == [
-        "crash", "memory", "partial", "raises",
-    ]  # fmt: skip
-    assert count_calls(control, "src", "good-1") == 1
-    assert count_calls(control, "src", "raises") == 1
+    # As quatro falhas ficaram registradas numa execução fechada, com erros.
+    (closing,) = [r for r in _all_lines(tmp_path / "lake") if "event" in r]
+    assert closing["event"] == "run_complete"
+    assert closing["tasks"] == 6 and closing["failed"] == 4
 
-    # retry_errors refaz só as que falharam (agora corrigidas).
+    # retry_errors refaz só as que falharam (agora corrigidas), numa execução nova.
     fixed = FakeConverter("src", conv.datasets(), control)
     retried = _build(tmp_path, {"src": fixed}, retry_errors=True)
     assert not retried.has_errors
+    assert not retried.resumed_run and retried.run_id != summary.run_id
     assert retried.sources["src"].tasks_ok == 4
     assert retried.sources["src"].tasks_already_done == 2
     assert count_calls(control, "src", "good-1") == 1
     assert count_calls(control, "src", "raises") == 2
-    # Terceira execução: tudo concluído, nada a fazer.
-    assert not _build(tmp_path, {"src": fixed}).has_errors
+    # Sem erros na execução mais recente, retry_errors não tem o que refazer.
+    nothing = _build(tmp_path, {"src": fixed}, retry_errors=True)
+    assert not nothing.has_errors and nothing.sources["src"].tasks_ok == 0
     assert count_calls(control, "src", "raises") == 2
 
 
@@ -246,7 +249,8 @@ def test_disk_precheck_skipped_when_nothing_is_pending(tmp_path, monkeypatch):
     conv = FakeConverter("src", ["a"], control)
     _build(tmp_path, {"src": conv})
     _fake_disk(monkeypatch, free=0)
-    assert not _build(tmp_path, {"src": conv}).has_errors
+    # Nada com erro na execução mais recente: nada pendente, sem checar o disco.
+    assert not _build(tmp_path, {"src": conv}, retry_errors=True).has_errors
 
 
 # --- interrupção -------------------------------------------------------------
@@ -321,7 +325,7 @@ def test_interrupt_ends_whole_process_tree_and_resume_skips_done(tmp_path, label
             lambda: (
                 (pids / "b.grandchild").exists()
                 and (pids / "b.task").exists()
-                and any(r["dataset"] == "a" for r in _records(lake))
+                and any(r["dataset"] == "a" for r in _task_lines(lake))
             )
         ), "the build did not reach the hanging task"
         task_pid = int((pids / "b.task").read_text())
@@ -342,8 +346,8 @@ def test_interrupt_ends_whole_process_tree_and_resume_skips_done(tmp_path, label
     ), "orphan process left behind"
     assert not _pid_alive(driver.pid)
 
-    # Só "a" está registrada; "b" ficou sem linha (não terminou).
-    assert [(r["dataset"], r["status"]) for r in _records(lake)] == [("a", "ok")]
+    # Só "a" está registrada; "b" ficou sem linha e a execução sem fechamento.
+    assert [(r["dataset"], r["status"]) for r in _all_lines(lake)] == [("a", "ok")]
 
     # Retomada: "a" não é refeita, "b" (agora sem travar) é convertida.
     conv = FakeConverter("slow", ["a", "b"], control)
@@ -356,11 +360,14 @@ def test_interrupt_ends_whole_process_tree_and_resume_skips_done(tmp_path, label
         prevent_sleep=False,
     )
     assert not summary.has_errors
+    assert summary.resumed_run and "resumed" in summary.format()
     assert summary.sources["slow"].tasks_already_done == 1
     assert summary.sources["slow"].tasks_ok == 1
     assert count_calls(control, "slow", "a") == 1
     assert count_calls(control, "slow", "b") == 2
-    assert len(list((lake / ".build").glob("*.jsonl"))) == 2
+    # Mesmo arquivo; só agora ganha a linha de fechamento.
+    assert len(list((lake / ".build").glob("*.jsonl"))) == 1
+    assert _all_lines(lake)[-1]["event"] == "run_complete"
 
 
 def test_truncated_state_line_is_ignored(tmp_path):
@@ -368,11 +375,219 @@ def test_truncated_state_line_is_ignored(tmp_path):
     _raw(tmp_path, "src")
     conv = FakeConverter("src", ["a", "b"], control)
     _build(tmp_path, {"src": conv})
-    state = next((tmp_path / "lake" / ".build").glob("*.jsonl"))
-    state.write_text(state.read_text() + '{"source": "src", "data')  # queda de energia
+    lake = tmp_path / "lake"
+    state = next((lake / ".build").glob("*.jsonl"))
+    # Queda de energia no meio do fechamento: a linha fica pela metade.
+    lines = state.read_text().splitlines()
+    state.write_text("\n".join(lines[:-1]) + '\n{"run_id": "x", "event": "run_co')
     summary = _build(tmp_path, {"src": conv})
-    assert summary.sources["src"].tasks_already_done == 2
+    assert summary.resumed_run and summary.sources["src"].tasks_already_done == 2
     assert count_calls(control, "src", "a") == 1
+    # O fechamento novo não colou na linha pela metade.
+    last = state.read_text().splitlines()[-1]
+    assert json.loads(last)["event"] == "run_complete"
+
+
+# --- execuções: fechamento, retomada, nova execução --------------------------
+
+
+def test_complete_run_writes_closing_line_and_next_run_redoes_all_tasks(tmp_path):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["a", "b"], control)
+
+    first = _build(tmp_path, {"src": conv})
+
+    assert not first.resumed_run
+    lines = _all_lines(tmp_path / "lake")
+    assert [r.get("event") for r in lines] == [None, None, "run_complete"]
+    closing = lines[-1]
+    assert closing["run_id"] == first.run_id
+    assert closing["tasks"] == 2 and closing["failed"] == 0
+    assert closing["finished_at"] >= lines[0]["finished_at"]
+    assert set(closing) == {"run_id", "event", "finished_at", "tasks", "failed"}
+
+    # Chegam versões novas do bruto: nova execução roda tudo (o conversor decide).
+    second = _build(tmp_path, {"src": conv})
+    assert not second.resumed_run
+    assert second.run_id != first.run_id
+    assert "resumed" not in second.format()
+    assert second.sources["src"].tasks_ok == 2
+    assert second.sources["src"].tasks_already_done == 0
+    assert count_calls(control, "src", "a") == 2
+    assert count_calls(control, "src", "b") == 2
+    assert len(list((tmp_path / "lake" / ".build").glob("*.jsonl"))) == 2
+
+
+def _interrupt_last_run(lake: Path) -> Path:
+    """Simulate an interruption: drop the closing line of the newest run."""
+    state = lb._load_runs(lake / ".build")[-1].path
+    lines = state.read_text().splitlines()
+    assert json.loads(lines[-1])["event"] == "run_complete"
+    state.write_text("\n".join(lines[:-1]) + "\n")
+    return state
+
+
+def test_interrupted_run_resumes_same_run_and_skips_ok_tasks(tmp_path):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["a", "b", "c"], control)
+    first = _build(tmp_path, {"src": conv})
+    state = _interrupt_last_run(tmp_path / "lake")
+    # "c" não chegou a ser registrada.
+    kept = [ln for ln in state.read_text().splitlines() if '"dataset": "c"' not in ln]
+    state.write_text("\n".join(kept) + "\n")
+
+    resumed = _build(tmp_path, {"src": conv})
+
+    assert resumed.resumed_run
+    assert resumed.run_id == first.run_id and resumed.state_file == state
+    assert "resumed" in resumed.format()
+    assert resumed.sources["src"].tasks_already_done == 2
+    assert resumed.sources["src"].tasks_ok == 1
+    assert count_calls(control, "src", "a") == 1
+    assert count_calls(control, "src", "c") == 2
+    lines = _all_lines(tmp_path / "lake")
+    assert lines[-1]["event"] == "run_complete" and lines[-1]["tasks"] == 3
+    assert len(list((tmp_path / "lake" / ".build").glob("*.jsonl"))) == 1
+    # Fechada, a seguinte volta a ser uma execução nova.
+    assert not _build(tmp_path, {"src": conv}).resumed_run
+
+
+def test_retry_errors_redoes_only_failures_of_latest_run(tmp_path):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    bad = FakeConverter("src", ["a", "b", "c"], control, {"b": "raise"})
+    _build(tmp_path, {"src": bad})
+    good = FakeConverter("src", ["a", "b", "c"], control)
+    # Uma execução anterior com erro não conta: só a mais recente.
+    _build(tmp_path, {"src": good})
+    assert count_calls(control, "src", "a") == 2
+
+    retried = _build(tmp_path, {"src": bad}, retry_errors=True)
+    assert not retried.has_errors  # a mais recente não tinha erros
+    assert count_calls(control, "src", "b") == 2
+
+    _build(tmp_path, {"src": bad})  # nova execução: "b" falha de novo
+    calls_b = count_calls(control, "src", "b")
+    calls_a = count_calls(control, "src", "a")
+    retried = _build(tmp_path, {"src": good}, retry_errors=True)
+    assert retried.sources["src"].tasks_ok == 1
+    assert retried.sources["src"].tasks_already_done == 2
+    assert count_calls(control, "src", "b") == calls_b + 1
+    assert count_calls(control, "src", "a") == calls_a
+    closing = _all_lines(tmp_path / "lake")[-1]
+    assert closing["tasks"] == 1 and closing["failed"] == 0
+
+
+def test_retry_errors_on_interrupted_run_adds_unrecorded_tasks(tmp_path):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    bad = FakeConverter("src", ["a", "b", "c"], control, {"b": "raise"})
+    first = _build(tmp_path, {"src": bad})
+    state = _interrupt_last_run(tmp_path / "lake")
+    kept = [ln for ln in state.read_text().splitlines() if '"dataset": "c"' not in ln]
+    state.write_text("\n".join(kept) + "\n")
+    good = FakeConverter("src", ["a", "b", "c"], control)
+
+    # Sem retry_errors a retomada deixa a falha quieta (e a reporta).
+    plain = _build(tmp_path, {"src": bad})
+    assert plain.resumed_run and plain.has_errors
+    assert plain.previous_failures == [("src", "b")]
+    assert count_calls(control, "src", "b") == 1
+    assert _all_lines(tmp_path / "lake")[-1]["failed"] == 1
+
+    _interrupt_last_run(tmp_path / "lake")
+    retried = _build(tmp_path, {"src": good}, retry_errors=True)
+    assert retried.resumed_run and retried.run_id == first.run_id
+    assert not retried.has_errors
+    assert count_calls(control, "src", "b") == 2
+    assert count_calls(control, "src", "a") == 1
+
+
+def test_force_starts_a_new_run_even_after_interruption(tmp_path):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["a", "b"], control)
+    first = _build(tmp_path, {"src": conv})
+    _interrupt_last_run(tmp_path / "lake")
+
+    forced = _build(tmp_path, {"src": conv}, force=True)
+
+    assert not forced.resumed_run and forced.run_id != first.run_id
+    assert count_calls(control, "src", "a") == 2
+    assert _all_lines(tmp_path / "lake")[-1]["run_id"] == forced.run_id
+
+
+def test_legacy_state_without_closing_line_is_resumed(tmp_path):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["a", "b"], control)
+    lake = tmp_path / "lake"
+    legacy = lake / ".build" / "20260101T000000Z.jsonl"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        json.dumps(
+            {
+                "run_id": "20260101T000000Z",
+                "source": "src",
+                "dataset": "a",
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2026-01-01T00:00:05+00:00",
+                "seconds": 5.0,
+                "status": "ok",
+                "converted": 1,
+                "skipped": 0,
+                "errors": 0,
+                "message": None,
+            }
+        )  # fmt: skip
+        + "\n"
+    )
+
+    summary = _build(tmp_path, {"src": conv})
+
+    assert summary.resumed_run and summary.run_id == "20260101T000000Z"
+    assert summary.sources["src"].tasks_already_done == 1
+    assert count_calls(control, "src", "a") == 0
+    assert count_calls(control, "src", "b") == 1
+    assert _all_lines(lake)[-1]["event"] == "run_complete"
+
+
+def test_interruption_writes_no_closing_line(tmp_path, monkeypatch):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["a", "b"], control)
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(lb, "_run", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        _build(tmp_path, {"src": conv})
+    assert not any("event" in r for r in _all_lines(tmp_path / "lake"))
+
+
+def test_explicit_run_id_resumes_unfinished_and_rejects_finished(tmp_path):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["a"], control)
+    _build(tmp_path, {"src": conv}, run_id="mine")
+    with pytest.raises(LakeBuildError, match="already exists"):
+        _build(tmp_path, {"src": conv}, run_id="mine")
+    _interrupt_last_run(tmp_path / "lake")
+    assert _build(tmp_path, {"src": conv}, run_id="mine").resumed_run
+
+
+def test_quick_successive_runs_keep_chronological_order(tmp_path):
+    # Execuções no mesmo segundo ganham sufixo "-2", "-3"...; a mais recente
+    # tem de ser a de maior sufixo (e "-10" depois de "-9").
+    runs = [
+        lb._RunState(run_id=rid, path=Path(rid), last_time="2026-01-01T00:00:00+00:00")
+        for rid in ("20260101T000000Z-10", "20260101T000000Z-2", "20260101T000000Z")
+    ]
+    ordered = [r.run_id for r in sorted(runs, key=lb._run_order)]
+    assert ordered == ["20260101T000000Z", "20260101T000000Z-2", "20260101T000000Z-10"]
 
 
 # --- keep_awake --------------------------------------------------------------

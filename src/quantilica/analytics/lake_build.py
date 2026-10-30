@@ -11,10 +11,20 @@ into the lake, one task per ``(source, dataset)``:
   ``MemoryError``, a crash or ``os._exit`` in one task never takes the others
   down. On interruption (Ctrl+C, SIGTERM, SIGHUP, Ctrl+Break) the parent ends
   every child *and its descendants* before re-raising.
-* **Resumable state.** ``<lake_dir>/.build/<run-id>.jsonl`` holds one line per
-  finished task. A later run skips what ended ``ok`` in any earlier run;
-  ``retry_errors`` redoes the failed ones, ``force`` redoes everything. There
-  are no global phase markers.
+* **Runs and resuming.** ``<lake_dir>/.build/<run-id>.jsonl`` holds one line per
+  finished task and, when the run ends without interruption (with or without
+  failed tasks), a closing line
+  ``{"run_id": ..., "event": "run_complete", "finished_at": ..., "tasks": n,
+  "failed": k}``. On start, if the most recent run has no closing line (it was
+  interrupted) the build *resumes* it: same ``run_id`` and file, skipping its
+  ``ok`` tasks. If the most recent run is complete, a *new* run starts and runs
+  every task; the converters themselves skip files already in the lake with the
+  same ``sha256``, so a repeated task is cheap and only what changed is
+  reconverted. ``retry_errors`` redoes only the failed tasks of the most recent
+  run (plus the unrecorded ones, if it was interrupted); ``force`` starts a new
+  run and redoes everything. A ``.jsonl`` written before the closing line
+  existed has none, so the newest legacy file is treated as an interrupted run.
+  There are no global phase markers.
 * **Resources and safety nets.** DuckDB memory, threads and the scratch
   directory are parameters (they become the ``QUANTILICA_DUCKDB_MEMORY``,
   ``QUANTILICA_DUCKDB_THREADS`` and ``QUANTILICA_LAKE_SCRATCH`` variables in
@@ -56,6 +66,7 @@ logger = logging.getLogger("quantilica.analytics.lake_build")
 BUILD_DIRNAME = ".build"
 DUCKDB_MEMORY_ENV = "QUANTILICA_DUCKDB_MEMORY"
 DUCKDB_THREADS_ENV = "QUANTILICA_DUCKDB_THREADS"
+EVENT_RUN_COMPLETE = "run_complete"
 STATUS_OK = "ok"
 STATUS_ERROR = "erro"
 # Estimativas conservadoras da pré-checagem de disco, como fração do bruto
@@ -123,9 +134,12 @@ class BuildSummary:
     * ``sources``: per-source totals (only sources that had tasks);
     * ``failed_tasks``: the tasks that failed in this run;
     * ``previous_failures``: ``(source, dataset)`` that failed in an earlier run
-      and were left alone because ``retry_errors`` was off;
+      in the run being resumed and were left alone because ``retry_errors`` was
+      off;
     * ``ignored_sources``: folders skipped because they have no converter;
-    * ``failed_sources``: sources whose dataset list could not be read.
+    * ``failed_sources``: sources whose dataset list could not be read;
+    * ``resumed_run``: this run continued an interrupted one (same ``run_id``
+      and state file) instead of starting a new run.
 
     :attr:`has_errors` is what a command should turn into its exit code.
     """
@@ -138,6 +152,7 @@ class BuildSummary:
     ignored_sources: dict[str, str] = field(default_factory=dict)
     failed_sources: dict[str, str] = field(default_factory=dict)
     seconds: float = 0.0
+    resumed_run: bool = False
 
     @property
     def has_errors(self) -> bool:
@@ -164,6 +179,8 @@ class BuildSummary:
     def format(self) -> str:
         """Plain-text report, one line per source."""
         lines = [f"lake build {self.run_id} ({self.seconds:.0f}s)"]
+        if self.resumed_run:
+            lines.append("  resumed: continued an interrupted run")
         for s in self.sources.values():
             lines.append(
                 f"  {s.source}: converted={s.converted} skipped={s.skipped} "
@@ -344,21 +361,49 @@ def _check_disk(
             )
 
 
-def _load_state(build_dir: Path) -> dict[tuple[str, str], str]:
-    """Best status of each ``(source, dataset)`` over every earlier run."""
-    state: dict[tuple[str, str], str] = {}
-    for path in sorted(build_dir.glob("*.jsonl")):
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    rec = json.loads(line)
-                    key = (rec["source"], rec["dataset"])
-                    status = rec["status"]
-                except (ValueError, KeyError, TypeError):
-                    continue  # linha truncada por queda de energia
-                if status == STATUS_OK or state.get(key) != STATUS_OK:
-                    state[key] = status
-    return state
+@dataclass
+class _RunState:
+    """What one ``.build/<run-id>.jsonl`` says: last status per task, and
+    whether the closing line is there."""
+
+    run_id: str
+    path: Path
+    status: dict[tuple[str, str], str] = field(default_factory=dict)
+    complete: bool = False
+    last_time: str = ""
+
+
+def _read_run(path: Path) -> _RunState:
+    run = _RunState(run_id=path.stem, path=path)
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+                if rec.get("event") == EVENT_RUN_COMPLETE:
+                    run.complete = True
+                    run.last_time = max(run.last_time, str(rec.get("finished_at", "")))
+                    continue
+                key = (rec["source"], rec["dataset"])
+                run.status[key] = rec["status"]  # a later line overrides
+                run.last_time = max(run.last_time, str(rec.get("finished_at", "")))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue  # linha truncada por queda de energia
+    return run
+
+
+def _run_order(run: _RunState) -> tuple[str, str, int]:
+    # Instante da última linha; empate (execuções no mesmo segundo): "<id>-2"
+    # vem depois de "<id>".
+    base, _, n = run.run_id.rpartition("-")
+    if base and n.isdigit():
+        return run.last_time, base, int(n)
+    return run.last_time, run.run_id, 1
+
+
+def _load_runs(build_dir: Path) -> list[_RunState]:
+    """Every run in ``.build/``, oldest first."""
+    runs = [_read_run(p) for p in build_dir.glob("*.jsonl")]
+    return sorted(runs, key=_run_order)
 
 
 def _new_run_id(build_dir: Path) -> str:
@@ -370,11 +415,39 @@ def _new_run_id(build_dir: Path) -> str:
     return run_id
 
 
-def _append_record(path: Path, record: TaskRecord) -> None:
+def _append_line(path: Path, data: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+        fh.write(json.dumps(data, ensure_ascii=False) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
+
+
+def _append_record(path: Path, record: TaskRecord) -> None:
+    _append_line(path, asdict(record))
+
+
+def _close_run(path: Path, run_id: str, tasks: int, failed: int) -> None:
+    _append_line(
+        path,
+        {
+            "run_id": run_id,
+            "event": EVENT_RUN_COMPLETE,
+            "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "tasks": tasks,
+            "failed": failed,
+        },
+    )
+
+
+def _end_with_newline(path: Path) -> None:
+    """A run cut by a power failure may end in a half line; keep the next one apart."""
+    with path.open("rb+") as fh:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            return
+        fh.seek(-1, os.SEEK_END)
+        if fh.read(1) != b"\n":
+            fh.write(b"\n")
 
 
 # --- child process --------------------------------------------------------
@@ -726,10 +799,12 @@ def lake_build(
         threads: DuckDB threads of each task.
         scratch: Directory for archive extraction and DuckDB's temporary files
             (put it on a fast disk).
-        force: Redo every task and reconvert even what the lake has current.
-        retry_errors: Also redo tasks that failed in an earlier run. Without it
-            they are left alone and reported in ``previous_failures``. Tasks
-            that never finished (interrupted) always run.
+        force: Start a new run and redo every task with ``force``, reconverting
+            even what the lake has current.
+        retry_errors: Redo only the tasks that failed in the most recent run,
+            finished or not (plus its unrecorded tasks, if it was interrupted).
+            Without it, a resumed run leaves its failed tasks alone and reports
+            them in ``previous_failures``.
         check_disk: Compare free space with the estimate before converting;
             ``False`` skips the check.
         disk_factor: Lake size as a fraction of the pending raw data.
@@ -739,7 +814,17 @@ def lake_build(
             entry points. A value is an object (must be picklable, since the
             task processes are spawned) or a ``"package.module:attribute"``
             string imported in the task process.
-        run_id: Name of this run's state file; defaults to a UTC timestamp.
+        run_id: Name of a new run's state file (defaults to a UTC timestamp), or
+            of an interrupted run to resume; an already finished run raises
+            :class:`LakeBuildError`.
+
+    A run that ends without interruption (with or without failed tasks) writes
+    a final ``run_complete`` line. If the most recent run lacks it, it is
+    resumed (same ``run_id``/file, its ``ok`` tasks skipped, ``resumed_run``
+    true in the summary); otherwise a new run starts and runs every task, which
+    is cheap because the converters skip files already in the lake with the
+    same ``sha256``. A state file from before the closing line existed is
+    treated as an interrupted run.
 
     Returns:
         BuildSummary: per-source totals; check ``has_errors`` for the exit code.
@@ -749,7 +834,7 @@ def lake_build(
         InsufficientDiskError: not enough free space (see ``check_disk``).
         KeyboardInterrupt: after ending every child process, when interrupted
             by Ctrl+C, SIGTERM, SIGHUP or Ctrl+Break. What finished stays in
-            the state file, so running again resumes.
+            the state file (no closing line), so running again resumes.
     """
     started = time.monotonic()
     input_path, lake_path = Path(input_dir), Path(lake_dir)
@@ -762,26 +847,47 @@ def lake_build(
     converters = dict(converters or {})
 
     build_dir = lake_path / BUILD_DIRNAME
-    run_id = run_id or _new_run_id(build_dir)
-    summary = BuildSummary(run_id=run_id, state_file=build_dir / f"{run_id}.jsonl")
+    runs = _load_runs(build_dir) if build_dir.is_dir() else []
+    resume, reference = _choose_run(runs, run_id, force, retry_errors)
+    if resume is not None:
+        run_id = resume.run_id
+    else:
+        run_id = run_id or _new_run_id(build_dir)
+    path = resume.path if resume is not None else build_dir / f"{run_id}.jsonl"
+    summary = BuildSummary(
+        run_id=run_id, state_file=path, resumed_run=resume is not None
+    )
 
     tasks = _plan(input_path, sources, converters, summary)
-    state = _load_state(build_dir) if build_dir.is_dir() else {}
     pending: list[_Task] = []
+    scope = 0  # tasks this run answers for (the closing line's "tasks")
     for task in tasks:
-        status = state.get((task.source, task.dataset))
         sums = summary.sources.setdefault(task.source, SourceSummary(task.source))
-        if force or status is None:
+        status = (
+            reference.status.get((task.source, task.dataset)) if reference else None
+        )
+        if force or reference is None:
             pending.append(task)
         elif status == STATUS_OK:
             sums.tasks_already_done += 1
+        elif status is None:
+            if resume is not None:
+                pending.append(task)
+            else:
+                continue  # retry_errors on a complete run: not its business
         elif retry_errors:
             pending.append(task)
         else:
             summary.previous_failures.append((task.source, task.dataset))
+        scope += 1
+    if resume is None and reference is not None:
+        scope = len(pending)  # retry_errors on a complete run: a run of the failed
 
     if not pending:
         logger.info("lake build: nothing to do (%d tasks already done)", len(tasks))
+        if resume is not None:
+            _end_with_newline(path)
+            _close_run(path, run_id, scope, len(summary.previous_failures))
         summary.seconds = time.monotonic() - started
         return summary
 
@@ -789,8 +895,9 @@ def lake_build(
     pending.sort(key=lambda t: -t.size)
     pending_bytes = sum({t.source: t.size for t in pending}.values())
     logger.info(
-        "lake build %s: %d tasks (%d already done), %.1f GB raw, %d processes",
+        "lake build %s%s: %d tasks (%d already done), %.1f GB raw, %d processes",
         summary.run_id,
+        " (resumed)" if resume is not None else "",
         len(pending),
         len(tasks) - len(pending),
         pending_bytes / 1e9,
@@ -799,13 +906,41 @@ def lake_build(
     if check_disk:
         _check_disk(lake_path, scratch_path, pending_bytes, disk_factor, scratch_factor)
     build_dir.mkdir(parents=True, exist_ok=True)
+    if resume is not None:
+        _end_with_newline(path)
 
     wake = keep_awake() if prevent_sleep else contextlib.nullcontext()
     with wake, _interrupts_as_keyboard_interrupt():
         _run(pending, summary, workers, lake_path, force, memory, threads, scratch_path)
+    # Só chega aqui sem interrupção: com tarefas com erro também se fecha a execução.
+    _close_run(
+        path, run_id, scope, len(summary.failed_tasks) + len(summary.previous_failures)
+    )
     summary.seconds = time.monotonic() - started
     logger.info("lake build %s finished:\n%s", summary.run_id, summary.format())
     return summary
+
+
+def _choose_run(
+    runs: list[_RunState], run_id: str | None, force: bool, retry_errors: bool
+) -> tuple[_RunState | None, _RunState | None]:
+    """``(run to resume, run whose statuses decide what to skip)``.
+
+    Resume the most recent run if it has no closing line (``force`` never
+    resumes). A complete most recent run is only consulted, for
+    ``retry_errors``; the build then starts a new run with its failed tasks.
+    """
+    if run_id is not None:
+        same = next((r for r in runs if r.run_id == run_id), None)
+        if same is not None and (same.complete or force):
+            raise LakeBuildError(f"run {run_id!r} already exists in the lake state")
+        return (same, same) if same is not None else (None, None)
+    if force or not runs:
+        return None, None
+    latest = runs[-1]
+    if not latest.complete:
+        return latest, latest
+    return None, latest if retry_errors else None
 
 
 def _plan(

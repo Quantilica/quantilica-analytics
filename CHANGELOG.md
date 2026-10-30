@@ -5,6 +5,27 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Alterado
+- `lake_build` passa a distinguir execuções. Ao terminar sem interrupção (com ou sem
+  tarefas com erro), cada execução grava no fim do seu `.jsonl` uma linha de fechamento
+  `{"run_id", "event": "run_complete", "finished_at", "tasks", "failed"}`; as linhas de
+  tarefa não mudam. Ao iniciar: se a execução mais recente não tem o fechamento (foi
+  interrompida), ela é retomada (mesmo `run_id` e arquivo, pulando as tarefas `ok`); se
+  terminou, começa uma execução nova que roda todas as tarefas, e os conversores só
+  reconvertem o que mudou no bruto (arquivos já no lake com o mesmo `sha256` são pulados).
+  Antes, qualquer tarefa concluída em qualquer execução anterior era pulada para sempre,
+  e chegar uma versão nova do bruto não gerava reconversão.
+- `retry_errors=True` refaz só as tarefas com erro da execução mais recente (terminada ou
+  não), mais as ainda não registradas dela se foi interrompida; numa execução terminada,
+  abre uma execução nova só com essas tarefas. `force=True` abre sempre uma execução nova
+  com tudo forçado. Um `run_id` explícito de execução já terminada levanta `LakeBuildError`;
+  o de uma interrompida a retoma.
+- `BuildSummary.resumed_run` informa se a execução retomou uma interrompida, e
+  `BuildSummary.format()` passa a avisar. Arquivos `.jsonl` de versões anteriores, sem
+  linha de fechamento, são tratados como execução interrompida (o mais recente é retomado).
+
 ## [0.8.0] - 2026-10-30
 
 ### Adicionado
