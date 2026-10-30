@@ -21,6 +21,23 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   em threads.
 - `footer_from_metadata` em `quantilica.analytics.lake`: o mesmo dicionário de `_footer`,
   a partir de um rodapé já aberto.
+- `quantilica.analytics.lake_build.lake_build(input_dir, lake_dir, ...)`: constrói o lake
+  a partir de uma árvore de brutos, com uma tarefa por `(fonte, dataset)`. Os datasets de
+  cada fonte vêm de `converter.datasets()` (nunca do nome da pasta, que nem sempre é o id)
+  e cada tarefa roda num processo próprio: `MemoryError`, queda do processo ou exceção de
+  uma tarefa não derrubam as outras. Ao interromper (Ctrl+C, SIGTERM, SIGHUP, Ctrl+Break),
+  todos os processos filhos e seus descendentes são encerrados.
+- O andamento fica em `<lake>/.build/<run-id>.jsonl`, uma linha por tarefa concluída
+  (fonte, dataset, início, fim, status `ok`/`erro`, contagens e mensagem). Uma nova
+  execução pula o que já terminou sem erro; `retry_errors=True` refaz só as que falharam e
+  `force=True` refaz tudo.
+- Memória, threads e diretório temporário do DuckDB viram parâmetros (`memory`, `threads`,
+  `scratch`); antes de converter, `lake_build` compara o espaço livre dos volumes com uma
+  estimativa a partir do bruto pendente (`InsufficientDiskError`; `check_disk=False` ignora).
+- `keep_awake()`: context manager que impede a suspensão do sistema (Windows, macOS e
+  Linux, quando o sistema oferece o bloqueio); `lake_build` o usa por padrão.
+- `BuildSummary` com o resumo por fonte (convertidos, pulados, erros, tarefas com erro) e
+  `has_errors` para decidir o código de saída.
 
 ## [0.7.1] - 2026-10-30
 
