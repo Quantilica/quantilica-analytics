@@ -22,11 +22,12 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import polars as pl
 import pyarrow as pa
@@ -230,14 +231,17 @@ def _duckdb_type(dtype: Any) -> str:
     raise LakeError(f"Contract dtype {dtype} has no DuckDB cast.")
 
 
-def _try_cast(column: str, duck: str) -> str:
+def _try_cast(column: str, duck: str, *, decimal_comma: bool = True) -> str:
     """``TRY_CAST`` of a text column that survives DuckDB's CSV cast pushdown.
 
     A bare ``TRY_CAST(col AS T)`` over ``read_csv`` is pushed into the reader,
     which then *raises* on the first bad value. ``NULLIF(col, '')`` (a no-op:
     empty fields are already null) keeps the cast in the query plan.
     """
-    return f"TRY_CAST(NULLIF({_ident(column)}, '') AS {duck})"
+    ident = _ident(column)
+    if decimal_comma and duck in ("DOUBLE", "FLOAT", "DECIMAL"):
+        return f"TRY_CAST(replace(NULLIF({ident}, ''), ',', '.') AS {duck})"
+    return f"TRY_CAST(NULLIF({ident}, '') AS {duck})"
 
 
 def _scratch_dir(staging: Path) -> Path:
@@ -319,6 +323,7 @@ def _read_csv_sql(
     quote: str | None = None,
     escape: str | None = None,
     parallel: bool = True,
+    skip: int = 0,
 ) -> str:
     args = [
         "[" + ", ".join(_lit(str(f)) for f in files) + "]",
@@ -328,7 +333,10 @@ def _read_csv_sql(
         f"encoding={_lit(encoding)}",
         "null_padding=true",
         "strict_mode=false",
+        "comment=''",
     ]
+    if skip > 0:
+        args.append(f"skip={skip}")
     if quote is not None:
         args.append(f"quote={_lit(quote)}")
     if escape is not None:
@@ -535,6 +543,8 @@ class LakeWriter:
         quote: str | None = None,
         escape: str | None = None,
         parallel: bool = True,
+        skip: int = 0,
+        decimal_comma: bool = True,
     ) -> LakeWriteResult:
         """Convert a CSV/TXT (or the members of a ZIP/7z) with DuckDB, streaming.
 
@@ -588,6 +598,8 @@ class LakeWriter:
                     quote=quote,
                     escape=escape,
                     parallel=parallel,
+                    skip=skip,
+                    decimal_comma=decimal_comma,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -969,6 +981,8 @@ class LakeWriter:
         quote: str | None = None,
         escape: str | None = None,
         parallel: bool = True,
+        skip: int = 0,
+        decimal_comma: bool = True,
     ) -> LakeWriteResult:
         scratch = _scratch_dir(staging)
         conn = _connect(scratch)
@@ -986,6 +1000,7 @@ class LakeWriter:
                 quote=quote,
                 escape=escape,
                 parallel=parallel,
+                skip=skip,
             )
             columns = self._columns(conn, read, header, names, rename, required)
             partition_keys = set(self.descriptor.partition_keys) | set(
@@ -1003,10 +1018,20 @@ class LakeWriter:
                     f"keys {partition_keys}"
                 )
             cast_nulls: dict[str, int] = {}
-            select = self._select_list(columns, contract, partition_keys=partition_keys)
+            select = self._select_list(
+                columns,
+                contract,
+                partition_keys=partition_keys,
+                decimal_comma=decimal_comma,
+            )
             if contract is not None:
                 cast_nulls = self._count_cast_nulls(
-                    conn, read, columns, contract, partition_keys=partition_keys
+                    conn,
+                    read,
+                    columns,
+                    contract,
+                    partition_keys=partition_keys,
+                    decimal_comma=decimal_comma,
                 )
             meta = self._metadata(key, origin or src, digest, contract, converter)
             if cast_nulls:
@@ -1109,12 +1134,17 @@ class LakeWriter:
         columns: list[tuple[str, str]],
         contract: DataContract | None,
         partition_keys: set[str] | None = None,
+        decimal_comma: bool = True,
     ) -> str:
         parts = []
         for src, out, duck in self._typed(
             columns, contract, partition_keys=partition_keys
         ):
-            expr = _ident(src) if duck in (None, "VARCHAR") else _try_cast(src, duck)
+            expr = (
+                _ident(src)
+                if duck in (None, "VARCHAR")
+                else _try_cast(src, duck, decimal_comma=decimal_comma)
+            )
             parts.append(f"{expr} AS {_ident(out)}")
         return ", ".join(parts)
 
@@ -1125,6 +1155,7 @@ class LakeWriter:
         columns: list[tuple[str, str]],
         contract: DataContract,
         partition_keys: set[str] | None = None,
+        decimal_comma: bool = True,
     ) -> dict[str, int]:
         typed = [
             (src, out, duck)
@@ -1137,7 +1168,7 @@ class LakeWriter:
             return {}
         counts = ", ".join(
             f"count(*) FILTER (WHERE {_ident(src)} IS NOT NULL "
-            f"AND {_try_cast(src, duck)} IS NULL)"
+            f"AND {_try_cast(src, duck, decimal_comma=decimal_comma)} IS NULL)"
             for src, _, duck in typed
         )
         row = conn.execute(f"SELECT {counts} FROM {read}").fetchone()
@@ -1726,3 +1757,324 @@ def _check_readers(
                 f"{expected_rows}"
             )
     return errors
+
+
+# --- Declarative DatasetSpec & SpecLakeConverter framework -----------------------
+
+
+def detect_encoding(path_or_bytes: Path | bytes) -> str:
+    """Detect encoding: BOM -> utf-8-sig; valid UTF-8 in 64KB -> utf-8; else cp1252."""
+    if isinstance(path_or_bytes, Path):
+        with open(path_or_bytes, "rb") as f:
+            chunk = f.read(65536)
+    else:
+        chunk = path_or_bytes[:65536]
+    if chunk.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    try:
+        chunk.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "cp1252"
+
+
+def find_skip_until(file_path: Path, prefix: str, encoding: str) -> int:
+    """Count how many preamble lines to skip until a line starts with ``prefix``."""
+    enc = "utf-8" if encoding in ("utf-8", "utf-8-sig") else "cp1252"
+    try:
+        if file_path.suffix.lower() == ".zip":
+            with zipfile.ZipFile(file_path) as zf:
+                for name in zf.namelist():
+                    if name.lower().endswith((".csv", ".txt")):
+                        with zf.open(name) as member_file:
+                            for idx, line in enumerate(member_file):
+                                decoded = line.decode(enc, errors="replace")
+                                if decoded.startswith(prefix):
+                                    return idx
+                        break
+        else:
+            with open(file_path, encoding=enc, errors="replace") as f:
+                for idx, line in enumerate(f):
+                    if line.startswith(prefix):
+                        return idx
+    except Exception:
+        pass
+    return 0
+
+
+@dataclass
+class ConvertResult:
+    """Summary of a conversion run across one or more datasets."""
+
+    converted: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    """How one raw dataset is read and converted to the lake."""
+
+    dataset_id: str
+    partition_keys: tuple[str, ...]
+    partitions_from: Callable[[Path], dict[str, str | int | None]]
+    reader: Literal["duckdb", "polars", "fixed_width", "parquet"] = "duckdb"
+    encoding: str | Literal["detect"] = "detect"
+    separator: str = ";"
+    header: bool = True
+    decimal_comma: bool = True
+    skip_until: str | None = None
+    rename: Mapping[str, str] = field(default_factory=dict)
+    required: tuple[str, ...] = ()
+    members: str | None = None
+    contract: DataContract | None = None
+    normalize: Callable[[Path], Iterable[bytes]] | None = None
+
+    @property
+    def alias(self) -> str:
+        """Short view name: dataset_id as a SQL-friendly identifier."""
+        return self.dataset_id.replace("-", "_")
+
+    @property
+    def partition_types(self) -> dict[str, str]:
+        """Partition types: date-related parts are integers, others varchar."""
+        int_keys = {"ano", "year", "mes", "month", "trimestre", "quarter"}
+        return {
+            key: "int" if key.lower() in int_keys else "varchar"
+            for key in self.partition_keys
+        }
+
+
+def convert_with_specs(
+    source_id: str,
+    specs: Mapping[str, DatasetSpec],
+    input_dir: Path | str,
+    lake_dir: Path | str,
+    *,
+    datasets: list[str] | None = None,
+    force: bool = False,
+    converter: str = "quantilica-analytics",
+) -> ConvertResult:
+    """Convert raw files for specified datasets into Lake using DatasetSpecs."""
+    from quantilica.core.lake import select_current
+
+    input_dir = Path(input_dir)
+    lake_dir = Path(lake_dir)
+    result = ConvertResult()
+    if not input_dir.is_dir():
+        result.errors.append(f"diretório '{input_dir}' não existe")
+        return result
+
+    specs_to_run: list[DatasetSpec] = []
+    if datasets is not None:
+        for name in datasets:
+            spec = specs.get(name)
+            if spec is None:
+                result.errors.append(f"dataset desconhecido: {name}")
+            elif spec not in specs_to_run:
+                specs_to_run.append(spec)
+    else:
+        specs_to_run = list(specs.values())
+
+    supported_suffixes = frozenset(
+        {".csv", ".txt", ".zip", ".7z", ".parquet", ".xlsx", ".xls", ".json"}
+    )
+
+    for spec in specs_to_run:
+        # Locate files for this spec
+        candidate_dirs = [input_dir / spec.dataset_id]
+        if spec.alias != spec.dataset_id:
+            candidate_dirs.append(input_dir / spec.alias)
+
+        target_dir = None
+        for d in candidate_dirs:
+            if d.is_dir():
+                target_dir = d
+                break
+
+        if target_dir is not None:
+            raw_files = [
+                p
+                for p in target_dir.rglob("*")
+                if p.is_file()
+                and p.suffix.lower() in supported_suffixes
+                and not p.name.endswith(".manifest.json")
+                and not p.name.endswith(".tmp")
+                and not p.name.startswith(".")
+            ]
+        else:
+            other_dataset_dirs = {
+                (input_dir / s.dataset_id).resolve()
+                for s in specs.values()
+                if s.dataset_id != spec.dataset_id
+                and (input_dir / s.dataset_id).is_dir()
+            }
+            raw_files = [
+                p
+                for p in input_dir.rglob("*")
+                if p.is_file()
+                and p.suffix.lower() in supported_suffixes
+                and not p.name.endswith(".manifest.json")
+                and not p.name.endswith(".tmp")
+                and not p.name.startswith(".")
+                and not any(p.resolve().is_relative_to(d) for d in other_dataset_dirs)
+            ]
+
+        if not raw_files:
+            continue
+
+        selected_files = select_current(raw_files)
+
+        descriptor = DatasetDescriptor(
+            source_id=source_id,
+            dataset_id=spec.dataset_id,
+            alias=spec.alias,
+            partition_keys=list(spec.partition_keys),
+            partition_types=spec.partition_types,
+        )
+        writer = LakeWriter(
+            lake_dir / source_id / spec.dataset_id,
+            descriptor,
+            force=force,
+        )
+
+        for path in selected_files:
+            try:
+                partitions = spec.partitions_from(path)
+            except Exception as exc:
+                result.errors.append(f"{path.name}: {exc}")
+                continue
+
+            enc = detect_encoding(path) if spec.encoding == "detect" else spec.encoding
+
+            try:
+                if spec.reader == "parquet" or path.suffix.lower() == ".parquet":
+                    lf = pl.scan_parquet(path)
+                    written = writer.write_polars(
+                        lf,
+                        path,
+                        partitions=partitions,
+                        contract=spec.contract,
+                        converter=converter,
+                    )
+                elif spec.reader == "polars":
+                    if path.suffix.lower() in (".xlsx", ".xls"):
+                        df = pl.read_excel(path)
+                        written = writer.write_polars(
+                            df,
+                            path,
+                            partitions=partitions,
+                            contract=spec.contract,
+                            converter=converter,
+                        )
+                    else:
+                        polars_enc = "utf8" if "utf" in enc.lower() else "cp1252"
+                        lf = pl.scan_csv(
+                            path,
+                            separator=spec.separator,
+                            encoding=polars_enc,
+                            has_header=spec.header,
+                        )
+                        written = writer.write_polars(
+                            lf,
+                            path,
+                            partitions=partitions,
+                            contract=spec.contract,
+                            converter=converter,
+                        )
+                elif spec.reader == "duckdb":
+                    skip = 0
+                    if spec.skip_until:
+                        skip = find_skip_until(path, spec.skip_until, enc)
+
+                    written = writer.write_duckdb(
+                        path,
+                        partitions=partitions,
+                        separator=spec.separator,
+                        encoding=enc,
+                        header=spec.header,
+                        rename=dict(spec.rename),
+                        required=spec.required,
+                        contract=spec.contract,
+                        converter=converter,
+                        skip=skip,
+                        decimal_comma=spec.decimal_comma,
+                    )
+                elif spec.reader == "fixed_width":
+                    from quantilica.analytics.fixed_width import (
+                        fixed_width_sql,
+                        layout_from_datasus,
+                    )
+
+                    # Look for layout file in the same directory or inside archive
+                    layout_file = path.parent / f"{path.stem.split('@')[0]}_layout.txt"
+                    if not layout_file.is_file():
+                        layout_file = path.parent / "layout.txt"
+                    if not layout_file.is_file():
+                        raise LakeError(f"Layout file not found for {path.name}")
+                    text_content = layout_file.read_text(encoding="latin-1")
+                    layout = layout_from_datasus(text_content)
+                    sql = fixed_width_sql(str(path), layout, encoding=enc)
+                    import duckdb
+
+                    conn = duckdb.connect()
+                    df = conn.execute(sql).pl()
+                    conn.close()
+                    written = writer.write_polars(
+                        df,
+                        path,
+                        partitions=partitions,
+                        contract=spec.contract,
+                        converter=converter,
+                    )
+                else:
+                    raise LakeError(f"Unsupported reader: {spec.reader}")
+
+                if written.status == "skipped":
+                    result.skipped += 1
+                else:
+                    result.converted += 1
+            except Exception as exc:
+                message = str(exc).strip()
+                first_line = message.splitlines()[0] if message else repr(exc)
+                result.errors.append(f"{path.name}: {first_line}")
+
+    return result
+
+
+class SpecLakeConverter:
+    """Standard LakeConverter backed by declarative DatasetSpec table."""
+
+    def __init__(
+        self,
+        source_id: str,
+        specs: Mapping[str, DatasetSpec],
+        *,
+        version: str = "0.0.0",
+    ) -> None:
+        self.source_id = source_id
+        self.specs = dict(specs)
+        self.version = version
+
+    def datasets(self) -> list[str]:
+        """Dataset ids this converter writes to the lake."""
+        return list(self.specs)
+
+    def convert(
+        self,
+        input_dir: Path | str,
+        lake_dir: Path | str,
+        *,
+        datasets: list[str] | None = None,
+        force: bool = False,
+    ) -> ConvertResult:
+        """Convert raw files into the lake according to specs."""
+        return convert_with_specs(
+            self.source_id,
+            self.specs,
+            Path(input_dir),
+            Path(lake_dir),
+            datasets=datasets,
+            force=force,
+            converter=f"{self.source_id}-fetcher {self.version}",
+        )
