@@ -272,9 +272,11 @@ def _materialize(src: Path, tmp: Path) -> list[Path]:
             raise LakeError(f"7z failed on {src.name}: {proc.stderr.strip()[-300:]}")
     else:
         raise LakeError(f"Unsupported format: {src.name}")
-    files = sorted(p for p in tmp.rglob("*") if p.is_file())
+    files = sorted(
+        p for p in tmp.rglob("*") if p.is_file() and p.suffix.lower() in TEXT_SUFFIXES
+    )
     if not files:
-        raise LakeError(f"{src.name} contains no files")
+        raise LakeError(f"{src.name} contains no data files (.csv/.txt)")
     return files
 
 
@@ -520,6 +522,8 @@ class LakeWriter:
         src: Path,
         *,
         partitions: dict[str, Any] | None = None,
+        file_key_name: str | None = None,
+        src_origin: Path | None = None,
         separator: str = ";",
         encoding: str = "utf-8",
         header: bool = True,
@@ -551,15 +555,16 @@ class LakeWriter:
         input).
         """
         src = Path(src)
+        origin = Path(src_origin) if src_origin is not None else src
         rename = rename or {}
         partitions = dict(partitions or {})
         if not header and not names:
             raise ValueError("names is required when header is False.")
-        digest = sha256_file(src)
-        key = file_key(src)
+        digest = sha256_file(origin)
+        key = file_key_name or file_key(origin)
         with dataset_lock(self.dataset_dir):
             target = self._target(partitions)
-            skipped = self._skip_if_current(target, key, src, digest, contract)
+            skipped = self._skip_if_current(target, key, origin, digest, contract)
             if skipped:
                 return skipped
             staging = self._staging_dir()
@@ -570,6 +575,7 @@ class LakeWriter:
                     key,
                     digest,
                     staging,
+                    origin=origin,
                     partitions=partitions,
                     separator=separator,
                     encoding=encoding,
@@ -594,6 +600,8 @@ class LakeWriter:
         src: Path,
         *,
         partitions: dict[str, Any] | None = None,
+        file_key_name: str | None = None,
+        src_origin: Path | None = None,
         contract: DataContract | None = None,
     ) -> bool:
         """Whether ``src`` is already in the lake with its current ``sha256``.
@@ -605,9 +613,11 @@ class LakeWriter:
         if self.force:
             return False
         src = Path(src)
+        origin = Path(src_origin) if src_origin is not None else src
         target = self._target(dict(partitions or {}))
+        key = file_key_name or file_key(origin)
         skipped = self._skip_if_current(
-            target, file_key(src), src, sha256_file(src), contract
+            target, key, origin, sha256_file(origin), contract
         )
         return skipped is not None
 
@@ -946,6 +956,7 @@ class LakeWriter:
         digest: str,
         staging: Path,
         *,
+        origin: Path | None = None,
         partitions: dict[str, Any],
         separator: str,
         encoding: str,
@@ -997,7 +1008,7 @@ class LakeWriter:
                 cast_nulls = self._count_cast_nulls(
                     conn, read, columns, contract, partition_keys=partition_keys
                 )
-            meta = self._metadata(key, src, digest, contract, converter)
+            meta = self._metadata(key, origin or src, digest, contract, converter)
             if cast_nulls:
                 meta[META_CAST_NULLS] = json.dumps(cast_nulls, sort_keys=True)
             kv = ", ".join(f"{_lit(k)}: {_lit(v)}" for k, v in meta.items())
@@ -1041,7 +1052,9 @@ class LakeWriter:
             conn.close()
             if scratch != staging:
                 shutil.rmtree(scratch, ignore_errors=True)
-        return LakeWriteResult(src, outputs, "converted", int(rows or 0), cast_nulls)
+        return LakeWriteResult(
+            origin or src, outputs, "converted", int(rows or 0), cast_nulls
+        )
 
     def _columns(
         self,

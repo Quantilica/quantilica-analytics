@@ -229,6 +229,41 @@ def test_is_current_tracks_the_written_sha(tmp_path, dataset_dir, descriptor):
     assert not writer.is_current(src, partitions=partitions)
 
 
+def test_is_current_with_src_origin_and_file_key_name(
+    tmp_path, dataset_dir, descriptor
+):
+    origin = tmp_path / "pacote_2026@20260101.zip"
+    origin.write_bytes(b"ZIP_CONTENT_FOR_HASHING_12345")
+    temp_csv = tmp_path / "temp_extracted.csv"
+    temp_csv.write_bytes(CSV_LATIN1)
+
+    key = "pacote_2026__membro"
+    writer = LakeWriter(dataset_dir, descriptor)
+    partitions = {"ano": "2026", "mes": "01"}
+
+    assert not writer.is_current(
+        temp_csv,
+        partitions=partitions,
+        file_key_name=key,
+        src_origin=origin,
+    )
+
+    writer.write_duckdb(
+        temp_csv,
+        partitions=partitions,
+        file_key_name=key,
+        src_origin=origin,
+        encoding="latin-1",
+    )
+
+    assert writer.is_current(
+        temp_csv,
+        partitions=partitions,
+        file_key_name=key,
+        src_origin=origin,
+    )
+
+
 def test_duckdb_scratch_dir_holds_the_extraction(
     tmp_path, dataset_dir, descriptor, monkeypatch
 ):
