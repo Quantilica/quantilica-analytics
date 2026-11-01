@@ -685,3 +685,76 @@ def test_keep_awake_windows_sets_and_restores_execution_state(monkeypatch):
     with lb.keep_awake():
         assert calls == [0x80000000 | 0x00000001]
     assert calls == [0x80000000 | 0x00000001, 0x80000000]
+
+
+# --- datasets and profiles ----------------------------------------------------
+
+
+def test_lake_build_datasets_filter(tmp_path):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["ds_a", "ds_b", "ds_c"], control)
+
+    summary = _build(tmp_path, {"src": conv}, datasets=["ds_b"])
+    assert not summary.has_errors
+    assert count_calls(control, "src", "ds_a") == 0
+    assert count_calls(control, "src", "ds_b") == 1
+    assert count_calls(control, "src", "ds_c") == 0
+
+
+def test_lake_build_profiles(tmp_path, monkeypatch):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["ds_a"], control)
+    calls = []
+
+    def fake_run(pending, summary, workers, lake_dir, force, memory, threads, scratch):
+        calls.append({"workers": workers, "memory": memory})
+
+    monkeypatch.setattr(lb, "_run", fake_run)
+
+    # 96gb-batch
+    lb.lake_build(
+        tmp_path / "input",
+        tmp_path / "lake",
+        converters={"src": conv},
+        profile="96gb-batch",
+        run_id="r1",
+        prevent_sleep=False,
+    )
+    assert calls[-1] == {"workers": 6, "memory": "14GB"}
+
+    # 96gb-monolithic
+    lb.lake_build(
+        tmp_path / "input",
+        tmp_path / "lake",
+        converters={"src": conv},
+        profile="96gb-monolithic",
+        run_id="r2",
+        prevent_sleep=False,
+    )
+    assert calls[-1] == {"workers": 1, "memory": "64GB"}
+
+    # Override explícito tem precedência
+    lb.lake_build(
+        tmp_path / "input",
+        tmp_path / "lake",
+        converters={"src": conv},
+        profile="96gb-batch",
+        workers=2,
+        memory="8GB",
+        run_id="r3",
+        prevent_sleep=False,
+    )
+    assert calls[-1] == {"workers": 2, "memory": "8GB"}
+
+    # Perfil inválido levanta LakeBuildError
+    with pytest.raises(LakeBuildError, match="unknown profile"):
+        lb.lake_build(
+            tmp_path / "input",
+            tmp_path / "lake",
+            converters={"src": conv},
+            profile="invalid-profile",
+            run_id="r4",
+            prevent_sleep=False,
+        )

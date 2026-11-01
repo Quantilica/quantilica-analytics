@@ -78,6 +78,11 @@ DEFAULT_SCRATCH_FACTOR = 0.25
 TERMINATE_GRACE_SECONDS = 5.0
 _MESSAGE_LIMIT = 2000
 
+PROFILES: dict[str, dict[str, Any]] = {
+    "96gb-batch": {"workers": 6, "memory": "14GB"},
+    "96gb-monolithic": {"workers": 1, "memory": "64GB"},
+}
+
 
 class LakeBuildError(RuntimeError):
     """The build cannot start (bad arguments, unknown source, no space)."""
@@ -771,6 +776,8 @@ def lake_build(
     lake_dir: str | os.PathLike[str],
     *,
     sources: list[str] | None = None,
+    datasets: list[str] | None = None,
+    profile: str | None = None,
     workers: int | None = None,
     memory: str | None = None,
     threads: int | None = None,
@@ -794,6 +801,11 @@ def lake_build(
             ``input_dir`` that has a converter (the others are reported in
             ``ignored_sources``). A name without folder or converter raises
             :class:`LakeBuildError`.
+        datasets: Datasets to build (e.g. ``["sia-pa"]``). Filters tasks to
+            only matching dataset ids.
+        profile: Resource allocation profile (``"96gb-batch"``: 6 workers x 14GB;
+            ``"96gb-monolithic"``: 1 worker x 64GB). Explicit ``workers`` or
+            ``memory`` take precedence.
         workers: Parallel task processes (default: half the CPUs, at most 4).
         memory: DuckDB ``memory_limit`` of each task, such as ``"12GB"``.
         threads: DuckDB threads of each task.
@@ -841,6 +853,16 @@ def lake_build(
     scratch_path = Path(scratch) if scratch is not None else None
     if not input_path.is_dir():
         raise LakeBuildError(f"input directory not found: {input_path}")
+    if profile is not None:
+        if profile not in PROFILES:
+            raise LakeBuildError(
+                f"unknown profile {profile!r}: expected one of {list(PROFILES)}"
+            )
+        prof = PROFILES[profile]
+        if workers is None:
+            workers = prof.get("workers")
+        if memory is None:
+            memory = prof.get("memory")
     if workers is not None and workers < 1:
         raise LakeBuildError("workers must be at least 1")
     workers = workers or max(1, min(4, (os.cpu_count() or 2) // 2))
@@ -858,7 +880,7 @@ def lake_build(
         run_id=run_id, state_file=path, resumed_run=resume is not None
     )
 
-    tasks = _plan(input_path, sources, converters, summary)
+    tasks = _plan(input_path, sources, datasets, converters, summary)
     pending: list[_Task] = []
     scope = 0  # tasks this run answers for (the closing line's "tasks")
     for task in tasks:
@@ -946,6 +968,7 @@ def _choose_run(
 def _plan(
     input_dir: Path,
     sources: list[str] | None,
+    datasets: list[str] | None,
     converters: dict[str, Any],
     summary: BuildSummary,
 ) -> list[_Task]:
@@ -976,15 +999,20 @@ def _plan(
             summary.ignored_sources[name] = "no converter"
             continue
         try:
-            datasets = list(dict.fromkeys(converter.datasets()))
+            available = list(dict.fromkeys(converter.datasets()))
         except Exception as exc:  # noqa: BLE001
             summary.failed_sources[name] = f"datasets() failed: {exc}"
             continue
-        if not datasets:
+        if not available:
             summary.ignored_sources[name] = "converter lists no datasets"
             continue
+        if datasets is not None:
+            wanted_set = set(datasets)
+            available = [ds for ds in available if ds in wanted_set]
+            if not available:
+                continue
         size = _dir_size(folder)
-        tasks.extend(_Task(name, ds, folder, size, ref) for ds in datasets)
+        tasks.extend(_Task(name, ds, folder, size, ref) for ds in available)
     return tasks
 
 
