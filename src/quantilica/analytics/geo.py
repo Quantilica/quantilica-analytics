@@ -1,24 +1,33 @@
-"""Canonical geographic dimension (municipalities and federative units).
+"""Canonical geographic dimension and geospatial WKB helpers.
 
 Provides the module-level contracts for the ``dim_geo`` and ``dim_uf``
 datasets, IBGE municipality code converters between 6 and 7 digit forms
-(checked digit per IBGE Módulo 10), and accessors for the bundled
-municipality dimension.
+(checked digit per IBGE Módulo 10), accessors for the bundled
+municipality dimension, and helpers for converting GeoJSON geometry to WKB
+and extracting bounding boxes for the Lake.
 """
 
 from __future__ import annotations
 
+import json
+import struct
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
 from .schema import DataContract, Field
 
 __all__ = [
+    "BBOX_COLUMNS",
     "DIM_GEO_CONTRACT",
     "DIM_UF_CONTRACT",
+    "GEOMETRY_WKB_COLUMN",
     "IBGE_DV_EXCEPTIONS",
     "calc_ibge_dv",
+    "extract_wkb_and_bbox",
+    "geometry_to_wkb",
     "get_dim_geo",
     "get_dim_uf",
     "mun_6_to_7",
@@ -193,4 +202,164 @@ def get_dim_uf() -> pl.DataFrame:
     """
     df = get_dim_geo().select(_UF_COLUMNS).unique().sort("ibge_uf_id")
     DIM_UF_CONTRACT.validate(df)
+    return df
+
+
+# --- Geospatial WKB and Bounding Box Lake Helpers (Dimensão L5) ---
+
+GEOMETRY_WKB_COLUMN = "geom_wkb"
+"""Nome canônico da coluna binária WKB para geometrias no Lake."""
+
+BBOX_COLUMNS = ("bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy")
+"""Nomes canônicos das colunas escalares de bounding box no Lake."""
+
+
+def _coord_to_wkb_point(coords: list[Any] | tuple[Any, ...]) -> bytes:
+    return struct.pack("<BIdd", 1, 1, float(coords[0]), float(coords[1]))
+
+
+def _coords_to_wkb_linestring(coords: list[Any]) -> bytes:
+    header = struct.pack("<BII", 1, 2, len(coords))
+    pts = b"".join(struct.pack("<dd", float(c[0]), float(c[1])) for c in coords)
+    return header + pts
+
+
+def _coords_to_wkb_polygon(rings: list[Any]) -> bytes:
+    parts = [struct.pack("<BII", 1, 3, len(rings))]
+    for ring in rings:
+        parts.append(struct.pack("<I", len(ring)))
+        parts.append(
+            b"".join(struct.pack("<dd", float(c[0]), float(c[1])) for c in ring)
+        )
+    return b"".join(parts)
+
+
+def _coords_to_wkb_multipoint(coords: list[Any]) -> bytes:
+    parts = [struct.pack("<BII", 1, 4, len(coords))]
+    for c in coords:
+        parts.append(_coord_to_wkb_point(c))
+    return b"".join(parts)
+
+
+def _coords_to_wkb_multilinestring(lines: list[Any]) -> bytes:
+    parts = [struct.pack("<BII", 1, 5, len(lines))]
+    for line in lines:
+        parts.append(_coords_to_wkb_linestring(line))
+    return b"".join(parts)
+
+
+def _coords_to_wkb_multipolygon(polys: list[Any]) -> bytes:
+    parts = [struct.pack("<BII", 1, 6, len(polys))]
+    for poly in polys:
+        parts.append(_coords_to_wkb_polygon(poly))
+    return b"".join(parts)
+
+
+def geometry_to_wkb(geom: Mapping[str, Any] | None) -> bytes | None:
+    """Converte um dicionário de geometria GeoJSON para bytes WKB (little-endian).
+
+    Suporta Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon.
+    Retorna None se a geometria for nula, inválida ou de tipo não suportado.
+    """
+    if not geom or not isinstance(geom, Mapping):
+        return None
+    gtype = str(geom.get("type", "")).strip()
+    coords = geom.get("coordinates")
+    if coords is None:
+        return None
+
+    if gtype == "Point":
+        return _coord_to_wkb_point(coords)
+    if gtype == "LineString":
+        return _coords_to_wkb_linestring(coords)
+    if gtype == "Polygon":
+        return _coords_to_wkb_polygon(coords)
+    if gtype == "MultiPoint":
+        return _coords_to_wkb_multipoint(coords)
+    if gtype == "MultiLineString":
+        return _coords_to_wkb_multilinestring(coords)
+    if gtype == "MultiPolygon":
+        return _coords_to_wkb_multipolygon(coords)
+    return None
+
+
+def _calc_bbox(
+    geom: Mapping[str, Any] | None,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Calcula (minx, miny, maxx, maxy) para uma geometria GeoJSON."""
+    if not geom or not isinstance(geom, Mapping):
+        return (None, None, None, None)
+
+    coords = geom.get("coordinates")
+    if not coords:
+        return (None, None, None, None)
+
+    def _extract_all_points(data: Any) -> list[tuple[float, float]]:
+        if not isinstance(data, (list, tuple)) or not data:
+            return []
+        if isinstance(data[0], (int, float)) and len(data) >= 2:
+            return [(float(data[0]), float(data[1]))]
+        pts = []
+        for item in data:
+            pts.extend(_extract_all_points(item))
+        return pts
+
+    pts = _extract_all_points(coords)
+    if not pts:
+        return (None, None, None, None)
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def extract_wkb_and_bbox(
+    features_or_path: str | Path | Mapping[str, Any] | Iterable[dict[str, Any]],
+    *,
+    target_epsg: int = 4674,
+) -> pl.DataFrame:
+    """Extrai feições GeoJSON para DataFrame com geom_wkb e colunas escalares de BBox.
+
+    Permite indexar e consultar dados espaciais no Parquet Lake sem depender de PostGIS.
+    """
+    feature_list: list[dict[str, Any]] = []
+
+    if isinstance(features_or_path, (str, Path)):
+        p = Path(features_or_path)
+        with open(p, "rb") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            feature_list = data.get("features", [])
+    elif isinstance(features_or_path, Mapping):
+        feature_list = features_or_path.get("features", [])
+    elif isinstance(features_or_path, Iterable):
+        feature_list = list(features_or_path)
+
+    rows: list[dict[str, Any]] = []
+    for feat in feature_list:
+        if not isinstance(feat, dict):
+            continue
+        props = dict(feat.get("properties") or {})
+        geom = feat.get("geometry")
+        wkb = geometry_to_wkb(geom)
+        minx, miny, maxx, maxy = _calc_bbox(geom)
+
+        props[GEOMETRY_WKB_COLUMN] = wkb
+        props[BBOX_COLUMNS[0]] = minx
+        props[BBOX_COLUMNS[1]] = miny
+        props[BBOX_COLUMNS[2]] = maxx
+        props[BBOX_COLUMNS[3]] = maxy
+        rows.append(props)
+
+    if not rows:
+        schema = {
+            GEOMETRY_WKB_COLUMN: pl.Binary,
+            BBOX_COLUMNS[0]: pl.Float64,
+            BBOX_COLUMNS[1]: pl.Float64,
+            BBOX_COLUMNS[2]: pl.Float64,
+            BBOX_COLUMNS[3]: pl.Float64,
+        }
+        return pl.DataFrame(schema=schema)
+
+    df = pl.DataFrame(rows)
     return df

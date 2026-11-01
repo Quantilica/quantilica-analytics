@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import io
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -300,6 +301,85 @@ def read_brazilian_csv(
         return _read_csv_pandas_with_fallback(source, pd, **kwargs)
 
     raise ValueError(f"Unknown engine: {engine!r}")
+
+
+def read_csv_resilient(
+    source: Any,
+    *,
+    code_columns: tuple[str, ...] | list[str] = (),
+    schema_overrides: dict[str, Any] | None = None,
+    separator: str | None = None,
+    encoding: str | None = None,
+    truncate_ragged_lines: bool = False,
+    null_values: list[str] | None = None,
+    strip_null_bytes: bool = True,
+    **kwargs: Any,
+) -> pl.DataFrame:
+    """Leitura resiliente de CSV com detecção de encoding e códigos cadastrais (L4).
+
+    - Detecta encoding automaticamente (tenta utf-8, fallback para cp1252/latin-1).
+    - Força `code_columns` para `pl.String` em `schema_overrides` impedindo
+      perda de zeros à esquerda.
+    - Remove bytes nulos `\\x00` em arquivos malformados se strip_null_bytes=True.
+    - Suporta truncate_ragged_lines=True para lidar com linhas desiguais.
+    """
+    overrides = dict(schema_overrides or {})
+    for col in code_columns:
+        overrides[col] = pl.String
+    if overrides:
+        kwargs["schema_overrides"] = overrides
+
+    if truncate_ragged_lines:
+        kwargs["truncate_ragged_lines"] = True
+
+    if null_values is None:
+        kwargs.setdefault("null_values", list(DEFAULT_BR_NA))
+    else:
+        kwargs["null_values"] = null_values
+
+    if separator is not None:
+        kwargs["separator"] = separator
+
+    raw_bytes: bytes | None = None
+    if isinstance(source, (bytes, bytearray)):
+        raw_bytes = bytes(source)
+    elif isinstance(source, (str, Path)) and strip_null_bytes:
+        p = Path(source)
+        if p.is_file():
+            try:
+                with open(p, "rb") as f:
+                    head = f.read(2048)
+                if b"\x00" in head:
+                    raw_bytes = p.read_bytes()
+            except OSError:
+                pass
+
+    if raw_bytes is not None and strip_null_bytes and b"\x00" in raw_bytes:
+        source = io.BytesIO(raw_bytes.replace(b"\x00", b""))
+
+    encodings: list[str]
+    if encoding is not None:
+        encodings = [encoding]
+        if encoding.lower() not in ("latin-1", "iso-8859-1", "cp1252"):
+            encodings.extend(["cp1252", "latin-1"])
+    else:
+        encodings = ["utf-8", "cp1252", "latin-1"]
+
+    last_exc: Exception | None = None
+    for cand in encodings:
+        call_kwargs = dict(kwargs)
+        call_kwargs["encoding"] = cand
+        if hasattr(source, "seek"):
+            source.seek(0)
+        try:
+            return pl.read_csv(source, **call_kwargs)
+        except (pl.exceptions.ComputeError, UnicodeDecodeError, ValueError) as exc:
+            last_exc = exc
+            continue
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Failed to read CSV with resilient reader")
 
 
 class SmartReader:

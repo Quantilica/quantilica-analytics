@@ -192,3 +192,67 @@ class DataContract:
             if field_spec.name in df.columns:
                 expressions.append(pl.col(field_spec.name).cast(field_spec.dtype))
         return df.with_columns(expressions)
+
+
+class EraSchemaResolver:
+    """Mapeia esquemas de múltiplas eras históricas para contrato canônico (L3).
+
+    Renomeia colunas de eras históricas para o nome canônico, assegura casting para
+    os dtypes esperados e preenche colunas ausentes em eras antigas com nulos tipados.
+    """
+
+    def __init__(
+        self,
+        canonical_schema: DataContract | dict[str, pl.DataType],
+        eras: dict[str, dict[str, str]] | None = None,
+        *,
+        era_mappings: dict[str, dict[str, str]] | None = None,
+        default_values: dict[str, Any] | None = None,
+    ) -> None:
+        if isinstance(canonical_schema, DataContract):
+            self.schema: dict[str, pl.DataType] = {
+                f.name: f.dtype for f in canonical_schema.fields
+            }
+        else:
+            self.schema = dict(canonical_schema)
+        self.eras: dict[str, dict[str, str]] = dict(eras or era_mappings or {})
+        self.default_values: dict[str, Any] = dict(default_values or {})
+
+    def register_era(self, era: str, mapping: dict[str, str]) -> None:
+        """Registra mapeamento {coluna_antiga: coluna_canonica} para uma era."""
+        self.eras[era] = mapping
+
+    def resolve(
+        self,
+        df: pl.DataFrame,
+        era: str | None = None,
+        *,
+        fill_missing: bool = True,
+        strict_columns: bool = False,
+    ) -> pl.DataFrame:
+        """Normaliza um DataFrame da era histórica para o schema canônico."""
+        res = df
+        if era and era in self.eras:
+            mapping = {k: v for k, v in self.eras[era].items() if k in res.columns}
+            if mapping:
+                res = res.rename(mapping)
+
+        exprs: list[pl.Expr] = []
+        for col_name, dtype in self.schema.items():
+            if col_name in res.columns:
+                if res[col_name].dtype != dtype:
+                    exprs.append(pl.col(col_name).cast(dtype, strict=False))
+            elif fill_missing:
+                val = self.default_values.get(col_name)
+                if val is not None:
+                    exprs.append(pl.lit(val).cast(dtype, strict=False).alias(col_name))
+                else:
+                    exprs.append(pl.lit(None, dtype=dtype).alias(col_name))
+
+        if exprs:
+            res = res.with_columns(exprs)
+
+        if strict_columns:
+            res = res.select(list(self.schema.keys()))
+
+        return res
