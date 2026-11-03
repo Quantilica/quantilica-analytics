@@ -5,9 +5,22 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
-## [Não lançado]
+## [0.9.0] - 2026-11-03
+
+### Adicionado
+
+- `lake.DatasetSpec`, `lake.SpecLakeConverter`, `lake.convert_with_specs()` e `lake.ConvertResult`: conversor do lake dirigido por especificação. Cada `DatasetSpec` declara dataset, chaves de partição, como extraí-las do caminho e como ler o arquivo (DuckDB, Polars, largura fixa ou Parquet, com encoding, separador, preâmbulo e renomeação de colunas), e o `SpecLakeConverter` implementa o contrato `quantilica.lake` do `quantilica-core` a partir de uma lista delas, em vez de cada coletor reescrever o laço de conversão. `ConvertResult` reúne arquivos convertidos, pulados e erros.
+- `fixed_width`: leitura de arquivos de largura fixa pelo DuckDB. `FixedField`, `layout_from_datasus()` (tabela de layout do DATASUS, como a da tabela de procedimentos do SUS), `layout_from_sas_input()` (instrução `INPUT` do SAS, como a do IBGE) e `fixed_width_sql()`.
+- `reader.read_csv_resilient()`, `lake.detect_encoding()` e `lake.find_skip_until()`: leitura de CSV que detecta o encoding (UTF-8 com recuo para cp1252/latin-1), mantém como texto as colunas de código (preserva zeros à esquerda), remove bytes nulos e tolera linhas irregulares; `find_skip_until()` acha o fim do preâmbulo pelo prefixo da linha de cabeçalho.
+- `geo.geometry_to_wkb()` e `geo.extract_wkb_and_bbox()`: convertem geometrias GeoJSON em WKB e extraem as colunas escalares de caixa delimitadora (`geom_wkb`, `bbox_*`) para o lake. Constantes `GEOMETRY_WKB_COLUMN` e `BBOX_COLUMNS`.
+- `schema.EraSchemaResolver`: mapeia os esquemas de várias eras de uma série histórica para um contrato canônico.
+- `lake_build` ganha `profile` (`96gb-batch` e `96gb-monolithic`, que fixam número de processos e memória) e `datasets` (converte só os datasets pedidos); os dois chegam ao `quantilica lake build` como `--profile` e `--dataset`.
+- `LakeWriter.write_duckdb()` e `LakeWriter.is_current()` aceitam `file_key_name` e `src_origin` (chave e origem do arquivo quando a leitura vem de um arquivo extraído), e `write_duckdb()` aceita `skip` (linhas de preâmbulo) e `decimal_comma`.
+- O lake usa `partition_types_for()` e `composite_file_key()` do `quantilica-core` para tipar as partições e compor a chave de arquivo.
 
 ### Alterado
+
+- Exige `quantilica-core>=0.16.0`.
 - `lake_build` passa a distinguir execuções. Ao terminar sem interrupção (com ou sem
   tarefas com erro), cada execução grava no fim do seu `.jsonl` uma linha de fechamento
   `{"run_id", "event": "run_complete", "finished_at", "tasks", "failed"}`; as linhas de
