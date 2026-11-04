@@ -255,3 +255,41 @@ def test_resilient_max_bytes_guards_eager_reads(tmp_path: Path):
         read_csv_resilient(p, separator=";", max_bytes=100)
     assert read_csv_resilient(p, separator=";", max_bytes=100, lazy=True) is not None
     assert read_csv_resilient(p, separator=";", n_rows=3).height == 3
+
+
+# --- EraSchemaResolver -----------------------------------------------------------
+
+
+def _resolver():
+    from quantilica.analytics import EraSchemaResolver
+
+    return EraSchemaResolver({"ano": pl.Int64, "valor": pl.Float64})
+
+
+def test_era_resolver_warns_and_counts_values_lost_in_cast(caplog):
+    resolver = _resolver()
+    df = pl.DataFrame({"ano": ["2020", "oops", None], "valor": ["1.5", "2", "x"]})
+    with caplog.at_level("WARNING", logger="quantilica.analytics.schema"):
+        out = resolver.resolve(df)
+    # lenient mode keeps the contract: unconvertible values become null ...
+    assert out["ano"].to_list() == [2020, None, None]
+    assert out["valor"].to_list() == [1.5, 2.0, None]
+    # ... but never silently
+    assert resolver.cast_failures == {"ano": 1, "valor": 1}
+    assert "ano" in caplog.text and "valor" in caplog.text
+
+
+def test_era_resolver_no_warning_when_cast_is_clean(caplog):
+    resolver = _resolver()
+    df = pl.DataFrame({"ano": ["2020", None], "valor": ["1", "2"]})
+    with caplog.at_level("WARNING", logger="quantilica.analytics.schema"):
+        resolver.resolve(df)
+    assert resolver.cast_failures == {}
+    assert caplog.text == ""
+
+
+def test_era_resolver_strict_cast_raises():
+    resolver = _resolver()
+    df = pl.DataFrame({"ano": ["2020", "oops"], "valor": ["1", "2"]})
+    with pytest.raises(ValueError, match="ano"):
+        resolver.resolve(df, strict_cast=True)

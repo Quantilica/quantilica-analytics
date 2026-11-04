@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 import polars as pl
 import pyarrow as pa
+
+logger = logging.getLogger("quantilica.analytics.schema")
 
 DEFAULT_NULL_SENTINELS = ["-9999", "N/D", "NA", "n.a.", "n.d.", "-", "não disp", ""]
 """Canonical sentinel strings treated as null in Brazilian public data.
@@ -217,6 +220,13 @@ class EraSchemaResolver:
             self.schema = dict(canonical_schema)
         self.eras: dict[str, dict[str, str]] = dict(eras or era_mappings or {})
         self.default_values: dict[str, Any] = dict(default_values or {})
+        self.cast_failures: dict[str, int] = {}
+
+    @staticmethod
+    def _count_cast_losses(series: pl.Series, dtype: pl.DataType) -> int:
+        """Non-null values of ``series`` that a lenient cast to ``dtype`` nulls."""
+        casted = series.cast(dtype, strict=False)
+        return int((casted.is_null() & series.is_not_null()).sum())
 
     def register_era(self, era: str, mapping: dict[str, str]) -> None:
         """Registra mapeamento {coluna_antiga: coluna_canonica} para uma era."""
@@ -229,9 +239,21 @@ class EraSchemaResolver:
         *,
         fill_missing: bool = True,
         strict_columns: bool = False,
+        strict_cast: bool = False,
     ) -> pl.DataFrame:
-        """Normaliza um DataFrame da era histórica para o schema canônico."""
+        """Normaliza um DataFrame da era histórica para o schema canônico.
+
+        Contrato do cast para o dtype canônico: um valor não nulo que não
+        converte **vira nulo, mas nunca em silêncio**. Com ``strict_cast=False``
+        (o padrão, que preserva o comportamento anterior de não interromper a
+        carga de uma série histórica) cada coluna com perdas gera um aviso no
+        logger ``quantilica.analytics.schema`` e a contagem fica em
+        :attr:`cast_failures` (``{coluna: valores perdidos}``, refeito a cada
+        chamada). Com ``strict_cast=True`` a primeira coluna com perdas levanta
+        ``ValueError``, sem devolver dados alterados.
+        """
         res = df
+        self.cast_failures = {}
         if era and era in self.eras:
             mapping = {k: v for k, v in self.eras[era].items() if k in res.columns}
             if mapping:
@@ -241,6 +263,21 @@ class EraSchemaResolver:
         for col_name, dtype in self.schema.items():
             if col_name in res.columns:
                 if res[col_name].dtype != dtype:
+                    lost = self._count_cast_losses(res[col_name], dtype)
+                    if lost:
+                        if strict_cast:
+                            raise ValueError(
+                                f"{lost} value(s) of column {col_name!r} cannot "
+                                f"be cast to {dtype}"
+                            )
+                        self.cast_failures[col_name] = lost
+                        logger.warning(
+                            "EraSchemaResolver: %d value(s) of column %r cannot be "
+                            "cast to %s and became null",
+                            lost,
+                            col_name,
+                            dtype,
+                        )
                     exprs.append(pl.col(col_name).cast(dtype, strict=False))
             elif fill_missing:
                 val = self.default_values.get(col_name)
