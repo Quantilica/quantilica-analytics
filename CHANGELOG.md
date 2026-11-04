@@ -7,6 +7,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+## [0.10.0] - 2026-11-04
+
 ### Adicionado
 
 - `lake.convert_with_specs()` lê `.gz` (descomprimido), `.dbf` e `.dbc`. O DBF é lido por um leitor próprio (`dbf.read_dbf()`); o DBC precisa de `datasus-dbc` ou `pyreaddbc` e, sem eles, o erro diz o que instalar. O leitor `"dbf"` entra em `DatasetSpec.reader`.
