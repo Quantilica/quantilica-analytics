@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import codecs
 import io
+import logging
+import os
 import re
+import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,6 +26,8 @@ for backwards compatibility with the 0.1.x/0.2.x import surface.
 """
 
 _FALLBACK_ENCODING = "latin-1"
+
+logger = logging.getLogger("quantilica.analytics.reader")
 
 
 def _strip_thousands(value: str) -> str:
@@ -303,6 +310,55 @@ def read_brazilian_csv(
     raise ValueError(f"Unknown engine: {engine!r}")
 
 
+def _utf8_name(codec: str) -> str:
+    """Polars' native name for UTF-8 codecs, the Python codec name otherwise."""
+    return (
+        "utf8"
+        if codec.lower().replace("_", "-") in ("utf-8", "utf8", "utf-8-sig")
+        else codec
+    )
+
+
+def _temp_copy(
+    src: Path, *, codec: str | None, strip_nulls: bool, suffix: str = ".csv"
+) -> Path:
+    """Stream ``src`` to a temporary file, optionally transcoded to UTF-8.
+
+    ``codec`` is ``None`` to copy bytes as they are (only dropping NULs).
+    The file is removed when the interpreter exits.
+    """
+    fd, name = tempfile.mkstemp(prefix="quantilica-csv-", suffix=suffix)
+    out_path = Path(name)
+    atexit.register(lambda p=out_path: p.unlink(missing_ok=True))
+    decoder = codecs.getincrementaldecoder(codec)() if codec else None
+    with os.fdopen(fd, "wb") as out, open(src, "rb") as fh:
+        while chunk := fh.read(1 << 24):
+            if strip_nulls:
+                chunk = chunk.replace(b"\x00", b"")
+            if decoder is not None:
+                out.write(decoder.decode(chunk).encode("utf-8"))
+            else:
+                out.write(chunk)
+        if decoder is not None:
+            out.write(decoder.decode(b"", final=True).encode("utf-8"))
+    return out_path
+
+
+def _decodes_as(path: Path, codec: str, strip_nulls: bool) -> bool:
+    """Whether the whole file decodes under ``codec`` (streamed, not loaded)."""
+    decoder = codecs.getincrementaldecoder(codec)()
+    try:
+        with open(path, "rb") as fh:
+            while chunk := fh.read(1 << 24):
+                if strip_nulls:
+                    chunk = chunk.replace(b"\x00", b"")
+                decoder.decode(chunk)
+        decoder.decode(b"", final=True)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def read_csv_resilient(
     source: Any,
     *,
@@ -313,15 +369,33 @@ def read_csv_resilient(
     truncate_ragged_lines: bool = False,
     null_values: list[str] | None = None,
     strip_null_bytes: bool = True,
+    br_nulls: bool = False,
+    fallback_encodings: Sequence[str] | None = None,
+    lazy: bool = False,
+    max_bytes: int | None = None,
     **kwargs: Any,
-) -> pl.DataFrame:
+) -> pl.DataFrame | pl.LazyFrame:
     """Leitura resiliente de CSV com detecção de encoding e códigos cadastrais (L4).
 
-    - Detecta encoding automaticamente (tenta utf-8, fallback para cp1252/latin-1).
+    - Sem ``encoding``, tenta utf-8, cp1252 e latin-1, nessa ordem, e avisa no log
+      quando precisa recuar. Com ``encoding`` explícito, usa só ele: um erro de
+      decodificação é propagado, a menos que ``fallback_encodings`` liste outros
+      a tentar (também com aviso).
     - Força `code_columns` para `pl.String` em `schema_overrides` impedindo
       perda de zeros à esquerda.
     - Remove bytes nulos `\\x00` em arquivos malformados se strip_null_bytes=True.
     - Suporta truncate_ragged_lines=True para lidar com linhas desiguais.
+    - ``null_values`` só vale quando informado: nada é convertido em nulo por
+      padrão, para a leitura não mudar o dado. ``br_nulls=True`` aplica os
+      marcadores brasileiros de :data:`DEFAULT_BR_NA` (``"NA"``, ``"-"``,
+      ``"N/D"``...).
+    - ``lazy=True`` devolve um ``pl.LazyFrame`` sem carregar o arquivo: o CSV em
+      UTF-8 é varrido no lugar e outros encodings (ou bytes nulos) passam antes
+      por uma cópia temporária em UTF-8 gerada em blocos, removida ao sair do
+      processo. A fonte precisa ser caminho (ou bytes, gravados em temporário).
+    - ``max_bytes`` recusa (``ValueError``) a leitura em memória de um arquivo
+      maior que o limite, indicando ``lazy=True``; ``n_rows`` e demais opções do
+      Polars seguem em ``kwargs``.
     """
     overrides = dict(schema_overrides or {})
     for col in code_columns:
@@ -332,54 +406,123 @@ def read_csv_resilient(
     if truncate_ragged_lines:
         kwargs["truncate_ragged_lines"] = True
 
-    if null_values is None:
-        kwargs.setdefault("null_values", list(DEFAULT_BR_NA))
-    else:
+    if null_values is not None:
         kwargs["null_values"] = null_values
+    elif br_nulls:
+        kwargs.setdefault("null_values", list(DEFAULT_BR_NA))
 
     if separator is not None:
         kwargs["separator"] = separator
 
-    raw_bytes: bytes | None = None
-    if isinstance(source, (bytes, bytearray)):
-        raw_bytes = bytes(source)
-    elif isinstance(source, (str, Path)) and strip_null_bytes:
-        p = Path(source)
-        if p.is_file():
-            try:
-                with open(p, "rb") as f:
-                    head = f.read(2048)
-                if b"\x00" in head:
-                    raw_bytes = p.read_bytes()
-            except OSError:
-                pass
-
-    if raw_bytes is not None and strip_null_bytes and b"\x00" in raw_bytes:
-        source = io.BytesIO(raw_bytes.replace(b"\x00", b""))
-
-    encodings: list[str]
     if encoding is not None:
-        encodings = [encoding]
-        if encoding.lower() not in ("latin-1", "iso-8859-1", "cp1252"):
-            encodings.extend(["cp1252", "latin-1"])
+        encodings = [encoding, *(fallback_encodings or ())]
+        auto = False
     else:
         encodings = ["utf-8", "cp1252", "latin-1"]
+        auto = True
 
-    last_exc: Exception | None = None
+    temps: list[Path] = []
+    path: Path | None = None
+    try:
+        if isinstance(source, (str, Path)) and Path(source).is_file():
+            path = Path(source)
+        elif isinstance(source, (bytes, bytearray)) and (lazy or max_bytes):
+            fd, name = tempfile.mkstemp(prefix="quantilica-csv-", suffix=".csv")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(source)
+            path = Path(name)
+            atexit.register(lambda p=path: p.unlink(missing_ok=True))
+            temps.append(path)
+        elif lazy:
+            raise ValueError("lazy=True needs a file path or bytes as source")
+
+        if path is not None:
+            size = path.stat().st_size
+            if max_bytes is not None and not lazy and size > max_bytes:
+                raise ValueError(
+                    f"{path.name} has {size} bytes, over max_bytes={max_bytes}; "
+                    "pass lazy=True to scan it without loading it"
+                )
+            has_nulls = False
+            if strip_null_bytes:
+                with open(path, "rb") as fh:
+                    has_nulls = b"\x00" in fh.read(2048)
+            if lazy:
+                return _scan_csv_resilient(
+                    path, encodings, auto, has_nulls, kwargs, temps
+                )
+            if has_nulls:
+                path = _temp_copy(path, codec=None, strip_nulls=True)
+                temps.append(path)
+            source = path
+        elif isinstance(source, (bytes, bytearray)):
+            data = bytes(source)
+            if strip_null_bytes and b"\x00" in data:
+                data = data.replace(b"\x00", b"")
+            source = io.BytesIO(data)
+
+        last_exc: Exception | None = None
+        for i, cand in enumerate(encodings):
+            call_kwargs = dict(kwargs)
+            call_kwargs["encoding"] = _utf8_name(cand)
+            if hasattr(source, "seek"):
+                source.seek(0)
+            try:
+                df = pl.read_csv(source, **call_kwargs)
+            except (pl.exceptions.ComputeError, UnicodeDecodeError, ValueError) as exc:
+                last_exc = exc
+                continue
+            if i > 0:
+                logger.warning(
+                    "read_csv_resilient: %s did not decode as %s, read as %s",
+                    getattr(source, "name", None) or path or "source",
+                    encodings[0],
+                    cand,
+                )
+            return df
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Failed to read CSV with resilient reader")
+    finally:
+        if not lazy:
+            for tmp in temps:
+                tmp.unlink(missing_ok=True)
+
+
+def _scan_csv_resilient(
+    path: Path,
+    encodings: list[str],
+    auto: bool,
+    has_nulls: bool,
+    kwargs: dict[str, Any],
+    temps: list[Path],
+) -> pl.LazyFrame:
+    """Lazy half of :func:`read_csv_resilient` (see its docstring)."""
+    chosen: str | None = None
     for cand in encodings:
-        call_kwargs = dict(kwargs)
-        call_kwargs["encoding"] = cand
-        if hasattr(source, "seek"):
-            source.seek(0)
-        try:
-            return pl.read_csv(source, **call_kwargs)
-        except (pl.exceptions.ComputeError, UnicodeDecodeError, ValueError) as exc:
-            last_exc = exc
-            continue
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("Failed to read CSV with resilient reader")
+        if _decodes_as(path, cand, has_nulls):
+            chosen = cand
+            break
+    if chosen is None:
+        raise UnicodeDecodeError(
+            "unknown", b"", 0, 1, f"{path.name} does not decode as any of {encodings}"
+        )
+    if chosen != encodings[0]:
+        logger.warning(
+            "read_csv_resilient: %s did not decode as %s, read as %s",
+            path.name,
+            encodings[0],
+            chosen,
+        )
+    is_utf8 = _utf8_name(chosen) == "utf8"
+    if is_utf8 and not has_nulls:
+        target = path
+    else:
+        target = _temp_copy(path, codec=chosen, strip_nulls=has_nulls)
+        # The temporary is UTF-8 already; the caller owns nothing to clean up.
+    temps.clear()  # keep the temp alive: the LazyFrame reads it later
+    return pl.scan_csv(target, encoding="utf8", **kwargs)
 
 
 class SmartReader:

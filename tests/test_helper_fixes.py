@@ -6,13 +6,16 @@ import gzip
 import zipfile
 from pathlib import Path
 
+import polars as pl
 import pyarrow.parquet as pq
+import pytest
 
 from quantilica.analytics.lake import (
     DatasetSpec,
     convert_with_specs,
     find_skip_until,
 )
+from quantilica.analytics.reader import DEFAULT_BR_NA, read_csv_resilient
 
 
 def test_dataset_spec_partition_types_follow_core():
@@ -184,3 +187,71 @@ def test_fixed_width_layout_found_with_stacked_extensions(tmp_path: Path):
     res, ds = _convert(tmp_path, _spec(reader="fixed_width"))
     assert not res.errors, res.errors
     assert _read_all(ds).column("cod").to_pylist() == ["0001", "0002"]
+
+
+# --- read_csv_resilient ----------------------------------------------------------
+
+
+def test_resilient_does_not_impose_null_values_by_default(tmp_path: Path):
+    p = tmp_path / "a.csv"
+    p.write_text("a;b\nNA;1\n-;2\n", encoding="utf-8")
+    df = read_csv_resilient(p, separator=";")
+    assert df["a"].to_list() == ["NA", "-"]
+
+
+def test_resilient_br_nulls_opt_in(tmp_path: Path):
+    p = tmp_path / "a.csv"
+    p.write_text("a;b\nNA;1\n-;2\nx;3\n", encoding="utf-8")
+    df = read_csv_resilient(p, separator=";", br_nulls=True)
+    assert df["a"].to_list() == [None, None, "x"]
+    explicit = read_csv_resilient(p, separator=";", null_values=["x"])
+    assert explicit["a"].to_list() == ["NA", "-", None]
+    assert "NA" in DEFAULT_BR_NA
+
+
+def test_resilient_explicit_encoding_does_not_fall_back_silently(tmp_path: Path):
+    p = tmp_path / "a.csv"
+    p.write_bytes("a;b\nação;1\n".encode("latin-1"))
+    with pytest.raises(Exception):  # noqa: B017 - polars raises ComputeError
+        read_csv_resilient(p, separator=";", encoding="utf-8")
+
+
+def test_resilient_explicit_fallback_encodings(tmp_path: Path):
+    p = tmp_path / "a.csv"
+    p.write_bytes("a;b\nação;1\n".encode("latin-1"))
+    df = read_csv_resilient(
+        p, separator=";", encoding="utf-8", fallback_encodings=["latin-1"]
+    )
+    assert df["a"].to_list() == ["ação"]
+
+
+def test_resilient_auto_encoding_still_detects(tmp_path: Path):
+    p = tmp_path / "a.csv"
+    p.write_bytes("a;b\nação;1\n".encode("latin-1"))
+    assert read_csv_resilient(p, separator=";")["a"].to_list() == ["ação"]
+
+
+def test_resilient_lazy_streams_latin1_and_null_bytes(tmp_path: Path):
+    p = tmp_path / "a.csv"
+    p.write_bytes("cod;nome\x00\n0123;ação\n0456;maçã\n".encode("latin-1"))
+    lf = read_csv_resilient(p, separator=";", code_columns=["cod"], lazy=True)
+    assert isinstance(lf, pl.LazyFrame)
+    df = lf.collect()
+    assert df["cod"].to_list() == ["0123", "0456"]
+    assert df["nome"].to_list() == ["ação", "maçã"]
+
+
+def test_resilient_lazy_utf8_scans_the_file_directly(tmp_path: Path):
+    p = tmp_path / "a.csv"
+    p.write_text("a;b\n1;ç\n2;d\n", encoding="utf-8")
+    lf = read_csv_resilient(p, separator=";", lazy=True)
+    assert lf.head(1).collect().shape == (1, 2)
+
+
+def test_resilient_max_bytes_guards_eager_reads(tmp_path: Path):
+    p = tmp_path / "a.csv"
+    p.write_text("a;b\n" + "1;2\n" * 1000, encoding="utf-8")
+    with pytest.raises(ValueError, match="lazy"):
+        read_csv_resilient(p, separator=";", max_bytes=100)
+    assert read_csv_resilient(p, separator=";", max_bytes=100, lazy=True) is not None
+    assert read_csv_resilient(p, separator=";", n_rows=3).height == 3
