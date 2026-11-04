@@ -5,6 +5,25 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Adicionado
+
+- `lake.convert_with_specs()` lê `.gz` (descomprimido), `.dbf` e `.dbc`. O DBF é lido por um leitor próprio (`dbf.read_dbf()`); o DBC precisa de `datasus-dbc` ou `pyreaddbc` e, sem eles, o erro diz o que instalar. O leitor `"dbf"` entra em `DatasetSpec.reader`.
+- `DatasetSpec.members` passa a valer: glob (sem diferenciar maiúsculas) que escolhe quais arquivos de texto de um ZIP/7z são lidos; sem correspondência é erro. `LakeWriter.write_duckdb()` aceita `members`.
+- `DatasetSpec.fallback` (padrão `True`): se o cabeçalho não contém o separador declarado mas contém outro entre `; , tab |`, usa esse; se o palpite UTF-8 do `encoding="detect"` falha, tenta de novo como Latin-1. Os dois avisam no log; com `False` a especificação vale exatamente como escrita.
+- `reader.read_csv_resilient()`: `lazy=True` devolve um `LazyFrame` sem carregar o arquivo (outros encodings e bytes nulos passam por uma cópia temporária em UTF-8 gerada em blocos), `max_bytes` recusa a leitura em memória de arquivo maior que o limite, `br_nulls=True` aplica os marcadores brasileiros de nulo e `fallback_encodings` lista encodings a tentar depois do explícito.
+- `geo.extract_wkb_and_bbox()` aceita `source_epsg` e lê shapefile, GeoPackage, FlatGeobuf, KML e GML quando o extra `quantilica-analytics[geo]` (geopandas, pyogrio, pyproj) está instalado; sem ele, o `ImportError` explica como instalar.
+- `schema.EraSchemaResolver.resolve()` aceita `strict_cast` e expõe `cast_failures` (valores que viraram nulo no cast, por coluna).
+
+### Corrigido
+
+- `DatasetSpec.partition_types` seguia uma regra própria (`mes` e `trimestre` como inteiros) e passa a usar `partition_types_for()` do `quantilica-core`: só `ano` é inteiro, `mes`, `trimestre` e as demais chaves são `varchar`, como no layout `mes=01`.
+- `convert_with_specs()`: o latin-1 deixa de ser lido como cp1252 (no leitor Polars e em `find_skip_until()`); o arquivo de layout de largura fixa é achado pela chave do arquivo (`file_key`), também com extensões empilhadas como `.txt.gz`, e o próprio arquivo de layout deixa de ser tratado como dado; a leitura de largura fixa deixa de falhar com o DuckDB 2.0; `detect_encoding()` e `find_skip_until()` olham dentro de `.gz` e `.zip`, e um caractere multibyte cortado no limite de 64 KB não conta mais como UTF-8 inválido.
+- `read_csv_resilient()` não impõe mais `DEFAULT_BR_NA` como valores nulos por padrão (passe `br_nulls=True` ou `null_values=`) e não recua mais em silêncio de um `encoding` explícito para cp1252/latin-1; o recuo sem `encoding` continua, agora com aviso.
+- `EraSchemaResolver.resolve()` não zera mais valores em silêncio ao converter para o tipo canônico: o valor que não converte continua virando nulo (padrão `strict_cast=False`), mas com aviso no log e contagem em `cast_failures`.
+- `geo.extract_wkb_and_bbox()` ignorava `target_epsg`: agora reprojeta com pyproj quando o CRS de origem difere do alvo (4326 e 4674 contam como o mesmo CRS) e levanta `ImportError` claro se o pyproj faltar.
+
 ## [0.9.0] - 2026-11-03
 
 ### Adicionado

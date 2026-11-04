@@ -10,6 +10,7 @@ and extracting bounding boxes for the Lake.
 from __future__ import annotations
 
 import json
+import re
 import struct
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -313,27 +314,150 @@ def _calc_bbox(
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+_VECTOR_SUFFIXES = frozenset(
+    {".shp", ".gpkg", ".fgb", ".kml", ".gml", ".gdb", ".zip", ".sqlite"}
+)
+# WGS 84 and SIRGAS 2000 differ by centimetres; treating them as the same CRS
+# keeps the default (target 4674) usable on GeoJSON (always WGS 84) with no
+# reprojection library. Any other pair of CRSs goes through pyproj.
+_EQUIVALENT_CRS = frozenset({4326, 4674})
+_GEOJSON_DEFAULT_EPSG = 4326
+_EPSG_IN_NAME = re.compile(r"EPSG:+(\d+)", re.IGNORECASE)
+
+
+def _same_crs(a: int, b: int) -> bool:
+    return a == b or (a in _EQUIVALENT_CRS and b in _EQUIVALENT_CRS)
+
+
+def _geojson_epsg(data: Mapping[str, Any]) -> int | None:
+    """EPSG code of a GeoJSON's legacy ``crs`` member, when it has one."""
+    crs = data.get("crs")
+    if isinstance(crs, Mapping):
+        name = (crs.get("properties") or {}).get("name")
+        if isinstance(name, str):
+            match = _EPSG_IN_NAME.search(name)
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def _make_transformer(source_epsg: int, target_epsg: int) -> Any:
+    try:
+        from pyproj import Transformer
+    except ImportError:
+        raise ImportError(
+            f"reprojecting from EPSG:{source_epsg} to EPSG:{target_epsg} needs "
+            "pyproj; install it with `uv add 'quantilica-analytics[geo]'`"
+        ) from None
+    return Transformer.from_crs(source_epsg, target_epsg, always_xy=True)
+
+
+def _transform_coords(coords: Any, transformer: Any) -> Any:
+    """Apply ``transformer`` to every position in a GeoJSON coordinates tree."""
+    if (
+        isinstance(coords, (list, tuple))
+        and len(coords) >= 2
+        and isinstance(coords[0], (int, float))
+    ):
+        x, y = transformer.transform(coords[0], coords[1])
+        return [x, y, *coords[2:]]
+    if isinstance(coords, (list, tuple)):
+        return [_transform_coords(c, transformer) for c in coords]
+    return coords
+
+
+def _reproject_geometry(geom: Any, transformer: Any) -> Any:
+    if not isinstance(geom, Mapping):
+        return geom
+    out = dict(geom)
+    if "coordinates" in out:
+        out["coordinates"] = _transform_coords(out["coordinates"], transformer)
+    if "geometries" in out:
+        out["geometries"] = [
+            _reproject_geometry(g, transformer) for g in out["geometries"]
+        ]
+    return out
+
+
+def _read_vector_features(
+    path: Path, target_epsg: int, source_epsg: int | None
+) -> list[dict[str, Any]]:
+    """Features of a shapefile/GeoPackage/... as GeoJSON-like dicts (target CRS)."""
+    try:
+        import geopandas as gpd
+    except ImportError:
+        raise ImportError(
+            f"reading {path.name} needs geopandas (with pyogrio); install it "
+            "with `uv add 'quantilica-analytics[geo]'`"
+        ) from None
+    gdf = gpd.read_file(path)
+    if source_epsg is not None:
+        gdf = gdf.set_crs(epsg=source_epsg, allow_override=True)
+    file_epsg = gdf.crs.to_epsg() if gdf.crs is not None else None
+    if file_epsg is None:
+        raise ValueError(
+            f"{path.name} has no CRS; pass source_epsg to say which one it uses"
+        )
+    if not _same_crs(file_epsg, target_epsg):
+        gdf = gdf.to_crs(epsg=target_epsg)
+    geom_col = gdf.geometry.name
+    features: list[dict[str, Any]] = []
+    for record in gdf.drop(columns=[geom_col]).to_dict("records"):
+        features.append({"properties": record})
+    for feat, geom in zip(features, gdf.geometry, strict=True):
+        feat["geometry"] = None if geom is None else geom.__geo_interface__
+    return features
+
+
 def extract_wkb_and_bbox(
     features_or_path: str | Path | Mapping[str, Any] | Iterable[dict[str, Any]],
     *,
     target_epsg: int = 4674,
+    source_epsg: int | None = None,
 ) -> pl.DataFrame:
-    """Extrai feições GeoJSON para DataFrame com geom_wkb e colunas escalares de BBox.
+    """Extrai feições para DataFrame com geom_wkb e colunas escalares de BBox.
 
     Permite indexar e consultar dados espaciais no Parquet Lake sem depender de PostGIS.
+
+    Entradas: GeoJSON (caminho, ``FeatureCollection`` ou lista de feições) e,
+    com o extra ``quantilica-analytics[geo]`` (geopandas + pyogrio), arquivos
+    vetoriais como shapefile (``.shp``), GeoPackage (``.gpkg``), FlatGeobuf,
+    KML e GML. Sem o extra, esses arquivos levantam ``ImportError`` dizendo o que
+    instalar.
+
+    ``target_epsg`` é o CRS das saídas (WKB e bbox). O CRS de origem é
+    ``source_epsg`` quando informado; senão o do membro ``crs`` do GeoJSON ou o
+    do arquivo vetorial; senão WGS 84 (4326, o padrão do GeoJSON). Quando os dois
+    coincidem (4326 e 4674, WGS 84 e SIRGAS 2000, contam como o mesmo), nada é
+    reprojetado; nos demais casos a reprojeção usa ``pyproj`` e, se ele não
+    estiver instalado, levanta ``ImportError`` explicando como instalar.
     """
     feature_list: list[dict[str, Any]] = []
+    file_source_epsg: int | None = None
+    vector = False
 
     if isinstance(features_or_path, (str, Path)):
         p = Path(features_or_path)
-        with open(p, "rb") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            feature_list = data.get("features", [])
+        if p.suffix.lower() in _VECTOR_SUFFIXES:
+            vector = True
+            feature_list = _read_vector_features(p, target_epsg, source_epsg)
+        else:
+            with open(p, "rb") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                feature_list = data.get("features", [])
+                file_source_epsg = _geojson_epsg(data)
     elif isinstance(features_or_path, Mapping):
         feature_list = features_or_path.get("features", [])
+        file_source_epsg = _geojson_epsg(features_or_path)
     elif isinstance(features_or_path, Iterable):
         feature_list = list(features_or_path)
+
+    transformer = None
+    if not vector:
+        src_epsg = source_epsg or file_source_epsg or _GEOJSON_DEFAULT_EPSG
+        if not _same_crs(src_epsg, target_epsg):
+            transformer = _make_transformer(src_epsg, target_epsg)
 
     rows: list[dict[str, Any]] = []
     for feat in feature_list:
@@ -341,6 +465,8 @@ def extract_wkb_and_bbox(
             continue
         props = dict(feat.get("properties") or {})
         geom = feat.get("geometry")
+        if transformer is not None:
+            geom = _reproject_geometry(geom, transformer)
         wkb = geometry_to_wkb(geom)
         minx, miny, maxx, maxy = _calc_bbox(geom)
 

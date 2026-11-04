@@ -35,6 +35,14 @@ dependencies = [
     "quantilica-core>=0.16.0",
 ]
 
+[project.optional-dependencies]
+# Reprojeção e leitura de shapefile/GeoPackage em geo.extract_wkb_and_bbox().
+geo = [
+    "geopandas>=1.0",
+    "pyogrio>=0.9",
+    "pyproj>=3.6",
+]
+
 [project.urls]
 Homepage = "https://github.com/Quantilica/quantilica-analytics"
 Repository = "https://github.com/Quantilica/quantilica-analytics"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import sys
 import zipfile
 from pathlib import Path
 
@@ -255,6 +256,143 @@ def test_resilient_max_bytes_guards_eager_reads(tmp_path: Path):
         read_csv_resilient(p, separator=";", max_bytes=100)
     assert read_csv_resilient(p, separator=";", max_bytes=100, lazy=True) is not None
     assert read_csv_resilient(p, separator=";", n_rows=3).height == 3
+
+
+# --- extract_wkb_and_bbox --------------------------------------------------------
+
+
+def _point_collection(x=-46.6333, y=-23.5505, crs_epsg=None) -> dict:
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"id": 1},
+                "geometry": {"type": "Point", "coordinates": [x, y]},
+            }
+        ],
+    }
+    if crs_epsg:
+        fc["crs"] = {
+            "type": "name",
+            "properties": {"name": f"urn:ogc:def:crs:EPSG::{crs_epsg}"},
+        }
+    return fc
+
+
+def test_extract_same_or_equivalent_crs_needs_no_pyproj(monkeypatch):
+    from quantilica.analytics import extract_wkb_and_bbox
+
+    monkeypatch.setitem(sys.modules, "pyproj", None)
+    for target in (4326, 4674):  # WGS 84 and SIRGAS 2000 coincide
+        df = extract_wkb_and_bbox(_point_collection(), target_epsg=target)
+        assert df["bbox_minx"].to_list() == [-46.6333]
+
+
+def test_extract_target_epsg_without_pyproj_is_a_clear_error(monkeypatch):
+    from quantilica.analytics import extract_wkb_and_bbox
+
+    monkeypatch.setitem(sys.modules, "pyproj", None)
+    with pytest.raises(ImportError, match="pyproj"):
+        extract_wkb_and_bbox(_point_collection(), target_epsg=31983)
+
+
+def test_extract_reads_geojson_crs_member_as_source(monkeypatch):
+    from quantilica.analytics import extract_wkb_and_bbox
+
+    monkeypatch.setitem(sys.modules, "pyproj", None)
+    # already in the target CRS: no transform, no pyproj
+    df = extract_wkb_and_bbox(
+        _point_collection(333000.0, 7394000.0, crs_epsg=31983), target_epsg=31983
+    )
+    assert df["bbox_minx"].to_list() == [333000.0]
+    # declared as UTM, asked in geographic: needs a transform
+    with pytest.raises(ImportError, match="pyproj"):
+        extract_wkb_and_bbox(
+            _point_collection(333000.0, 7394000.0, crs_epsg=31983), target_epsg=4674
+        )
+
+
+def test_extract_reprojects_with_pyproj():
+    pytest.importorskip("pyproj")
+    from quantilica.analytics import extract_wkb_and_bbox
+
+    df = extract_wkb_and_bbox(_point_collection(), target_epsg=31983)
+    x, y = df["bbox_minx"][0], df["bbox_miny"][0]
+    assert 300_000 < x < 360_000
+    assert 7_350_000 < y < 7_450_000
+    assert df["bbox_maxx"][0] == x
+
+
+def test_extract_applies_the_transformer_to_every_position(monkeypatch):
+    import types
+
+    from quantilica.analytics import extract_wkb_and_bbox
+
+    calls = []
+
+    class FakeTransformer:
+        @staticmethod
+        def from_crs(src, dst, always_xy):
+            calls.append((src, dst, always_xy))
+            return types.SimpleNamespace(transform=lambda x, y: (x + 1000, y + 2000))
+
+    monkeypatch.setitem(
+        sys.modules, "pyproj", types.SimpleNamespace(Transformer=FakeTransformer)
+    )
+    fc = _point_collection()
+    fc["features"].append(
+        {
+            "type": "Feature",
+            "properties": {"id": 2},
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+            },
+        }
+    )
+    df = extract_wkb_and_bbox(fc, target_epsg=31983)
+    assert calls == [(4326, 31983, True)]
+    assert df["bbox_minx"].to_list() == [-46.6333 + 1000, 1000.0]
+    assert df["bbox_maxy"].to_list() == [-23.5505 + 2000, 2001.0]
+
+
+def test_extract_source_epsg_overrides_default(monkeypatch):
+    from quantilica.analytics import extract_wkb_and_bbox
+
+    monkeypatch.setitem(sys.modules, "pyproj", None)
+    with pytest.raises(ImportError, match="pyproj"):
+        extract_wkb_and_bbox(_point_collection(), source_epsg=31983, target_epsg=4674)
+
+
+def test_extract_vector_file_without_geopandas_is_actionable(monkeypatch, tmp_path):
+    from quantilica.analytics import extract_wkb_and_bbox
+
+    monkeypatch.setitem(sys.modules, "geopandas", None)
+    path = tmp_path / "limites.gpkg"
+    path.write_bytes(b"")
+    with pytest.raises(ImportError, match=r"geopandas.*quantilica-analytics\[geo\]"):
+        extract_wkb_and_bbox(path)
+
+
+def test_extract_geopackage_with_geopandas(tmp_path):
+    gpd = pytest.importorskip("geopandas")
+    pytest.importorskip("pyogrio")
+    from shapely.geometry import Point
+
+    from quantilica.analytics import extract_wkb_and_bbox
+
+    gdf = gpd.GeoDataFrame(
+        {"nome": ["A", "B"]},
+        geometry=[Point(-46.0, -23.0), Point(-43.0, -22.0)],
+        crs="EPSG:4674",
+    )
+    path = tmp_path / "pts.gpkg"
+    gdf.to_file(path, driver="GPKG")
+    df = extract_wkb_and_bbox(path)
+    assert df["nome"].to_list() == ["A", "B"]
+    assert df["bbox_minx"].to_list() == [-46.0, -43.0]
+    assert all(isinstance(b, bytes) for b in df["geom_wkb"].to_list())
 
 
 # --- EraSchemaResolver -----------------------------------------------------------
