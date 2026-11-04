@@ -13,6 +13,9 @@ the pieces that need heavy dependencies:
 
 from __future__ import annotations
 
+import codecs
+import fnmatch
+import gzip
 import json
 import logging
 import math
@@ -255,15 +258,29 @@ def _scratch_dir(staging: Path) -> Path:
     return Path(tempfile.mkdtemp(dir=base))
 
 
-def _materialize(src: Path, tmp: Path) -> list[Path]:
-    """Text files to read: the file itself, or the members of a ZIP/7z."""
+def _materialize(src: Path, tmp: Path, members: str | None = None) -> list[Path]:
+    """Text files to read: the file itself, or the members of a ZIP/7z.
+
+    A ``.gz`` is decompressed to ``tmp``. ``members`` is a case-insensitive
+    glob (``fnmatch``) on the member's path inside the archive; only the
+    matching text members are read. It is an error for it to match none.
+    """
     suffix = src.suffix.lower()
     if suffix in TEXT_SUFFIXES:
         return [src]
+    if suffix == ".gz":
+        tmp.mkdir(parents=True, exist_ok=True)
+        name = src.name[:-3]
+        if Path(name).suffix.lower() not in TEXT_SUFFIXES:
+            name += ".csv"
+        out = tmp / name
+        with gzip.open(src, "rb") as reader, open(out, "wb") as writer:
+            shutil.copyfileobj(reader, writer, 1 << 24)
+        return [out]
     if suffix == ".zip":
         with zipfile.ZipFile(src) as archive:
-            members = [m for m in archive.infolist() if not m.is_dir()]
-            archive.extractall(tmp, members=members)
+            entries = [m for m in archive.infolist() if not m.is_dir()]
+            archive.extractall(tmp, members=entries)
     elif suffix == ".7z":
         tool = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
         if tool is None:
@@ -280,6 +297,16 @@ def _materialize(src: Path, tmp: Path) -> list[Path]:
     files = sorted(
         p for p in tmp.rglob("*") if p.is_file() and p.suffix.lower() in TEXT_SUFFIXES
     )
+    if members:
+        pattern = members.lower()
+        files = [
+            p
+            for p in files
+            if fnmatch.fnmatchcase(p.relative_to(tmp).as_posix().lower(), pattern)
+            or fnmatch.fnmatchcase(p.name.lower(), pattern)
+        ]
+        if not files:
+            raise LakeError(f"{src.name} has no member matching {members!r}")
     if not files:
         raise LakeError(f"{src.name} contains no data files (.csv/.txt)")
     return files
@@ -546,8 +573,12 @@ class LakeWriter:
         parallel: bool = True,
         skip: int = 0,
         decimal_comma: bool = True,
+        members: str | None = None,
     ) -> LakeWriteResult:
         """Convert a CSV/TXT (or the members of a ZIP/7z) with DuckDB, streaming.
+
+        ``members`` (a case-insensitive glob) picks which text members of a
+        ZIP/7z are read; a ``.gz`` is decompressed first.
 
         Columns are read as text, named from the header (normalized, then
         ``rename``) or from ``names`` when ``header`` is false. ``quote`` and
@@ -601,6 +632,7 @@ class LakeWriter:
                     parallel=parallel,
                     skip=skip,
                     decimal_comma=decimal_comma,
+                    members=members,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -984,11 +1016,15 @@ class LakeWriter:
         parallel: bool = True,
         skip: int = 0,
         decimal_comma: bool = True,
+        members: str | None = None,
     ) -> LakeWriteResult:
         scratch = _scratch_dir(staging)
         conn = _connect(scratch)
         try:
-            files = _materialize(src, scratch / "raw")
+            if members:
+                files = _materialize(src, scratch / "raw", members)
+            else:
+                files = _materialize(src, scratch / "raw")
             if encoding.lower() in _LATIN1 and any(map(_has_c1_bytes, files)):
                 files = _latin1_to_utf8(files, scratch / "utf8")
                 encoding = "utf-8"
@@ -1764,26 +1800,42 @@ def _check_readers(
 
 
 def detect_encoding(path_or_bytes: Path | bytes) -> str:
-    """Detect encoding: BOM -> utf-8-sig; valid UTF-8 in 64KB -> utf-8; else cp1252."""
+    """Detect encoding: BOM -> utf-8-sig; valid UTF-8 in 64KB -> utf-8; else cp1252.
+
+    A ``.gz`` and the first text member of a ``.zip`` are sampled decompressed.
+    A multibyte character cut by the 64 KB boundary does not count as invalid.
+    """
     if isinstance(path_or_bytes, Path):
-        with open(path_or_bytes, "rb") as f:
-            chunk = f.read(65536)
+        try:
+            chunk = _sample_bytes(path_or_bytes)
+        except (OSError, zipfile.BadZipFile, EOFError):
+            with open(path_or_bytes, "rb") as f:
+                chunk = f.read(65536)
     else:
         chunk = path_or_bytes[:65536]
     if chunk.startswith(b"\xef\xbb\xbf"):
         return "utf-8-sig"
     try:
-        chunk.decode("utf-8")
+        codecs.getincrementaldecoder("utf-8")().decode(chunk, final=False)
         return "utf-8"
     except UnicodeDecodeError:
         return "cp1252"
 
 
 def find_skip_until(file_path: Path, prefix: str, encoding: str) -> int:
-    """Count how many preamble lines to skip until a line starts with ``prefix``."""
-    enc = "utf-8" if encoding in ("utf-8", "utf-8-sig") else "cp1252"
+    """Count how many preamble lines to skip until a line starts with ``prefix``.
+
+    The file is decoded with ``encoding`` itself (Latin-1 is real Latin-1, not
+    cp1252); a ``.gz`` and the first text member of a ``.zip`` are read decompressed.
+    """
+    enc = _py_codec(encoding)
     try:
-        if file_path.suffix.lower() == ".zip":
+        if file_path.suffix.lower() == ".gz":
+            with gzip.open(file_path, "rt", encoding=enc, errors="replace") as gz:
+                for idx, line in enumerate(gz):
+                    if line.startswith(prefix):
+                        return idx
+        elif file_path.suffix.lower() == ".zip":
             with zipfile.ZipFile(file_path) as zf:
                 for name in zf.namelist():
                     if name.lower().endswith((".csv", ".txt")):
@@ -1819,7 +1871,7 @@ class DatasetSpec:
     dataset_id: str
     partition_keys: tuple[str, ...]
     partitions_from: Callable[[Path], dict[str, str | int | None]]
-    reader: Literal["duckdb", "polars", "fixed_width", "parquet"] = "duckdb"
+    reader: Literal["duckdb", "polars", "fixed_width", "parquet", "dbf"] = "duckdb"
     encoding: str | Literal["detect"] = "detect"
     separator: str = ";"
     header: bool = True
@@ -1830,6 +1882,17 @@ class DatasetSpec:
     members: str | None = None
     contract: DataContract | None = None
     normalize: Callable[[Path], Iterable[bytes]] | None = None
+    fallback: bool = True
+    """Tolerate a wrong guess about the file.
+
+    With ``True`` (the default), a header that lacks ``separator`` but uses
+    another one of ``; , tab |`` is read with that one, and a failed UTF-8
+    guess (``encoding="detect"``) is retried as Latin-1; both log a warning.
+    With ``False`` the spec is applied exactly as written.
+
+    ``members`` is a case-insensitive glob choosing which text members of a
+    ZIP/7z archive are read (all of them when ``None``).
+    """
 
     @property
     def alias(self) -> str:
@@ -1844,6 +1907,244 @@ class DatasetSpec:
         ``varchar`` (the layout writes ``mes=01``, which an integer would drop).
         """
         return partition_types_for(self.partition_keys)
+
+
+_SEPARATOR_CANDIDATES = (";", ",", "\t", "|")
+_ENCODING_ERROR_HINTS = ("unicode", "utf", "encod", "codec", "decode")
+
+
+def _py_codec(encoding: str) -> str:
+    """Python codec name for ``encoding``; Latin-1 stays real Latin-1.
+
+    ``latin-1`` (and its aliases) is *not* ``cp1252``: the two differ in
+    0x80-0x9F, and cp1252 leaves 0x81, 0x8D, 0x8F, 0x90 and 0x9D undefined.
+    """
+    norm = encoding.lower().replace("_", "-")
+    if norm in _LATIN1:
+        return "latin-1"
+    if norm in ("utf8", "utf-8"):
+        return "utf-8"
+    if norm in ("utf8-sig", "utf-8-sig"):
+        return "utf-8-sig"
+    return encoding
+
+
+def _sample_bytes(path: Path, limit: int = 65536) -> bytes:
+    """The first ``limit`` bytes of the text in ``path`` (decompressed if needed).
+
+    Looks inside ``.gz`` files and into the first text member of a ``.zip``.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".gz":
+        with gzip.open(path, "rb") as fh:
+            return fh.read(limit)
+    if suffix == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                if not info.is_dir() and info.filename.lower().endswith(
+                    tuple(TEXT_SUFFIXES)
+                ):
+                    with zf.open(info) as fh:
+                        return fh.read(limit)
+        return b""
+    with open(path, "rb") as fh:
+        return fh.read(limit)
+
+
+def _sniff_separator(path: Path, encoding: str, skip: int, current: str) -> str:
+    """The delimiter of the header line when ``current`` does not occur in it.
+
+    Returns ``current`` when it is present in the line (the declared
+    separator is trusted), when no other candidate is, or when the file cannot
+    be sampled (7z, for one).
+    """
+    if path.suffix.lower() not in (*TEXT_SUFFIXES, ".gz", ".zip"):
+        return current
+    try:
+        chunk = _sample_bytes(path)
+        lines = chunk.decode(_py_codec(encoding), errors="replace").splitlines()
+    except Exception:
+        return current
+    if len(lines) <= skip:
+        return current
+    line = lines[skip]
+    if current in line:
+        return current
+    counts = {c: line.count(c) for c in _SEPARATOR_CANDIDATES if c != current}
+    best = max(counts, key=lambda c: counts[c])
+    if counts[best] == 0:
+        return current
+    logger.warning(
+        "lake: %s: separator %r not found in the header, using %r",
+        path.name,
+        current,
+        best,
+    )
+    return best
+
+
+def _is_encoding_error(exc: Exception) -> bool:
+    if isinstance(exc, UnicodeError):
+        return True
+    text = str(exc).lower()
+    return any(hint in text for hint in _ENCODING_ERROR_HINTS)
+
+
+def _convert_spec_file(
+    writer: LakeWriter,
+    spec: DatasetSpec,
+    path: Path,
+    partitions: dict[str, Any],
+    converter: str,
+) -> LakeWriteResult:
+    """Convert one raw file according to ``spec``.
+
+    With ``spec.encoding == "detect"`` and ``spec.fallback``, a UTF-8 guess
+    that fails to decode (the sniff only sees the first 64 KB) is retried as
+    Latin-1.
+    """
+    detect = spec.encoding == "detect"
+    enc = detect_encoding(path) if detect else spec.encoding
+    candidates = [enc]
+    if detect and spec.fallback and enc.lower().startswith("utf"):
+        candidates.append("latin-1")
+    for i, candidate in enumerate(candidates):
+        try:
+            return _convert_spec_file_with(
+                writer, spec, path, partitions, converter, candidate
+            )
+        except Exception as exc:
+            if i + 1 < len(candidates) and _is_encoding_error(exc):
+                logger.warning(
+                    "lake: %s: decoding as %s failed (%s), retrying as %s",
+                    path.name,
+                    candidate,
+                    str(exc).splitlines()[0] if str(exc) else exc,
+                    candidates[i + 1],
+                )
+                continue
+            raise
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _convert_spec_file_with(
+    writer: LakeWriter,
+    spec: DatasetSpec,
+    path: Path,
+    partitions: dict[str, Any],
+    converter: str,
+    enc: str,
+) -> LakeWriteResult:
+    suffix = path.suffix.lower()
+
+    def write_eager(read: Callable[[], pl.DataFrame]) -> LakeWriteResult:
+        # An unchanged file is skipped before the plan runs, so do not decode it.
+        current = writer.is_current(path, partitions=partitions, contract=spec.contract)
+        return writer.write_polars(
+            pl.DataFrame() if current else read(),
+            path,
+            partitions=partitions,
+            contract=spec.contract,
+            converter=converter,
+        )
+
+    if spec.reader == "parquet" or suffix == ".parquet":
+        return writer.write_polars(
+            pl.scan_parquet(path),
+            path,
+            partitions=partitions,
+            contract=spec.contract,
+            converter=converter,
+        )
+
+    if spec.reader == "dbf" or suffix in (".dbf", ".dbc"):
+        from quantilica.analytics.dbf import read_dbc, read_dbf
+
+        codec = None if spec.encoding == "detect" else _py_codec(spec.encoding)
+        reader_fn = read_dbc if suffix == ".dbc" else read_dbf
+        return write_eager(lambda: reader_fn(path, encoding=codec))
+
+    if spec.reader == "polars":
+        if suffix in (".xlsx", ".xls"):
+            return write_eager(lambda: pl.read_excel(path))
+        codec = _py_codec(enc)
+        separator = spec.separator
+        if spec.fallback:
+            separator = _sniff_separator(path, codec, 0, separator)
+        if codec in ("utf-8", "utf-8-sig"):
+            return writer.write_polars(
+                pl.scan_csv(
+                    path,
+                    separator=separator,
+                    encoding="utf8",
+                    has_header=spec.header,
+                ),
+                path,
+                partitions=partitions,
+                contract=spec.contract,
+                converter=converter,
+            )
+        # Polars' lazy CSV scan only decodes UTF-8; other codecs are read eagerly.
+        return write_eager(
+            lambda: pl.read_csv(
+                path,
+                separator=separator,
+                encoding=codec,
+                has_header=spec.header,
+            )
+        )
+
+    if spec.reader == "duckdb":
+        skip = 0
+        if spec.skip_until:
+            skip = find_skip_until(path, spec.skip_until, enc)
+        separator = spec.separator
+        if spec.fallback:
+            separator = _sniff_separator(path, enc, skip, separator)
+        return writer.write_duckdb(
+            path,
+            partitions=partitions,
+            separator=separator,
+            encoding=enc,
+            header=spec.header,
+            rename=dict(spec.rename),
+            required=spec.required,
+            contract=spec.contract,
+            converter=converter,
+            skip=skip,
+            decimal_comma=spec.decimal_comma,
+            members=spec.members,
+        )
+
+    if spec.reader == "fixed_width":
+        from quantilica.analytics.fixed_width import (
+            fixed_width_sql,
+            layout_from_datasus,
+        )
+
+        # Look for a layout file next to the data, named after its file key.
+        layout_file = path.parent / f"{file_key(path)}_layout.txt"
+        if not layout_file.is_file():
+            layout_file = path.parent / "layout.txt"
+        if not layout_file.is_file():
+            raise LakeError(f"Layout file not found for {path.name}")
+        layout = layout_from_datasus(layout_file.read_text(encoding="latin-1"))
+
+        def read_fixed() -> pl.DataFrame:
+            import duckdb
+
+            conn = duckdb.connect()
+            try:
+                sql = fixed_width_sql(str(path), layout, encoding=enc)
+                # A relation's .pl() exists in every DuckDB; the connection's
+                # was removed in 2.0.
+                return conn.sql(sql).pl()
+            finally:
+                conn.close()
+
+        return write_eager(read_fixed)
+
+    raise LakeError(f"Unsupported reader: {spec.reader}")
 
 
 def convert_with_specs(
@@ -1878,8 +2179,23 @@ def convert_with_specs(
         specs_to_run = list(specs.values())
 
     supported_suffixes = frozenset(
-        {".csv", ".txt", ".zip", ".7z", ".parquet", ".xlsx", ".xls", ".json"}
+        {
+            ".csv",
+            ".txt",
+            ".zip",
+            ".7z",
+            ".gz",
+            ".parquet",
+            ".xlsx",
+            ".xls",
+            ".json",
+            ".dbf",
+            ".dbc",
+        }
     )
+
+    def is_layout_file(p: Path) -> bool:
+        return p.stem.lower().endswith("_layout") or p.name.lower() == "layout.txt"
 
     for spec in specs_to_run:
         # Locate files for this spec
@@ -1902,6 +2218,7 @@ def convert_with_specs(
                 and not p.name.endswith(".manifest.json")
                 and not p.name.endswith(".tmp")
                 and not p.name.startswith(".")
+                and not (spec.reader == "fixed_width" and is_layout_file(p))
             ]
         else:
             other_dataset_dirs = {
@@ -1918,6 +2235,7 @@ def convert_with_specs(
                 and not p.name.endswith(".manifest.json")
                 and not p.name.endswith(".tmp")
                 and not p.name.startswith(".")
+                and not (spec.reader == "fixed_width" and is_layout_file(p))
                 and not any(p.resolve().is_relative_to(d) for d in other_dataset_dirs)
             ]
 
@@ -1946,90 +2264,8 @@ def convert_with_specs(
                 result.errors.append(f"{path.name}: {exc}")
                 continue
 
-            enc = detect_encoding(path) if spec.encoding == "detect" else spec.encoding
-
             try:
-                if spec.reader == "parquet" or path.suffix.lower() == ".parquet":
-                    lf = pl.scan_parquet(path)
-                    written = writer.write_polars(
-                        lf,
-                        path,
-                        partitions=partitions,
-                        contract=spec.contract,
-                        converter=converter,
-                    )
-                elif spec.reader == "polars":
-                    if path.suffix.lower() in (".xlsx", ".xls"):
-                        df = pl.read_excel(path)
-                        written = writer.write_polars(
-                            df,
-                            path,
-                            partitions=partitions,
-                            contract=spec.contract,
-                            converter=converter,
-                        )
-                    else:
-                        polars_enc = "utf8" if "utf" in enc.lower() else "cp1252"
-                        lf = pl.scan_csv(
-                            path,
-                            separator=spec.separator,
-                            encoding=polars_enc,
-                            has_header=spec.header,
-                        )
-                        written = writer.write_polars(
-                            lf,
-                            path,
-                            partitions=partitions,
-                            contract=spec.contract,
-                            converter=converter,
-                        )
-                elif spec.reader == "duckdb":
-                    skip = 0
-                    if spec.skip_until:
-                        skip = find_skip_until(path, spec.skip_until, enc)
-
-                    written = writer.write_duckdb(
-                        path,
-                        partitions=partitions,
-                        separator=spec.separator,
-                        encoding=enc,
-                        header=spec.header,
-                        rename=dict(spec.rename),
-                        required=spec.required,
-                        contract=spec.contract,
-                        converter=converter,
-                        skip=skip,
-                        decimal_comma=spec.decimal_comma,
-                    )
-                elif spec.reader == "fixed_width":
-                    from quantilica.analytics.fixed_width import (
-                        fixed_width_sql,
-                        layout_from_datasus,
-                    )
-
-                    # Look for layout file in the same directory or inside archive
-                    layout_file = path.parent / f"{path.stem.split('@')[0]}_layout.txt"
-                    if not layout_file.is_file():
-                        layout_file = path.parent / "layout.txt"
-                    if not layout_file.is_file():
-                        raise LakeError(f"Layout file not found for {path.name}")
-                    text_content = layout_file.read_text(encoding="latin-1")
-                    layout = layout_from_datasus(text_content)
-                    sql = fixed_width_sql(str(path), layout, encoding=enc)
-                    import duckdb
-
-                    conn = duckdb.connect()
-                    df = conn.execute(sql).pl()
-                    conn.close()
-                    written = writer.write_polars(
-                        df,
-                        path,
-                        partitions=partitions,
-                        contract=spec.contract,
-                        converter=converter,
-                    )
-                else:
-                    raise LakeError(f"Unsupported reader: {spec.reader}")
+                written = _convert_spec_file(writer, spec, path, partitions, converter)
 
                 if written.status == "skipped":
                     result.skipped += 1
