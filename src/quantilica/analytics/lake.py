@@ -42,6 +42,7 @@ from quantilica.core.lake import (
     dataset_lock,
     file_key,
     partition_dir,
+    partition_types_for,
 )
 from quantilica.core.manifests import read_manifest_sidecar
 
@@ -1837,12 +1838,12 @@ class DatasetSpec:
 
     @property
     def partition_types(self) -> dict[str, str]:
-        """Partition types: date-related parts are integers, others varchar."""
-        int_keys = {"ano", "year", "mes", "month", "trimestre", "quarter"}
-        return {
-            key: "int" if key.lower() in int_keys else "varchar"
-            for key in self.partition_keys
-        }
+        """Partition types, as ``quantilica.core.lake.partition_types_for`` defines.
+
+        ``ano`` is an integer; ``mes``, ``trimestre`` and every other key are
+        ``varchar`` (the layout writes ``mes=01``, which an integer would drop).
+        """
+        return partition_types_for(self.partition_keys)
 
 
 def convert_with_specs(
