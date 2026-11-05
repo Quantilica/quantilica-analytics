@@ -19,7 +19,7 @@ grouped files included) and checks, in this order:
    origin whose name is not in the raw but whose digest is that of the current
    version of the same file key is the same content under an older stamp (an
    *alias*): it is neither superseded nor missing.
-3. **Duplicates** (``versao_duplicada``): the same ``(origin name, sha256)`` in
+3. **Duplicates** (``versao_duplicada``): the same ``(origin name, sha256, member)`` in
    more than one Parquet or member of a dataset, or two versions (different
    names) of one raw file, that is, of the same ``(folder, file_key)``, in the
    lake. The same file key in different folders is never a duplicate.
@@ -538,6 +538,9 @@ class _Origin:
     key: str
     unit: str  # where it lives: the partition directory, or the grouped file
     lake_rel: str
+    # The raw file's member (a ZIP member, a sheet): the footer's file key when
+    # it is a composite of the file key and the member. Empty for a plain file.
+    member: str = ""
 
 
 class _Raw:
@@ -930,6 +933,7 @@ def _digest(foot: _Footprint, info: _FileInfo) -> None:
                 file_key(name) if name else key,
                 "/".join(parts[:-1]),
                 rel,
+                key if name and key != file_key(name) else "",
             )
         )
         return
@@ -970,6 +974,7 @@ def _digest(foot: _Footprint, info: _FileInfo) -> None:
                 file_key(name) if name else key,
                 rel,
                 rel,
+                key if name and key != file_key(name) else "",
             )
         )
 
@@ -1006,8 +1011,8 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
 
     Two cases, both inside one dataset:
 
-    * the same ``(origin name, sha256)`` in more Parquets or members than the raw
-      side has files of that name and digest (a source may publish the very same
+    * the same ``(origin name, sha256, member)`` in more Parquets or members than
+      the raw side has files of that name and digest (a source may publish the very same
       file in two folders, e.g. two competences);
     * two versions (different names) of the same raw file, a *raw file* being
       ``(folder, file_key)`` of the raw side. The folder is found through the
@@ -1019,10 +1024,14 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
     sources repeat file names from one period to the next.
     """
     out = []
-    same: dict[tuple[str, str, str, str], list[_Origin]] = defaultdict(list)
+    # The member is part of the identity: one multi-member ZIP legitimately feeds
+    # many Parquets (one per member, e.g. per month), all with the same origin.
+    same: dict[tuple[str, str, str, str, str], list[_Origin]] = defaultdict(list)
     for origin in traced:
-        same[(origin.source, origin.dataset, origin.name, origin.sha256)].append(origin)
-    for (source, dataset, name, sha), group in sorted(same.items()):
+        same[
+            (origin.source, origin.dataset, origin.name, origin.sha256, origin.member)
+        ].append(origin)
+    for (source, dataset, name, sha, _member), group in sorted(same.items()):
         units = sorted({o.unit for o in group})
         copies = 1
         if raw is not None:

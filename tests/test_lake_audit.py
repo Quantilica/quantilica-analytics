@@ -762,3 +762,49 @@ def test_manifest_files_are_not_hashed(corpus, monkeypatch) -> None:
     convert(corpus, corpus.view / "eps" / "2025-01" / "Dados@20260101.zip", "eps", "d")
     assert audit(corpus, readers=False).ok
     assert len(hashed) == 1
+
+
+# --- multi-member ZIP: one raw file, N Parquets -----------------------------------
+
+
+def convert_member(corpus, raw_file: Path, member: str, mes: str) -> Path:
+    """Write one Parquet of a multi-member raw file (key = file key + member)."""
+    import polars as pl
+    from quantilica.core.lake import DatasetDescriptor, composite_file_key
+
+    from quantilica.analytics import LakeWriter
+
+    writer = LakeWriter(
+        corpus.dataset_dir("eps", "dados"),
+        DatasetDescriptor(
+            source_id="eps",
+            dataset_id="dados",
+            alias="dados",
+            partition_keys=["mes"],
+            partition_types={"mes": "varchar"},
+        ),
+    )
+    result = writer.write_polars(
+        pl.DataFrame({"valor": [1, 2, 3]}),
+        raw_file,
+        partitions={"mes": mes},
+        file_key_name=composite_file_key(raw_file, member),
+    )
+    return result.output
+
+
+def test_multi_member_zip_in_many_parquets_is_not_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "2013", "scrdata_2013@20260416.zip")
+    for mes in ("01", "02", "03"):
+        convert_member(corpus, raw, f"scrdata_2013_{mes}.csv", mes)
+    report = audit(corpus, readers=False)
+    assert "versao_duplicada" not in categories(report), report.to_text()
+
+
+def test_same_member_converted_twice_is_still_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "2013", "scrdata_2013@20260416.zip")
+    convert_member(corpus, raw, "scrdata_2013_01.csv", "01")
+    convert_member(corpus, raw, "scrdata_2013_02.csv", "02")
+    convert_member(corpus, raw, "scrdata_2013_01.csv", "03")  # member repeated
+    report = audit(corpus, readers=False)
+    assert categories(report)["versao_duplicada"] == 1
