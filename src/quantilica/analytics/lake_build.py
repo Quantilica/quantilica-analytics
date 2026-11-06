@@ -50,6 +50,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -79,8 +80,13 @@ TERMINATE_GRACE_SECONDS = 5.0
 _MESSAGE_LIMIT = 2000
 
 PROFILES: dict[str, dict[str, Any]] = {
-    "96gb-batch": {"workers": 6, "memory": "14GB"},
-    "96gb-monolithic": {"workers": 1, "memory": "64GB"},
+    "batch": {"workers": 6, "memory": "14GB"},
+    "monolithic": {"workers": 1, "memory": "64GB"},
+}
+# Nomes antigos, aceitos com aviso de depreciação.
+PROFILE_ALIASES: dict[str, str] = {
+    "96gb-batch": "batch",
+    "96gb-monolithic": "monolithic",
 }
 
 
@@ -803,9 +809,10 @@ def lake_build(
             :class:`LakeBuildError`.
         datasets: Datasets to build (e.g. ``["sia-pa"]``). Filters tasks to
             only matching dataset ids.
-        profile: Resource allocation profile (``"96gb-batch"``: 6 workers x 14GB;
-            ``"96gb-monolithic"``: 1 worker x 64GB). Explicit ``workers`` or
-            ``memory`` take precedence.
+        profile: Resource allocation profile (``"batch"``: 6 workers x 14GB;
+            ``"monolithic"``: 1 worker x 64GB). The old names ``"96gb-batch"``
+            and ``"96gb-monolithic"`` still work but are deprecated. Explicit
+            ``workers`` or ``memory`` take precedence.
         workers: Parallel task processes (default: half the CPUs, at most 4).
         memory: DuckDB ``memory_limit`` of each task, such as ``"12GB"``.
         threads: DuckDB threads of each task.
@@ -854,6 +861,14 @@ def lake_build(
     if not input_path.is_dir():
         raise LakeBuildError(f"input directory not found: {input_path}")
     if profile is not None:
+        if profile in PROFILE_ALIASES:
+            new_name = PROFILE_ALIASES[profile]
+            warnings.warn(
+                f"profile {profile!r} is deprecated; use {new_name!r}",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            profile = new_name
         if profile not in PROFILES:
             raise LakeBuildError(
                 f"unknown profile {profile!r}: expected one of {list(PROFILES)}"

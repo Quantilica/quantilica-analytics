@@ -7,6 +7,10 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Alterado
+
+- `lake_build`: os perfis de recursos passam a se chamar `batch` (6 processos, 14GB cada) e `monolithic` (1 processo, 64GB). Os nomes `96gb-batch` e `96gb-monolithic` continuam aceitos, mas emitem `DeprecationWarning`.
+
 ### Corrigido
 
 - `lake_audit`: `versao_duplicada` não acusa mais um arquivo bruto multimembro (por exemplo um ZIP que gera um Parquet por mês) como "o mesmo arquivo em N lugares". A identidade da cópia passa a ser `(nome da origem, sha256, membro)`, com o membro lido da chave de arquivo composta do rodapé. A duplicação real (o mesmo membro convertido duas vezes, ou duas versões `@AAAAMMDD` da mesma chave) continua sendo detectada.

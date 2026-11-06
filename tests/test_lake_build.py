@@ -713,23 +713,23 @@ def test_lake_build_profiles(tmp_path, monkeypatch):
 
     monkeypatch.setattr(lb, "_run", fake_run)
 
-    # 96gb-batch
+    # batch
     lb.lake_build(
         tmp_path / "input",
         tmp_path / "lake",
         converters={"src": conv},
-        profile="96gb-batch",
+        profile="batch",
         run_id="r1",
         prevent_sleep=False,
     )
     assert calls[-1] == {"workers": 6, "memory": "14GB"}
 
-    # 96gb-monolithic
+    # monolithic
     lb.lake_build(
         tmp_path / "input",
         tmp_path / "lake",
         converters={"src": conv},
-        profile="96gb-monolithic",
+        profile="monolithic",
         run_id="r2",
         prevent_sleep=False,
     )
@@ -740,7 +740,7 @@ def test_lake_build_profiles(tmp_path, monkeypatch):
         tmp_path / "input",
         tmp_path / "lake",
         converters={"src": conv},
-        profile="96gb-batch",
+        profile="batch",
         workers=2,
         memory="8GB",
         run_id="r3",
@@ -758,3 +758,26 @@ def test_lake_build_profiles(tmp_path, monkeypatch):
             run_id="r4",
             prevent_sleep=False,
         )
+
+
+def test_lake_build_profile_alias_depreciado(tmp_path, monkeypatch):
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    conv = FakeConverter("src", ["ds_a"], control)
+    calls = []
+
+    def fake_run(pending, summary, workers, lake_dir, force, memory, threads, scratch):
+        calls.append({"workers": workers, "memory": memory})
+
+    monkeypatch.setattr(lb, "_run", fake_run)
+
+    with pytest.warns(DeprecationWarning, match="monolithic"):
+        lb.lake_build(
+            tmp_path / "input",
+            tmp_path / "lake",
+            converters={"src": conv},
+            profile="96gb-monolithic",
+            run_id="r1",
+            prevent_sleep=False,
+        )
+    assert calls[-1] == {"workers": 1, "memory": "64GB"}
