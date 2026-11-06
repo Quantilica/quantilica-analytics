@@ -7,6 +7,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+## [0.11.0] - 2026-11-06
+
 ### Alterado
 
 - `lake_build`: os perfis de recursos passam a se chamar `batch` (6 processos, 14GB cada) e `monolithic` (1 processo, 64GB). Os nomes `96gb-batch` e `96gb-monolithic` continuam aceitos, mas emitem `DeprecationWarning`.
