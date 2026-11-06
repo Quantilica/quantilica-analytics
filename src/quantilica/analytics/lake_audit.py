@@ -1006,6 +1006,28 @@ def _check_depth(foot: _Footprint, scan: _LakeScan) -> list[AuditFinding]:
     return out
 
 
+def _places(group: list[_Origin]) -> int:
+    """How many places hold one ``(origin, member)``, row-year splits aside.
+
+    The converter partitions by the year of each row, so one raw file legitimately
+    leaves one Parquet in each ``ano=`` partition (same file name, same footer
+    origin). Units that differ only in the ``ano=`` segment therefore count as
+    one place; a second Parquet inside the *same* partition directory counts as
+    another. Trade-off: the footer does not say which years a Parquet holds, so a
+    Parquet copied by hand into another ``ano=`` partition is indistinguishable
+    from a row-year split and goes unreported; copies across any other partition
+    key (``mes=``, ...), other datasets or versions are still caught.
+    """
+    shapes = {_YEAR_PART.sub("ano=*", o.unit) for o in group}
+    per_unit: dict[str, set[str]] = defaultdict(set)
+    for o in group:
+        per_unit[o.unit].add(o.lake_rel)
+    return len(shapes) + sum(len(rels) - 1 for rels in per_unit.values())
+
+
+_YEAR_PART = re.compile(r"(?<![^/])ano=[^/]*")
+
+
 def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFinding]:
     """``versao_duplicada``: one raw file, or two versions of it, in the lake.
 
@@ -1021,7 +1043,8 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
       side, only the first case is checked.
 
     The same file key in different folders is never a duplicate: it is how
-    sources repeat file names from one period to the next.
+    sources repeat file names from one period to the next. Nor is one origin in
+    several ``ano=`` partitions of a dataset (see :func:`_places`).
     """
     out = []
     # The member is part of the identity: one multi-member ZIP legitimately feeds
@@ -1032,17 +1055,17 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
             (origin.source, origin.dataset, origin.name, origin.sha256, origin.member)
         ].append(origin)
     for (source, dataset, name, sha, _member), group in sorted(same.items()):
-        units = sorted({o.unit for o in group})
+        places = _places(group)
         copies = 1
         if raw is not None:
             files = raw.by_name.get((source, name), [])
             copies = max(1, sum(sha in raw.shas[f] for f in files))
-        if len(units) > copies:
+        if places > copies:
             where = sorted({o.lake_rel for o in group})
             out.append(
                 AuditFinding(
                     "versao_duplicada",
-                    f"{name} (sha256 {sha[:12]}) está em {len(units)} lugares: "
+                    f"{name} (sha256 {sha[:12]}) está em {places} lugares: "
                     f"{', '.join(where[:4])}",
                     where[0],
                     source,

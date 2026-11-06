@@ -808,3 +808,54 @@ def test_same_member_converted_twice_is_still_a_duplicate(corpus) -> None:
     convert_member(corpus, raw, "scrdata_2013_01.csv", "03")  # member repeated
     report = audit(corpus, readers=False)
     assert categories(report)["versao_duplicada"] == 1
+
+
+# --- row-year split: one raw file, one Parquet per ano= partition ------------------
+
+
+def convert_year(corpus, raw_file: Path, ano: str, dataset: str = "dados") -> Path:
+    """Write the Parquet of one row-year of a raw file (same file name each time)."""
+    import polars as pl
+    from quantilica.core.lake import DatasetDescriptor
+
+    from quantilica.analytics import LakeWriter
+
+    writer = LakeWriter(
+        corpus.dataset_dir("eps", dataset),
+        DatasetDescriptor(
+            source_id="eps",
+            dataset_id=dataset,
+            alias=dataset,
+            partition_keys=["ano"],
+            partition_types={"ano": "int"},
+        ),
+    )
+    return writer.write_polars(
+        pl.DataFrame({"valor": [1, 2, 3]}), raw_file, partitions={"ano": ano}
+    ).output
+
+
+def test_row_year_split_is_not_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "acidentes", "acidentes@20251128.csv")
+    for ano in ("2013", "2014", "2015"):
+        convert_year(corpus, raw, ano)
+    report = audit(corpus, readers=False)
+    assert "versao_duplicada" not in categories(report), report.to_text()
+
+
+def test_same_origin_twice_in_one_partition_is_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "acidentes", "acidentes@20251128.csv")
+    convert_year(corpus, raw, "2013")
+    first = convert_year(corpus, raw, "2014")
+    first.with_name("outro.parquet").write_bytes(first.read_bytes())
+    report = audit(corpus, readers=False)
+    assert categories(report)["versao_duplicada"] == 1
+
+
+def test_datasets_are_audited_independently(corpus) -> None:
+    # The check has always been per dataset: one origin feeding two datasets is
+    # not reported, and the row-year relaxation does not change that.
+    raw = add_raw(corpus, "eps", "acidentes", "acidentes@20251128.csv")
+    convert_year(corpus, raw, "2013", "dados")
+    convert_year(corpus, raw, "2013", "outro")
+    assert "versao_duplicada" not in categories(audit(corpus, readers=False))

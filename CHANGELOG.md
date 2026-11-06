@@ -7,6 +7,10 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Corrigido
+
+- `lake_audit`: `versao_duplicada` não acusa mais um arquivo bruto dividido entre partições `ano=` pelo ano das linhas (um CSV que gera um Parquet por ano, todos com o mesmo nome e a mesma origem). Origem e membro iguais em partições que diferem só no `ano=` contam como um lugar só; dois Parquets da mesma origem na mesma partição, a mesma origem em partições que diferem em outra chave (`mes=`), em datasets distintos ou em duas versões `@AAAAMMDD` continuam sendo duplicata. Limite: o rodapé não diz quais anos o Parquet contém, então uma cópia manual para outra partição `ano=` não é detectada.
+
 ## [0.11.0] - 2026-11-06
 
 ### Alterado
