@@ -62,6 +62,19 @@ logger = logging.getLogger("quantilica.analytics.lake")
 TMP_DIRNAME = ".tmp"
 TMP_SUFFIX = ".tmp"
 TEXT_SUFFIXES = frozenset({".csv", ".txt"})
+# Suffixes of package members that are known not to be data (documentation,
+# office files, images, web pages). Used only when no member has a text suffix.
+NON_DATA_SUFFIXES = frozenset(
+    {
+        ".pdf", ".doc", ".docx", ".odt", ".rtf", ".xls", ".xlsx", ".xlsm",
+        ".ods", ".ppt", ".pptx", ".odp", ".htm", ".html", ".xml", ".md",
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".svg",
+        ".ico", ".db", ".ini", ".lnk", ".log", ".sas", ".sps", ".dta", ".sav",
+        ".zip", ".7z", ".rar", ".gz",
+    }
+)  # fmt: skip
+# Extensionless member names that are documentation, not data.
+_NON_DATA_STEMS = frozenset({"leiame", "readme", "license", "licenca", "layout"})
 # Diretório opcional para a extração de ZIP/7z e o temporário do DuckDB. Sem ele,
 # ambos ficam no staging do dataset, no mesmo disco do lake.
 LAKE_SCRATCH_ENV = "QUANTILICA_LAKE_SCRATCH"
@@ -263,7 +276,9 @@ def _materialize(src: Path, tmp: Path, members: str | None = None) -> list[Path]
 
     A ``.gz`` is decompressed to ``tmp``. ``members`` is a case-insensitive
     glob (``fnmatch``) on the member's path inside the archive; only the
-    matching text members are read. It is an error for it to match none.
+    matching members are read, whatever their suffix. It is an error for it to
+    match none. Without ``members`` the data members are chosen by
+    :func:`_data_member_names`.
     """
     suffix = src.suffix.lower()
     if suffix in TEXT_SUFFIXES:
@@ -294,22 +309,49 @@ def _materialize(src: Path, tmp: Path, members: str | None = None) -> list[Path]
             raise LakeError(f"7z failed on {src.name}: {proc.stderr.strip()[-300:]}")
     else:
         raise LakeError(f"Unsupported format: {src.name}")
-    files = sorted(
-        p for p in tmp.rglob("*") if p.is_file() and p.suffix.lower() in TEXT_SUFFIXES
-    )
+    extracted = sorted(p for p in tmp.rglob("*") if p.is_file())
     if members:
         pattern = members.lower()
         files = [
             p
-            for p in files
+            for p in extracted
             if fnmatch.fnmatchcase(p.relative_to(tmp).as_posix().lower(), pattern)
             or fnmatch.fnmatchcase(p.name.lower(), pattern)
         ]
         if not files:
             raise LakeError(f"{src.name} has no member matching {members!r}")
+        return files
+    keep = set(_data_member_names([p.relative_to(tmp).as_posix() for p in extracted]))
+    files = [p for p in extracted if p.relative_to(tmp).as_posix() in keep]
     if not files:
-        raise LakeError(f"{src.name} contains no data files (.csv/.txt)")
+        raise LakeError(f"{src.name} contains no data files")
     return files
+
+
+def _data_member_names(names: Iterable[str]) -> list[str]:
+    """The names of ``names`` that hold data, for a package without ``members``.
+
+    Members with a text suffix (``.csv``/``.txt``) win. If there is none, the
+    data is in members with another (or no) suffix, as in the Receita Federal
+    CNPJ files (``K3241.K03200Y0.D60711.EMPRECSV``) or the RAIS ``.COMT``; then
+    everything is kept except hidden files, ``__MACOSX`` entries and members
+    with a suffix that is known not to be data (see ``NON_DATA_SUFFIXES``).
+    """
+    candidates: list[str] = []
+    for name in names:
+        path = Path(name)
+        if path.name.startswith(".") or "__MACOSX" in path.parts:
+            continue
+        candidates.append(name)
+    preferred = [n for n in candidates if Path(n).suffix.lower() in TEXT_SUFFIXES]
+    if preferred:
+        return preferred
+    return [
+        n
+        for n in candidates
+        if Path(n).suffix.lower() not in NON_DATA_SUFFIXES
+        and not (not Path(n).suffix and Path(n).stem.lower() in _NON_DATA_STEMS)
+    ]
 
 
 def _has_c1_bytes(path: Path) -> bool:
@@ -1802,7 +1844,7 @@ def _check_readers(
 def detect_encoding(path_or_bytes: Path | bytes) -> str:
     """Detect encoding: BOM -> utf-8-sig; valid UTF-8 in 64KB -> utf-8; else cp1252.
 
-    A ``.gz`` and the first text member of a ``.zip`` are sampled decompressed.
+    A ``.gz`` and the first data member of a ``.zip`` are sampled decompressed.
     A multibyte character cut by the 64 KB boundary does not count as invalid.
     """
     if isinstance(path_or_bytes, Path):
@@ -1826,7 +1868,7 @@ def find_skip_until(file_path: Path, prefix: str, encoding: str) -> int:
     """Count how many preamble lines to skip until a line starts with ``prefix``.
 
     The file is decoded with ``encoding`` itself (Latin-1 is real Latin-1, not
-    cp1252); a ``.gz`` and the first text member of a ``.zip`` are read decompressed.
+    cp1252); a ``.gz`` and the first data member of a ``.zip`` are read decompressed.
     """
     enc = _py_codec(encoding)
     try:
@@ -1932,7 +1974,8 @@ def _py_codec(encoding: str) -> str:
 def _sample_bytes(path: Path, limit: int = 65536) -> bytes:
     """The first ``limit`` bytes of the text in ``path`` (decompressed if needed).
 
-    Looks inside ``.gz`` files and into the first text member of a ``.zip``.
+    Looks inside ``.gz`` files and into the first data member of a ``.zip``
+    (chosen as in :func:`_data_member_names`).
     """
     suffix = path.suffix.lower()
     if suffix == ".gz":
@@ -1940,12 +1983,10 @@ def _sample_bytes(path: Path, limit: int = 65536) -> bytes:
             return fh.read(limit)
     if suffix == ".zip":
         with zipfile.ZipFile(path) as zf:
-            for info in zf.infolist():
-                if not info.is_dir() and info.filename.lower().endswith(
-                    tuple(TEXT_SUFFIXES)
-                ):
-                    with zf.open(info) as fh:
-                        return fh.read(limit)
+            infos = {i.filename: i for i in zf.infolist() if not i.is_dir()}
+            for name in _data_member_names(infos):
+                with zf.open(infos[name]) as fh:
+                    return fh.read(limit)
         return b""
     with open(path, "rb") as fh:
         return fh.read(limit)

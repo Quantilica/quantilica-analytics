@@ -351,6 +351,122 @@ def test_duckdb_7z(tmp_path, dataset_dir, descriptor):
     assert result.rows == 2
 
 
+RFB_LINE = '"00000000";"BANCO DO BRASIL SA";"2038";"10";"120000000000,00";"05";""\n'
+RFB_NAMES = [
+    "cnpj_basico",
+    "razao_social",
+    "natureza",
+    "qualif",
+    "capital",
+    "porte",
+    "ente",
+]
+
+
+def _write_headerless(writer, src, **kwargs):
+    return writer.write_duckdb(
+        src,
+        partitions={"ano": 2026, "mes": "10"},
+        encoding="latin-1",
+        header=False,
+        names=RFB_NAMES,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "K3241.K03200Y0.D60711.EMPRECSV",
+        "K3241.K03200Y0.D60711.ESTABELE",
+        "F.K03200$W.SIMPLES.CSV.D60711",
+        "F.K03200$Z.D60711.CNAECSV",
+    ],
+)
+def test_duckdb_zip_member_without_text_suffix(
+    tmp_path, dataset_dir, descriptor, member
+):
+    src = make_zip(tmp_path / "Empresas0.zip", member, RFB_LINE.encode("latin-1"))
+
+    result = _write_headerless(LakeWriter(dataset_dir, descriptor), src)
+
+    assert result.status == "converted"
+    assert result.rows == 1
+    df = pl.read_parquet(result.output)
+    assert df["razao_social"].to_list() == ["BANCO DO BRASIL SA"]
+
+
+@pytest.mark.skipif(shutil.which("7z") is None, reason="7z not installed")
+def test_duckdb_7z_member_without_text_suffix(tmp_path, dataset_dir, descriptor):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "RAIS_VINC_PUB_CENTRO_OESTE.COMT").write_bytes(RFB_LINE.encode("latin-1"))
+    src = tmp_path / "RAIS_VINC_PUB_CENTRO_OESTE.7z"
+    subprocess.run(
+        ["7z", "a", "-bd", str(src), str(raw / "RAIS_VINC_PUB_CENTRO_OESTE.COMT")],
+        check=True,
+        capture_output=True,
+    )
+
+    result = _write_headerless(LakeWriter(dataset_dir, descriptor), src)
+
+    assert result.rows == 1
+
+
+def test_duckdb_zip_prefers_text_member_over_pdf(tmp_path, dataset_dir, descriptor):
+    src = tmp_path / "pacote.zip"
+    with zipfile.ZipFile(src, "w") as archive:
+        archive.writestr("leia-me.pdf", b"%PDF-1.4 not data")
+        archive.writestr("dados.csv", CSV_LATIN1)
+        archive.writestr("K1.EMPRECSV", b"lixo;que;nao;e;lido\n")
+
+    result = LakeWriter(dataset_dir, descriptor).write_duckdb(
+        src, partitions={"ano": 2026, "mes": "10"}, encoding="latin-1"
+    )
+
+    assert result.rows == 2
+
+
+def test_duckdb_zip_skips_known_non_data_without_text_member(
+    tmp_path, dataset_dir, descriptor
+):
+    src = tmp_path / "pacote.zip"
+    with zipfile.ZipFile(src, "w") as archive:
+        archive.writestr("LEIAME.PDF", b"%PDF-1.4 not data")
+        archive.writestr("__MACOSX/._DADOS.COMT", b"junk")
+        archive.writestr("DADOS.COMT", RFB_LINE.encode("latin-1"))
+
+    result = _write_headerless(LakeWriter(dataset_dir, descriptor), src)
+
+    assert result.rows == 1
+
+
+def test_duckdb_zip_with_only_pdf_is_an_error(tmp_path, dataset_dir, descriptor):
+    src = make_zip(tmp_path / "so_pdf.zip", "manual.pdf", b"%PDF-1.4 not data")
+
+    with pytest.raises(LakeError, match="contains no data files"):
+        LakeWriter(dataset_dir, descriptor).write_duckdb(
+            src, partitions={"ano": 2026, "mes": "10"}
+        )
+    assert parquets(dataset_dir) == []
+
+
+def test_duckdb_members_pattern_ignores_suffix_filter(
+    tmp_path, dataset_dir, descriptor
+):
+    src = tmp_path / "pacote.zip"
+    with zipfile.ZipFile(src, "w") as archive:
+        archive.writestr("dados.csv", CSV_LATIN1)
+        archive.writestr("K1.EMPRECSV", RFB_LINE.encode("latin-1"))
+
+    result = _write_headerless(
+        LakeWriter(dataset_dir, descriptor), src, members="*.EMPRECSV"
+    )
+
+    assert result.rows == 1
+    assert pl.read_parquet(result.output)["cnpj_basico"].to_list() == ["00000000"]
+
+
 def test_idempotent_skip_then_force(tmp_path, dataset_dir, descriptor):
     src = tmp_path / "rais_2025.csv"
     src.write_bytes(CSV_LATIN1)

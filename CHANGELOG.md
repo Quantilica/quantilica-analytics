@@ -7,6 +7,10 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Corrigido
+
+- `lake`: a conversão de um pacote ZIP/7z deixa de recusar (`contains no data files (.csv/.txt)`) quando o membro de dados não termina em `.csv`/`.txt`, como nos arquivos da Receita Federal (CNPJ: `*.EMPRECSV`, `*.ESTABELE`, `F.K03200$W.SIMPLES.CSV.D60711`) e da RAIS (`*.COMT`). Quando há membros `.csv`/`.txt`, só eles são lidos, como antes. Quando não há, são lidos os demais membros, exceto arquivos ocultos, entradas `__MACOSX` e sufixos que não são dado (`.pdf`, `.doc(x)`, `.xls(x)`, `.htm(l)`, imagens e similares); um pacote só com esses continua dando erro. Com `members` informado, o padrão vale para todos os arquivos extraídos, sem filtro de sufixo. A detecção de codificação e de separador, que amostra o primeiro membro de dados do ZIP, segue a mesma regra.
+
 ## [0.11.1] - 2026-11-06
 
 ### Corrigido
