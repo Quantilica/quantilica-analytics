@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import polars as pl
@@ -70,11 +70,16 @@ NON_DATA_SUFFIXES = frozenset(
         ".ods", ".ppt", ".pptx", ".odp", ".htm", ".html", ".xml", ".md",
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".svg",
         ".ico", ".db", ".ini", ".lnk", ".log", ".sas", ".sps", ".dta", ".sav",
-        ".zip", ".7z", ".rar", ".gz",
+        ".zip", ".7z", ".rar", ".gz", ".json", ".dbf", ".dbc", ".parquet", ".sql",
+        ".md5", ".sha1", ".sha256", ".sig", ".do", ".r", ".py", ".yaml", ".yml",
+        ".exe", ".dll", ".bat", ".sh",
     }
 )  # fmt: skip
-# Extensionless member names that are documentation, not data.
-_NON_DATA_STEMS = frozenset({"leiame", "readme", "license", "licenca", "layout"})
+# Member names that are documentation, with or without a suffix (``LEIA-ME``,
+# ``leiame.docx``, ``README``, ``Licença``, ``layout_campos``, ``Dicionario``).
+_NON_DATA_NAME = re.compile(
+    r"^(leia[-_ ]?me|read[-_ ]?me|licen[sc]|layout|dicion[aá]rio)"
+)
 # Diretório opcional para a extração de ZIP/7z e o temporário do DuckDB. Sem ele,
 # ambos ficam no staging do dataset, no mesmo disco do lake.
 LAKE_SCRATCH_ENV = "QUANTILICA_LAKE_SCRATCH"
@@ -309,23 +314,52 @@ def _materialize(src: Path, tmp: Path, members: str | None = None) -> list[Path]
             raise LakeError(f"7z failed on {src.name}: {proc.stderr.strip()[-300:]}")
     else:
         raise LakeError(f"Unsupported format: {src.name}")
-    extracted = sorted(p for p in tmp.rglob("*") if p.is_file())
+    extracted = {
+        p.relative_to(tmp).as_posix(): p for p in tmp.rglob("*") if p.is_file()
+    }
+    chosen = _select_member_names(extracted, members, src.name)
+    return [extracted[name] for name in chosen]
+
+
+def _select_member_names(
+    names: Iterable[str], members: str | None, package: str | None = None
+) -> list[str]:
+    """The members of a package to read, in reading order (sorted by path).
+
+    With ``members`` (a case-insensitive ``fnmatch`` glob on the member's path
+    or on its base name) the matching members, whatever their suffix; it is an
+    error for it to match none. Without it, :func:`_data_member_names`; it is an
+    error for it to find none. ``package`` (the archive's name) is for the
+    messages; when given, a fallback that picks several members is logged.
+    """
+    ordered = sorted(names, key=lambda n: PurePosixPath(n).parts)
+    label = package or "package"
     if members:
         pattern = members.lower()
-        files = [
-            p
-            for p in extracted
-            if fnmatch.fnmatchcase(p.relative_to(tmp).as_posix().lower(), pattern)
-            or fnmatch.fnmatchcase(p.name.lower(), pattern)
+        chosen = [
+            n
+            for n in ordered
+            if fnmatch.fnmatchcase(n.lower(), pattern)
+            or fnmatch.fnmatchcase(PurePosixPath(n).name.lower(), pattern)
         ]
-        if not files:
-            raise LakeError(f"{src.name} has no member matching {members!r}")
-        return files
-    keep = set(_data_member_names([p.relative_to(tmp).as_posix() for p in extracted]))
-    files = [p for p in extracted if p.relative_to(tmp).as_posix() in keep]
-    if not files:
-        raise LakeError(f"{src.name} contains no data files")
-    return files
+        if not chosen:
+            raise LakeError(f"{label} has no member matching {members!r}")
+        return chosen
+    chosen = _data_member_names(ordered)
+    if not chosen:
+        raise LakeError(f"{label} contains no data files")
+    if (
+        package
+        and len(chosen) > 1
+        and not any(PurePosixPath(n).suffix.lower() in TEXT_SUFFIXES for n in chosen)
+    ):
+        logger.warning(
+            "lake: %s has no .csv/.txt member; reading %d members by exclusion: %s",
+            package,
+            len(chosen),
+            ", ".join(chosen),
+        )
+    return chosen
 
 
 def _data_member_names(names: Iterable[str]) -> list[str]:
@@ -334,23 +368,26 @@ def _data_member_names(names: Iterable[str]) -> list[str]:
     Members with a text suffix (``.csv``/``.txt``) win. If there is none, the
     data is in members with another (or no) suffix, as in the Receita Federal
     CNPJ files (``K3241.K03200Y0.D60711.EMPRECSV``) or the RAIS ``.COMT``; then
-    everything is kept except hidden files, ``__MACOSX`` entries and members
-    with a suffix that is known not to be data (see ``NON_DATA_SUFFIXES``).
+    everything is kept except hidden files, ``__MACOSX`` entries, members with
+    a suffix that is known not to be data (see ``NON_DATA_SUFFIXES``) and
+    documentation names (``LEIA-ME``, ``README``, ...).
     """
     candidates: list[str] = []
     for name in names:
-        path = Path(name)
+        path = PurePosixPath(name)
         if path.name.startswith(".") or "__MACOSX" in path.parts:
             continue
         candidates.append(name)
-    preferred = [n for n in candidates if Path(n).suffix.lower() in TEXT_SUFFIXES]
+    preferred = [
+        n for n in candidates if PurePosixPath(n).suffix.lower() in TEXT_SUFFIXES
+    ]
     if preferred:
         return preferred
     return [
         n
         for n in candidates
-        if Path(n).suffix.lower() not in NON_DATA_SUFFIXES
-        and not (not Path(n).suffix and Path(n).stem.lower() in _NON_DATA_STEMS)
+        if PurePosixPath(n).suffix.lower() not in NON_DATA_SUFFIXES
+        and not _NON_DATA_NAME.match(PurePosixPath(n).name.lower())
     ]
 
 
@@ -1847,9 +1884,14 @@ def detect_encoding(path_or_bytes: Path | bytes) -> str:
     A ``.gz`` and the first data member of a ``.zip`` are sampled decompressed.
     A multibyte character cut by the 64 KB boundary does not count as invalid.
     """
+    return _detect_encoding(path_or_bytes)
+
+
+def _detect_encoding(path_or_bytes: Path | bytes, members: str | None = None) -> str:
+    """:func:`detect_encoding`, sampling the ``members`` glob of a ZIP."""
     if isinstance(path_or_bytes, Path):
         try:
-            chunk = _sample_bytes(path_or_bytes)
+            chunk = _sample_bytes(path_or_bytes, members=members)
         except (OSError, zipfile.BadZipFile, EOFError):
             with open(path_or_bytes, "rb") as f:
                 chunk = f.read(65536)
@@ -1870,6 +1912,13 @@ def find_skip_until(file_path: Path, prefix: str, encoding: str) -> int:
     The file is decoded with ``encoding`` itself (Latin-1 is real Latin-1, not
     cp1252); a ``.gz`` and the first data member of a ``.zip`` are read decompressed.
     """
+    return _find_skip_until(file_path, prefix, encoding)
+
+
+def _find_skip_until(
+    file_path: Path, prefix: str, encoding: str, members: str | None = None
+) -> int:
+    """:func:`find_skip_until`, reading the ``members`` glob of a ZIP."""
     enc = _py_codec(encoding)
     try:
         if file_path.suffix.lower() == ".gz":
@@ -1879,14 +1928,13 @@ def find_skip_until(file_path: Path, prefix: str, encoding: str) -> int:
                         return idx
         elif file_path.suffix.lower() == ".zip":
             with zipfile.ZipFile(file_path) as zf:
-                for name in zf.namelist():
-                    if name.lower().endswith((".csv", ".txt")):
-                        with zf.open(name) as member_file:
-                            for idx, line in enumerate(member_file):
-                                decoded = line.decode(enc, errors="replace")
-                                if decoded.startswith(prefix):
-                                    return idx
-                        break
+                names = [i.filename for i in zf.infolist() if not i.is_dir()]
+                name = _select_member_names(names, members)[0]
+                with zf.open(name) as member_file:
+                    for idx, line in enumerate(member_file):
+                        decoded = line.decode(enc, errors="replace")
+                        if decoded.startswith(prefix):
+                            return idx
         else:
             with open(file_path, encoding=enc, errors="replace") as f:
                 for idx, line in enumerate(f):
@@ -1971,11 +2019,12 @@ def _py_codec(encoding: str) -> str:
     return encoding
 
 
-def _sample_bytes(path: Path, limit: int = 65536) -> bytes:
+def _sample_bytes(path: Path, limit: int = 65536, members: str | None = None) -> bytes:
     """The first ``limit`` bytes of the text in ``path`` (decompressed if needed).
 
-    Looks inside ``.gz`` files and into the first data member of a ``.zip``
-    (chosen as in :func:`_data_member_names`).
+    Looks inside ``.gz`` files and into the first member of a ``.zip`` that
+    :func:`_materialize` would read (same choice and order, ``members``
+    included).
     """
     suffix = path.suffix.lower()
     if suffix == ".gz":
@@ -1984,15 +2033,19 @@ def _sample_bytes(path: Path, limit: int = 65536) -> bytes:
     if suffix == ".zip":
         with zipfile.ZipFile(path) as zf:
             infos = {i.filename: i for i in zf.infolist() if not i.is_dir()}
-            for name in _data_member_names(infos):
-                with zf.open(infos[name]) as fh:
-                    return fh.read(limit)
-        return b""
+            try:
+                chosen = _select_member_names(infos, members)
+            except LakeError:
+                return b""
+            with zf.open(infos[chosen[0]]) as fh:
+                return fh.read(limit)
     with open(path, "rb") as fh:
         return fh.read(limit)
 
 
-def _sniff_separator(path: Path, encoding: str, skip: int, current: str) -> str:
+def _sniff_separator(
+    path: Path, encoding: str, skip: int, current: str, members: str | None = None
+) -> str:
     """The delimiter of the header line when ``current`` does not occur in it.
 
     Returns ``current`` when it is present in the line (the declared
@@ -2002,7 +2055,7 @@ def _sniff_separator(path: Path, encoding: str, skip: int, current: str) -> str:
     if path.suffix.lower() not in (*TEXT_SUFFIXES, ".gz", ".zip"):
         return current
     try:
-        chunk = _sample_bytes(path)
+        chunk = _sample_bytes(path, members=members)
         lines = chunk.decode(_py_codec(encoding), errors="replace").splitlines()
     except Exception:
         return current
@@ -2045,7 +2098,7 @@ def _convert_spec_file(
     Latin-1.
     """
     detect = spec.encoding == "detect"
-    enc = detect_encoding(path) if detect else spec.encoding
+    enc = _detect_encoding(path, spec.members) if detect else spec.encoding
     candidates = [enc]
     if detect and spec.fallback and enc.lower().startswith("utf"):
         candidates.append("latin-1")
@@ -2138,10 +2191,10 @@ def _convert_spec_file_with(
     if spec.reader == "duckdb":
         skip = 0
         if spec.skip_until:
-            skip = find_skip_until(path, spec.skip_until, enc)
+            skip = _find_skip_until(path, spec.skip_until, enc, spec.members)
         separator = spec.separator
         if spec.fallback:
-            separator = _sniff_separator(path, enc, skip, separator)
+            separator = _sniff_separator(path, enc, skip, separator, spec.members)
         return writer.write_duckdb(
             path,
             partitions=partitions,

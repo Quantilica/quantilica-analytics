@@ -467,6 +467,126 @@ def test_duckdb_members_pattern_ignores_suffix_filter(
     assert pl.read_parquet(result.output)["cnpj_basico"].to_list() == ["00000000"]
 
 
+@pytest.mark.parametrize(
+    "member", ["dados.json", "dados.dbf", "dados.parquet", "x.sql"]
+)
+def test_duckdb_zip_with_only_known_non_data_suffix_is_an_error(
+    tmp_path, dataset_dir, descriptor, member
+):
+    src = make_zip(tmp_path / "pacote.zip", member, b"{}\n")
+
+    with pytest.raises(LakeError, match="contains no data files"):
+        LakeWriter(dataset_dir, descriptor).write_duckdb(
+            src, partitions={"ano": 2026, "mes": "10"}
+        )
+    assert parquets(dataset_dir) == []
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        "LEIA-ME",
+        "LEIAME",
+        "Leia_me.docx",
+        "README",
+        "readme.rtf",
+        "LICENCA",
+        "layout_campos",
+        "Dicionario",
+    ],
+)
+def test_duckdb_zip_skips_documentation_names(tmp_path, dataset_dir, descriptor, doc):
+    src = tmp_path / "pacote.zip"
+    with zipfile.ZipFile(src, "w") as archive:
+        archive.writestr(doc, b"Este pacote contem dados do mes\n")
+        archive.writestr("K1.COMT", RFB_LINE.encode("latin-1"))
+
+    result = _write_headerless(LakeWriter(dataset_dir, descriptor), src)
+
+    assert result.rows == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "K3241.K03200Y0.D60711.EMPRECSV",
+        "K3241.K03200Y0.D60711.ESTABELE",
+        "K3241.K03200Y0.D60711.SOCIOCSV",
+        "F.K03200$W.SIMPLES.CSV.D60711",
+        "F.K03200$Z.D60711.CNAECSV",
+        "F.K03200$Z.D60711.MOTICSV",
+        "F.K03200$Z.D60711.MUNICCSV",
+        "F.K03200$Z.D60711.NATJUCSV",
+        "F.K03200$Z.D60711.PAISCSV",
+        "F.K03200$Z.D60711.QUALSCSV",
+        "RAIS_VINC_PUB_CENTRO_OESTE.COMT",
+        "RAIS_ESTAB_PUB.COMT",
+    ],
+)
+def test_real_data_member_names_are_selected(name):
+    from quantilica.analytics import lake as lake_module
+
+    assert lake_module._data_member_names([name, "LEIA-ME"]) == [name]
+
+
+def test_duckdb_zip_fallback_with_several_members_warns(
+    tmp_path, dataset_dir, descriptor, caplog
+):
+    src = tmp_path / "pacote.zip"
+    with zipfile.ZipFile(src, "w") as archive:
+        archive.writestr("K1.COMT", RFB_LINE.encode("latin-1"))
+        archive.writestr("K2.COMT", RFB_LINE.encode("latin-1"))
+
+    with caplog.at_level("WARNING", logger="quantilica.analytics.lake"):
+        result = _write_headerless(LakeWriter(dataset_dir, descriptor), src)
+
+    assert result.rows == 2
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("K1.COMT" in m and "K2.COMT" in m for m in messages)
+
+
+def test_duckdb_zip_with_text_member_does_not_warn(
+    tmp_path, dataset_dir, descriptor, caplog
+):
+    src = tmp_path / "pacote.zip"
+    with zipfile.ZipFile(src, "w") as archive:
+        archive.writestr("a.csv", CSV_LATIN1)
+        archive.writestr("b.csv", CSV_LATIN1)
+
+    with caplog.at_level("WARNING", logger="quantilica.analytics.lake"):
+        LakeWriter(dataset_dir, descriptor).write_duckdb(
+            src, partitions={"ano": 2026, "mes": "10"}, encoding="latin-1"
+        )
+
+    assert not [r for r in caplog.records if "by exclusion" in r.getMessage()]
+
+
+def test_sampling_follows_the_member_that_will_be_read(tmp_path):
+    from quantilica.analytics import lake as lake_module
+
+    src = tmp_path / "pacote.zip"
+    with zipfile.ZipFile(src, "w") as archive:
+        archive.writestr("leiame.txt", b"Somente ASCII aqui\n")
+        archive.writestr("K1.COMT", "Município;Valor\nSão Paulo;10\n".encode("cp1252"))
+
+    # Without members the .txt wins (old behaviour); with it, the .COMT is sampled.
+    assert lake_module._detect_encoding(src) == "utf-8"
+    assert lake_module._detect_encoding(src, "*.COMT") == "cp1252"
+    assert lake_module._sample_bytes(src, members="*.COMT").startswith(b"Munic")
+
+
+def test_find_skip_until_uses_data_member_without_text_suffix(tmp_path):
+    from quantilica.analytics import lake as lake_module
+
+    src = tmp_path / "pacote.zip"
+    with zipfile.ZipFile(src, "w") as archive:
+        archive.writestr("LEIA-ME", b"nada\n")
+        archive.writestr("K1.COMT", b"preambulo\noutro\nCNPJ;NOME\n1;a\n")
+
+    assert lake_module.find_skip_until(src, "CNPJ", "latin-1") == 2
+    assert lake_module._find_skip_until(src, "CNPJ", "latin-1", "*.COMT") == 2
+
+
 def test_idempotent_skip_then_force(tmp_path, dataset_dir, descriptor):
     src = tmp_path / "rais_2025.csv"
     src.write_bytes(CSV_LATIN1)
