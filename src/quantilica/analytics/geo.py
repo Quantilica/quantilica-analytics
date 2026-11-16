@@ -343,7 +343,8 @@ def _geojson_epsg(data: Mapping[str, Any]) -> int | None:
 
 def _make_transformer(source_epsg: int, target_epsg: int) -> Any:
     try:
-        from pyproj import Transformer  # pyright: ignore[reportMissingImports]  # extra opcional "geo", fora do ambiente de dev
+        # extra opcional "geo", fora do ambiente de dev
+        from pyproj import Transformer  # pyright: ignore[reportMissingImports]
     except ImportError:
         raise ImportError(
             f"reprojecting from EPSG:{source_epsg} to EPSG:{target_epsg} needs "
