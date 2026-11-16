@@ -402,6 +402,16 @@ def _make_scratch_dir(base: Path, prefix: str) -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` is a running process on this host.
+
+    Never uses ``os.kill(pid, 0)`` on Windows: there signal ``0`` is
+    ``CTRL_C_EVENT`` and the call sends Ctrl+C to the process group, which
+    interrupts the whole ``lake build`` sharing the console.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -409,6 +419,31 @@ def _pid_alive(pid: int) -> bool:
     except OSError:  # PermissionError: it exists, it is someone else's
         return True
     return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    query_limited_information = 0x1000
+    still_active = 259
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = k32.OpenProcess(query_limited_information, False, pid)
+    if not handle:
+        # Access denied means the process exists (someone else's); anything else
+        # (invalid parameter) means there is no such process.
+        return ctypes.get_last_error() == 5
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == still_active
+    finally:
+        k32.CloseHandle(handle)
 
 
 def _is_stale(entry: Path, now: float) -> bool:
@@ -444,9 +479,13 @@ def _remove_stale_scratch(scratch: Path) -> None:
                 shutil.rmtree(entry, ignore_errors=True)
     for entry in scratch.glob("polars-*"):  # POLARS_TEMP_DIR of a dead process
         suffix = entry.name.removeprefix("polars-")
-        if entry.is_dir() and suffix.isdigit() and not _pid_alive(int(suffix)):
-            if time.time() - entry.stat().st_mtime >= STALE_SECONDS:
-                shutil.rmtree(entry, ignore_errors=True)
+        if not (entry.is_dir() and suffix.isdigit()):
+            continue
+        # Age first: a fresh directory is never removed, whatever its pid.
+        if now - entry.stat().st_mtime < STALE_SECONDS:
+            continue
+        if not _pid_alive(int(suffix)):
+            shutil.rmtree(entry, ignore_errors=True)
 
 
 def configure_scratch() -> None:

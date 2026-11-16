@@ -326,18 +326,32 @@ def test_fontes_lazy_path_e_duckdb_em_streaming(
 
     # O que o teste prova: o membro lazy sai por sink_parquet (streaming), nenhum
     # LazyFrame é coletado e nenhum DataFrame é materializado e escrito.
+    # O polars >= 1.41 executa o próprio sink com LazyFrame.collect(engine=...);
+    # isso é streaming e fica permitido só dentro do sink_parquet.
     sunk: list[Path] = []
+    dentro_do_sink = False
     original_sink = pl.LazyFrame.sink_parquet
+    original_collect = pl.LazyFrame.collect
 
     def spy_sink(self, path, *args, **kwargs):
+        nonlocal dentro_do_sink
         sunk.append(Path(path))
-        return original_sink(self, path, *args, **kwargs)
+        dentro_do_sink = True
+        try:
+            return original_sink(self, path, *args, **kwargs)
+        finally:
+            dentro_do_sink = False
 
     def boom(*args, **kwargs):
         raise AssertionError("o grupo não pode ser carregado na memória")
 
+    def collect_guard(self, *args, **kwargs):
+        if not dentro_do_sink:
+            boom()
+        return original_collect(self, *args, **kwargs)
+
     monkeypatch.setattr(pl.LazyFrame, "sink_parquet", spy_sink)
-    monkeypatch.setattr(pl.LazyFrame, "collect", boom)
+    monkeypatch.setattr(pl.LazyFrame, "collect", collect_guard)
     monkeypatch.setattr(pl.DataFrame, "write_parquet", boom)
     writer = _writer(tmp_path / "lake")
     res = writer.write_group("ds_2024", members, partitions=PARTS)
@@ -1310,3 +1324,48 @@ def test_publicacao_de_varias_partes_limpa_as_copias_se_uma_falhar(
     dataset = _dataset(tmp_path / "lake")
     assert not list(dataset.rglob("*.parquet"))
     assert not (dataset / ".tmp").exists()  # as duas cópias já feitas foram apagadas
+
+
+def test_pid_alive_no_windows_nao_usa_os_kill(monkeypatch) -> None:
+    """No Windows, ``os.kill(pid, 0)`` manda Ctrl+C ao grupo e derruba o build."""
+    from quantilica.analytics import lake as lake_mod
+
+    def _proibido(*_a, **_k):
+        raise AssertionError("os.kill não pode ser chamado no Windows")
+
+    monkeypatch.setattr(lake_mod.os, "name", "nt")
+    monkeypatch.setattr(lake_mod.os, "kill", _proibido)
+    monkeypatch.setattr(lake_mod, "_pid_alive_windows", lambda pid: pid == 4242)
+    assert lake_mod._pid_alive(4242) is True
+    assert lake_mod._pid_alive(4243) is False
+    assert lake_mod._pid_alive(0) is False
+
+
+def test_pid_alive_posix(tmp_path) -> None:
+    import subprocess
+    import sys
+
+    from quantilica.analytics import lake as lake_mod
+
+    if lake_mod.os.name == "nt":
+        pytest.skip("caminho POSIX")
+    assert lake_mod._pid_alive(lake_mod.os.getpid()) is True
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    assert lake_mod._pid_alive(proc.pid) is False
+
+
+def test_limpeza_do_scratch_nao_consulta_pid_de_pasta_recente(
+    tmp_path, monkeypatch
+) -> None:
+    """Pasta ``polars-<pid>`` recente fica sem consultar o pid (workers vivos)."""
+    from quantilica.analytics import lake as lake_mod
+
+    def _proibido(_pid):
+        raise AssertionError("pid consultado para pasta recente")
+
+    monkeypatch.setattr(lake_mod, "_pid_alive", _proibido)
+    viva = tmp_path / "polars-12345"
+    viva.mkdir()
+    lake_mod._remove_stale_scratch(tmp_path)
+    assert viva.is_dir()

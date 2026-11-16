@@ -8,6 +8,12 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Não lançado]
 
 
+
+## [0.12.1] - 2026-11-16
+
+### Corrigido
+
+- No Windows, a limpeza do diretório de trabalho conferia se um processo estava vivo com `os.kill(pid, 0)`, que lá envia Ctrl+C ao grupo de processos: o `lake build` se interrompia segundos depois de começar, assim que um segundo processo via a pasta `polars-<pid>` do primeiro. A conferência passa a usar a API do Windows, e uma pasta recente nem tem o pid consultado.
 ## [0.12.0] - 2026-11-15
 ### Adicionado
 
