@@ -7,6 +7,18 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Adicionado
+
+- Marcadores de publicação para um lake numa pasta sincronizada por um cliente de nuvem, escrito por uma máquina e lido por outra, sem escrever nele (módulo novo `quantilica.analytics.lake_publish`). O cliente envia os arquivos em ordem qualquer, então quem lê precisa de um critério próprio de "publicado":
+  - `lake_build` grava `<lake>/<fonte>/_em-atualizacao.json` (`build_id`, `host`, `iniciado_em`) antes de escrever qualquer coisa da fonte. Ao fim de um build em que todas as tarefas da fonte terminaram `ok`, grava, de forma atômica (temporário + `os.replace`), `<lake>/<fonte>/_build.json`: `build_id`, `concluido_em`, `versao_analytics` e o tamanho em bytes de TODOS os Parquets da fonte (inclusive os que o build não reescreveu, como num build de um dataset só). Build com tarefa falha, ou interrompido, não grava o manifesto e mantém o marcador; o manifesto de um build anterior fica como está. O `build_id` é o `run_id` da execução.
+  - `lake_audit(..., read_only=True)`: a auditoria não escreve nada no lake. Fonte com marcador não é lida nem julgada (`em_atualizacao`, sem achados) e fonte sem `_build.json` é `incompleto`. O DuckDB do `check_dataset` passa a gastar o disco temporário em `QUANTILICA_LAKE_SCRATCH` ou no diretório temporário do sistema, e não em `.tmp` do diretório de trabalho (que podia ser o próprio lake).
+  - Duas categorias de achado, sobre o manifesto de cada fonte: `manifesto_divergente` (arquivo listado e ausente, tamanho diferente, manifesto ilegível) e `parquet_fora_do_manifesto` (Parquet que o manifesto não lista).
+  - `AuditReport.publicacao` (e `publicacao` no JSON): por fonte, `build_id`, `resultado` (`publicado` sem achados; `incompleto` só com achados do manifesto; `falhou` com outro achado; `em_atualizacao` com marcador, ou, fora do modo somente leitura, com marcador de um build que não bate com o `_build.json`) e `auditado_em`.
+  - `lake_audit(..., state=ARQ)`: grava esses resultados num arquivo de estado fora do lake (mescla com o que já havia; um `state` dentro do lake é `ValueError`), lido pelos comandos de leitura do `quantilica-cli`.
+  - `lake_audit(..., clear_marker=True)`: remove o marcador das fontes `publicado` (única escrita da auditoria no lake; `ValueError` com `read_only`).
+  - `list_source_parquets(lake, fonte)`: os Parquets da fonte como a auditoria os vê, com o tamanho.
+- Os arquivos `_em-atualizacao.json` e `_build.json` ficam na raiz da fonte e não viram dataset nem achado da auditoria.
+
 ### Alterado
 
 - `pyright` (modo `basic`, `include = ["src"]`) passa a fazer parte do grupo de dev e fica em 0 erros: `Field.dtype` aceita classe ou instância de dtype Polars, `to_parquet(compression=...)` é tipado com os codecs do Polars, e as demais correções são só de tipagem, sem mudar comportamento.
