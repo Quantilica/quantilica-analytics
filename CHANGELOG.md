@@ -7,6 +7,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+
+## [0.12.0] - 2026-11-15
 ### Adicionado
 
 - `LakeWriter.write_group(group_key, members, ...)`: escreve todos os membros de um grupo (as partes de um mês, os membros de um ZIP, as séries de um ano) num único `<group_key>.parquet`, numa passada só. Pula o grupo inteiro quando nenhum membro mudou, reescreve uma vez quando algum mudou (`write_member` reescreve o grupo a cada membro) e copia do arquivo existente as linhas dos membros em dia: só o `data` dos membros alterados é avaliado (pode ser uma função, para não decodificar o que já está no lake). Nada é carregado na memória: `LazyFrame` vai por `sink_parquet`, `Path` de Parquet e `DuckSource` (um `SELECT` do DuckDB) passam pelo DuckDB, e o arquivo final sai de um `COPY` com spill em disco. A ordenação é opcional (`sort_by`, com custo de `ORDER BY` global); sem ela a escrita roda com `preserve_insertion_order` desligado e a ordem das linhas, e dos membros entre si, não é garantida. O grupo é sempre um arquivo só: `max_part_bytes` não se aplica a ele (aviso no log).
