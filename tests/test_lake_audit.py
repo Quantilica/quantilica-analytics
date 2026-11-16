@@ -559,6 +559,8 @@ def test_json_and_text(corpus) -> None:
         "links",
         "notes",
         "timings",
+        "publicacao",
+        "marcadores_removidos",
     }
     # sha256_divergente carries both digests in full; the others have no details
     assert set(data["findings"][0]) == {
