@@ -34,7 +34,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import polars as pl
 import pyarrow as pa
@@ -120,6 +120,22 @@ _DUCKDB_PART_FILE = re.compile(r"(\d+)")
 
 class LakeError(RuntimeError):
     """A raw file cannot be converted, or a dataset violates the contract."""
+
+
+def _first_value(cursor: Any) -> Any:
+    """First column of the single row a DuckDB scalar query returns."""
+    row = cursor.fetchone()
+    if row is None:
+        raise LakeError("DuckDB returned no row for a scalar query")
+    return row[0]
+
+
+def _duckdb_part_number(part: Path) -> int:
+    """Numeric index in the name of a part file written by DuckDB."""
+    match = _DUCKDB_PART_FILE.search(part.stem)
+    if match is None:
+        raise LakeError(f"{part.name}: no part number in the file name")
+    return int(match.group(1))
 
 
 @dataclass
@@ -427,7 +443,7 @@ def _pid_alive_windows(pid: int) -> bool:
 
     query_limited_information = 0x1000
     still_active = 259
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # pyright: ignore[reportAttributeAccessIssue]  # ctypes.WinDLL só existe no Windows
     k32.OpenProcess.restype = wintypes.HANDLE
     k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
@@ -436,7 +452,7 @@ def _pid_alive_windows(pid: int) -> bool:
     if not handle:
         # Access denied means the process exists (someone else's); anything else
         # (invalid parameter) means there is no such process.
-        return ctypes.get_last_error() == 5
+        return ctypes.get_last_error() == 5  # pyright: ignore[reportAttributeAccessIssue]  # idem, só no Windows
     try:
         code = wintypes.DWORD()
         if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -1482,13 +1498,14 @@ class LakeWriter:
         members: dict[str, dict[str, Any]] = {}
         existing = None
         if path.exists():
-            members = _members(path, group_key)
-            if members is None:
+            found = _members(path, group_key)
+            if found is None:
                 owner = _footer(path).get(META_FILE_KEY)
                 raise LakeError(
                     f"{path.name} is not the grouped file {group_key!r} "
                     f"(file key {owner!r}); refusing to overwrite it"
                 )
+            members = found
             existing = path
         members[key] = {
             "origin_file": src.name,
@@ -2375,9 +2392,11 @@ class LakeWriter:
             if self.max_part_bytes is None:
                 tmp_out = staging / f"{key}.parquet{TMP_SUFFIX}"
                 try:
-                    rows = conn.execute(
-                        f"COPY ({query}) TO {_lit(str(tmp_out))} ({options})"
-                    ).fetchone()[0]
+                    rows = _first_value(
+                        conn.execute(
+                            f"COPY ({query}) TO {_lit(str(tmp_out))} ({options})"
+                        )
+                    )
                     outputs = self._publish(target, key, [tmp_out])
                 except BaseException:
                     tmp_out.unlink(missing_ok=True)
@@ -2385,13 +2404,14 @@ class LakeWriter:
             else:
                 with tempfile.TemporaryDirectory() as duck_tmp:
                     out_dir = Path(duck_tmp) / "parts"
-                    rows = conn.execute(
-                        f"COPY ({query}) TO {_lit(str(out_dir))} "
-                        f"({options}, FILE_SIZE_BYTES {self.max_part_bytes})"
-                    ).fetchone()[0]
+                    rows = _first_value(
+                        conn.execute(
+                            f"COPY ({query}) TO {_lit(str(out_dir))} "
+                            f"({options}, FILE_SIZE_BYTES {self.max_part_bytes})"
+                        )
+                    )
                     raw_parts = sorted(
-                        out_dir.glob("*.parquet"),
-                        key=lambda p: int(_DUCKDB_PART_FILE.search(p.stem).group(1)),
+                        out_dir.glob("*.parquet"), key=_duckdb_part_number
                     )
                     staged = []
                     for idx, raw_part in enumerate(raw_parts, 1):
@@ -2943,9 +2963,9 @@ def _check_layout(
         where = directory.relative_to(dataset_dir) / key
         if None in parts and len(parts) > 1:
             errors.append(f"{where}: mixes an unsplit file with numbered parts")
-        elif None not in parts and sorted(int(p) for p in parts) != list(
-            range(1, len(parts) + 1)
-        ):
+        elif None not in parts and sorted(
+            int(p) for p in parts if p is not None
+        ) != list(range(1, len(parts) + 1)):
             errors.append(f"{where}: part numbers are not contiguous from 001")
     return files, errors
 
@@ -3009,9 +3029,9 @@ def _check_readers(
     try:
         conn = duckdb.connect()
         conn.execute(duckdb_view_sql(dataset_dir, "_lake_check"))
-        counts["duckdb"] = conn.execute("SELECT count(*) FROM _lake_check").fetchone()[
-            0
-        ]
+        counts["duckdb"] = _first_value(
+            conn.execute("SELECT count(*) FROM _lake_check")
+        )
         described = {
             r[0]: r[1].upper()
             for r in conn.execute("DESCRIBE SELECT * FROM _lake_check").fetchall()
@@ -3552,7 +3572,8 @@ def convert_with_specs(
         if not raw_files:
             continue
 
-        selected_files = select_current(raw_files)
+        # select_current has constrained TypeVar (str, PurePath): it returns PurePath.
+        selected_files = cast("list[Path]", select_current(raw_files))
 
         descriptor = DatasetDescriptor(
             source_id=source_id,

@@ -953,7 +953,7 @@ def _digest(foot: _Footprint, info: _FileInfo) -> None:
     parts = info.parts
     rel = "/".join(parts)
     source, dataset = _where(parts)
-    if len(parts) < 3:
+    if source is None or dataset is None:  # len(parts) < 3
         foot.findings.append(
             AuditFinding(
                 "fora_do_layout", "Parquet fora de <fonte>/<dataset>/", rel, source

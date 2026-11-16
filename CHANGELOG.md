@@ -7,6 +7,9 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Alterado
+
+- `pyright` (modo `basic`, `include = ["src"]`) passa a fazer parte do grupo de dev e fica em 0 erros: `Field.dtype` aceita classe ou instância de dtype Polars, `to_parquet(compression=...)` é tipado com os codecs do Polars, e as demais correções são só de tipagem, sem mudar comportamento.
 
 ## [0.12.2] - 2026-11-16
 ### Corrigido

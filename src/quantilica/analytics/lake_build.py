@@ -249,7 +249,7 @@ def _acquire_wake_lock(reason: str):
             import ctypes
 
             es_continuous, es_system_required = 0x80000000, 0x00000001
-            kernel32 = ctypes.windll.kernel32
+            kernel32 = ctypes.windll.kernel32  # pyright: ignore[reportAttributeAccessIssue]  # ctypes.windll só existe no Windows
             kernel32.SetThreadExecutionState(es_continuous | es_system_required)
             return lambda: kernel32.SetThreadExecutionState(es_continuous)
         if sys.platform == "darwin":
@@ -595,7 +595,7 @@ class _Pool:
         started_at = datetime.now(UTC).isoformat(timespec="seconds")
         process.start()
         child_conn.close()  # sem a ponta do filho aqui, a morte dele vira EOF
-        if self._job is not None:
+        if self._job is not None and process.pid is not None:
             self._job.assign(process.pid)
         self.running.append(
             _Running(task, process, parent_conn, started_at, time.monotonic())
@@ -717,7 +717,7 @@ class _WindowsJob:
             import ctypes
             from ctypes import wintypes
 
-            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # pyright: ignore[reportAttributeAccessIssue]  # ctypes.WinDLL só existe no Windows
             k32.CreateJobObjectW.restype = wintypes.HANDLE
             k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
             k32.SetInformationJobObject.argtypes = [
