@@ -40,6 +40,25 @@ grouped files included) and checks, in this order:
 6. **Readers** (``leitores``): :func:`~quantilica.analytics.lake.check_dataset`
    on every dataset (DuckDB, Polars and PyArrow agree). Expensive;
    ``readers=False`` skips it.
+7. **Build manifest** (``manifesto_divergente``, ``parquet_fora_do_manifesto``):
+   every Parquet that the source's ``_build.json`` lists exists with the same
+   size, and the source has no Parquet that the manifest does not list (see
+   :mod:`quantilica.analytics.lake_publish`).
+
+Publication state
+-----------------
+Besides the findings, the report says, per source, whether it is *published*
+(``report.publicacao``): ``publicado`` (no findings), ``incompleto`` (only
+manifest findings), ``falhou`` (any other finding) or ``em_atualizacao`` (the
+source has ``_em-atualizacao.json``; or, outside ``read_only``, a marker whose
+``build_id`` is not that of ``_build.json``, which is a build that did not
+finish). With ``read_only=True`` the audit writes nothing in the lake and a
+source with a marker is neither read nor judged: its findings are dropped and it
+is ``em_atualizacao``; a source without ``_build.json`` is ``incompleto``.
+``state`` is the state file (outside the lake) that receives these results, and
+``clear_marker=True`` removes the marker of each source that is ``publicado``
+(and whose marker is that of its manifest's build): the only write the audit can
+do in the lake.
 
 Only footers are read (plus the cheapest column of the last row group of each
 file), never whole files, and the footers are read by a thread pool. Raw files
@@ -112,6 +131,23 @@ from quantilica.analytics.lake import (
     check_dataset,
     footer_from_metadata,
 )
+from quantilica.analytics.lake_publish import (
+    BUILD_MANIFEST_NAME,
+    MARKER_NAME,
+    RESULT_FAILED,
+    RESULT_INCOMPLETE,
+    RESULT_PUBLISHED,
+    RESULT_UPDATING,
+    LakePublishError,
+    now_iso,
+    read_build_manifest,
+    read_marker,
+    state_entry,
+    update_state,
+)
+from quantilica.analytics.lake_publish import (
+    clear_marker as remove_marker,
+)
 
 # Finding categories, with what each one means.
 CATEGORIES: dict[str, str] = {
@@ -128,7 +164,12 @@ CATEGORIES: dict[str, str] = {
     "tmp_sobrando": "restos de escrita (.tmp) no lake",
     "fora_do_layout": "Parquet fora de <fonte>/<dataset>/",
     "leitores": "erro do check_dataset (descritor, layout, rodapé ou leitores)",
+    "manifesto_divergente": "arquivo do _build.json ausente, com outro tamanho, "
+    "ou manifesto ilegível/ausente em modo somente leitura",
+    "parquet_fora_do_manifesto": "Parquet na fonte que o _build.json não lista",
 }
+# Findings that only mean "the sync has not finished": the source is incomplete.
+MANIFEST_CATEGORIES = frozenset({"manifesto_divergente", "parquet_fora_do_manifesto"})
 
 # Raw files that carry no table, so having no Parquet is expected (heuristic used
 # when the converter has no ``inventory()``): documents, images and office files.
@@ -218,6 +259,8 @@ class AuditReport:
     links: list[dict[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
+    publicacao: dict[str, dict[str, Any]] = field(default_factory=dict)
+    markers_cleared: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -246,6 +289,8 @@ class AuditReport:
             "links": [dict(link) for link in self.links],
             "notes": list(self.notes),
             "timings": dict(self.timings),
+            "publicacao": {k: dict(v) for k, v in sorted(self.publicacao.items())},
+            "marcadores_removidos": list(self.markers_cleared),
         }
 
     def to_json(self, *, indent: int | None = 2) -> str:
@@ -282,6 +327,9 @@ class AuditReport:
             lines.append(f"  link {link['path']} -> {link['target']}: {link['action']}")
         for note in self.notes:
             lines.append(f"  aviso: {note}")
+        for source, entry in sorted(self.publicacao.items()):
+            if entry["resultado"] != RESULT_PUBLISHED:
+                lines.append(f"  publicação de {source}: {entry['resultado']}")
         by_category = self.by_category()
         if by_category:
             lines.append("Achados:")
@@ -404,12 +452,16 @@ def _is_lake_source(entry: os.DirEntry[str]) -> bool:
     return _has_descriptor_or_parquet(Path(entry.path))
 
 
-def _scan_lake(lake_dir: Path, sources: Collection[str] | None) -> _LakeScan:
+def _scan_lake(
+    lake_dir: Path,
+    sources: Collection[str] | None,
+    exclude: Collection[str] = (),
+) -> _LakeScan:
     """Walk the lake once: Parquets, leftovers and datasets, links counted once.
 
     Without ``sources``, the folders at the root that are not sources (see
     :func:`_is_lake_source`) are skipped; naming a folder in ``sources`` scans
-    it whatever it holds.
+    it whatever it holds. The folders in ``exclude`` are never entered.
     """
     scan = _LakeScan()
     root_real = Path(os.path.realpath(lake_dir))
@@ -434,6 +486,8 @@ def _scan_lake(lake_dir: Path, sources: Collection[str] | None) -> _LakeScan:
                         scan.tmp.append(posix)
                     continue
                 if name.startswith("."):  # .build, .lock...
+                    continue
+                if not rel and name in exclude:
                     continue
                 if not rel and sources is not None and name not in sources:
                     continue
@@ -494,6 +548,150 @@ def _scan_lake(lake_dir: Path, sources: Collection[str] | None) -> _LakeScan:
                         seen_files.add(target)
                     scan.parquets.append((parts, Path(entry.path)))
     return scan
+
+
+def _parquet_sizes(scan: _LakeScan, source: str) -> dict[str, int]:
+    """``{path relative to the source folder: size}`` of the scan's Parquets."""
+    out: dict[str, int] = {}
+    for parts, path in scan.parquets:
+        if parts[0] == source and len(parts) > 1:
+            out["/".join(parts[1:])] = path.stat().st_size
+    return out
+
+
+def list_source_parquets(lake_dir: Path | str, source: str) -> dict[str, int]:
+    """Every Parquet of ``source`` as the audit sees it, with its size in bytes.
+
+    Paths are relative to the source folder and use ``/``. It is the set that the
+    build manifest records and that the audit compares with it: the same walk
+    (links followed once, ``.tmp`` folders and leftovers left out).
+    """
+    return _parquet_sizes(_scan_lake(Path(lake_dir), [source]), source)
+
+
+def _publication_sources(lake_dir: Path, wanted: Collection[str] | None) -> set[str]:
+    """Source folders at the root that hold a marker or a build manifest."""
+    found: set[str] = set()
+    try:
+        with os.scandir(lake_dir) as it:
+            for entry in it:
+                if entry.name.startswith((".", "_")) or not entry.is_dir():
+                    continue
+                if wanted is not None and entry.name not in wanted:
+                    continue
+                folder = Path(entry.path)
+                if (folder / BUILD_MANIFEST_NAME).exists() or read_marker(
+                    folder
+                ) is not None:
+                    found.add(entry.name)
+    except OSError:
+        pass
+    return found
+
+
+def _check_manifest(
+    scan: _LakeScan, lake_dir: Path, source: str, *, required: bool
+) -> list[AuditFinding]:
+    """Compare ``<source>/_build.json`` with the Parquets in the lake.
+
+    Without a manifest it is a finding only when ``required`` (read-only audit:
+    a lake from before the manifest cannot be told complete).
+    """
+    try:
+        manifest = read_build_manifest(lake_dir / source)
+    except LakePublishError as exc:
+        return [
+            AuditFinding(
+                "manifesto_divergente",
+                f"manifesto ilegível: {exc}",
+                f"{source}/{BUILD_MANIFEST_NAME}",
+                source,
+            )
+        ]
+    if manifest is None:
+        if not required:
+            return []
+        return [
+            AuditFinding(
+                "manifesto_divergente",
+                "a fonte não tem _build.json (ainda não chegou, ou lake anterior "
+                "ao manifesto)",
+                f"{source}/{BUILD_MANIFEST_NAME}",
+                source,
+            )
+        ]
+    listed: dict[str, int] = manifest["parquets"]
+    try:
+        actual = _parquet_sizes(scan, source)
+    except OSError as exc:
+        return [
+            AuditFinding(
+                "manifesto_divergente",
+                f"não consegui medir os Parquets da fonte: {exc}",
+                None,
+                source,
+            )
+        ]
+    out: list[AuditFinding] = []
+
+    def where(rel: str) -> tuple[str, str | None]:
+        return f"{source}/{rel}", rel.split("/")[0] if "/" in rel else None
+
+    for rel, size in sorted(listed.items()):
+        path, dataset = where(rel)
+        if rel not in actual:
+            out.append(
+                AuditFinding(
+                    "manifesto_divergente",
+                    "listado no _build.json e ausente do lake",
+                    path,
+                    source,
+                    dataset,
+                )
+            )
+        elif actual[rel] != size:
+            out.append(
+                AuditFinding(
+                    "manifesto_divergente",
+                    f"tamanho {actual[rel]} bytes, o _build.json diz {size}",
+                    path,
+                    source,
+                    dataset,
+                )
+            )
+    for rel in sorted(set(actual) - set(listed)):
+        path, dataset = where(rel)
+        out.append(
+            AuditFinding(
+                "parquet_fora_do_manifesto",
+                "Parquet que o _build.json não lista",
+                path,
+                source,
+                dataset,
+            )
+        )
+    return out
+
+
+def _source_result(
+    source: str,
+    findings: Collection[AuditFinding],
+    marker: Mapping[str, Any] | None,
+    manifest_build: str | None,
+) -> str:
+    """The publication result of one source (see the module docstring)."""
+    # A finding that belongs to no source (a folder that could not be listed)
+    # counts against every source: it cannot be told where it happened.
+    mine = [f for f in findings if f.source in (source, None)]
+    if marker is not None and (
+        not manifest_build or marker.get("build_id") != manifest_build
+    ):
+        return RESULT_UPDATING  # the build that set the marker did not finish
+    if any(f.category not in MANIFEST_CATEGORIES for f in mine):
+        return RESULT_FAILED
+    if mine:
+        return RESULT_INCOMPLETE
+    return RESULT_PUBLISHED
 
 
 @dataclass
@@ -709,6 +907,9 @@ def lake_audit(
     rehash: bool = False,
     workers: int | None = None,
     progress: Progress | None = None,
+    read_only: bool = False,
+    clear_marker: bool = False,
+    state: Path | str | None = None,
 ) -> AuditReport:
     """Audit ``lake_dir``; see the module docstring for the checks.
 
@@ -739,9 +940,24 @@ def lake_audit(
             their manifest sidecar.
         workers: Threads reading footers (default: twice the CPUs, up to 32).
         progress: Called as ``progress(stage, done, total)``.
+        read_only: The audit of a lake mounted for reading only: it writes
+            nothing in the lake, a source with ``_em-atualizacao.json`` is
+            ``em_atualizacao`` (not read, findings dropped) and a source without
+            ``_build.json`` is ``incompleto``. Incompatible with ``clear_marker``.
+        clear_marker: Remove ``_em-atualizacao.json`` from each source whose
+            result is ``publicado`` (and whose marker is that of its
+            ``_build.json``). The only thing the audit writes in the lake.
+        state: State file (outside the lake) that receives, per source, the
+            ``build_id`` audited, the result and when (merged with what the file
+            already holds). See :mod:`quantilica.analytics.lake_publish`.
 
     Returns:
-        The :class:`AuditReport`; ``report.ok`` is the verdict.
+        The :class:`AuditReport`; ``report.ok`` is the verdict;
+        ``report.publicacao`` has the result per source.
+
+    Raises:
+        ValueError: ``read_only`` with ``clear_marker``, or ``state`` inside the
+            lake.
     """
     started = time.monotonic()
     lake_path = Path(lake_dir)
@@ -750,7 +966,15 @@ def lake_audit(
     input_path = Path(input_dir) if input_dir is not None else None
     if input_path is not None and not input_path.is_dir():
         raise NotADirectoryError(f"input directory not found: {input_path}")
+    if read_only and clear_marker:
+        raise ValueError("clear_marker writes in the lake: not allowed with read_only")
+    state_path = Path(state) if state is not None else None
+    if state_path is not None and _inside(state_path, lake_path):
+        raise ValueError(f"the state file must be outside the lake: {state_path}")
     wanted = set(sources) if sources is not None else None
+    published = _publication_sources(lake_path, wanted)
+    marked = {s: m for s in published if (m := read_marker(lake_path / s)) is not None}
+    skipped = set(marked) if read_only else set()
     report = AuditReport(
         lake_dir=str(lake_path),
         input_dir=str(input_path) if input_path else None,
@@ -775,7 +999,7 @@ def lake_audit(
         mark = now
 
     # footers, integrity and structure
-    scan = _scan_lake(lake_path, wanted)
+    scan = _scan_lake(lake_path, wanted, exclude=skipped)
     lap("varredura")
     report.links = scan.links
     foot = _read_footprint(scan, integrity, n_workers, step)
@@ -884,6 +1108,23 @@ def lake_audit(
     else:
         report.checks["leitores"] = "desligada"
 
+    # build manifest and publication state
+    judged = (
+        {parts[0] for parts, _ in scan.parquets}
+        | {s for s, _ in scan.datasets}
+        | published
+    ) - skipped
+    for source in sorted(judged):
+        findings += _check_manifest(scan, lake_path, source, required=read_only)
+    report.checks["manifesto"] = "ok"
+    if skipped:
+        findings = [f for f in findings if f.source not in skipped]
+        report.notes.append(
+            "em atualização (marcador "
+            f"{MARKER_NAME}), não auditadas: " + ", ".join(sorted(skipped))
+        )
+    lap("manifesto")
+
     order = {c: i for i, c in enumerate(CATEGORIES)}
     report.findings = sorted(
         findings,
@@ -901,6 +1142,9 @@ def lake_audit(
             stats = datasets[f"{f.source}/{f.dataset}"]
             stats["findings"] = stats.get("findings", 0) + 1
     report.datasets = datasets
+    _publication(report, lake_path, judged, marked, skipped, clear_marker)
+    if state_path is not None:
+        update_state(state_path, report.publicacao)
     report.counts.update(
         parquets=len(foot.infos),
         datasets=len(datasets),
@@ -911,6 +1155,54 @@ def lake_audit(
     lap("relatorio")
     report.seconds = time.monotonic() - started
     return report
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    return Path(os.path.realpath(path)).is_relative_to(os.path.realpath(folder))
+
+
+def _manifest_build_id(lake_dir: Path, source: str) -> str | None:
+    try:
+        manifest = read_build_manifest(lake_dir / source)
+    except LakePublishError:
+        return None
+    return manifest.get("build_id") if manifest else None
+
+
+def _publication(
+    report: AuditReport,
+    lake_dir: Path,
+    judged: Collection[str],
+    marked: Mapping[str, Mapping[str, Any]],
+    skipped: Collection[str],
+    clear: bool,
+) -> None:
+    """Fill ``report.publicacao`` and, if asked, remove the markers of the
+    sources that are published."""
+    now = now_iso()
+    for source in sorted(skipped):
+        report.publicacao[source] = state_entry(
+            marked[source].get("build_id"), RESULT_UPDATING, now
+        )
+    for source in sorted(judged):
+        manifest_build = _manifest_build_id(lake_dir, source)
+        result = _source_result(
+            source, report.findings, marked.get(source), manifest_build
+        )
+        build_id = (
+            marked[source].get("build_id")
+            if result == RESULT_UPDATING
+            else manifest_build
+        )
+        report.publicacao[source] = state_entry(build_id, result, now)
+        if result == RESULT_UPDATING:
+            report.notes.append(
+                f"{source}: o build {build_id or '?'} não terminou (o marcador não "
+                "bate com o _build.json); o marcador fica"
+            )
+        elif clear and source in marked and result == RESULT_PUBLISHED:
+            if remove_marker(lake_dir / source):
+                report.markers_cleared.append(source)
 
 
 @dataclass

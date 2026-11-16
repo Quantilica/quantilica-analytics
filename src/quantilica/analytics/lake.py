@@ -3028,6 +3028,10 @@ def _check_readers(
     # DuckDB, through the same view the consumers create.
     try:
         conn = duckdb.connect()
+        # DuckDB spills to ".tmp" in the working directory by default: with the
+        # process inside a (read-only) lake that would write there.
+        spill = Path(os.environ.get(LAKE_SCRATCH_ENV) or tempfile.gettempdir())
+        conn.execute(f"SET temp_directory = {_lit(str(spill / 'duckdb-check'))}")
         conn.execute(duckdb_view_sql(dataset_dir, "_lake_check"))
         counts["duckdb"] = _first_value(
             conn.execute("SELECT count(*) FROM _lake_check")

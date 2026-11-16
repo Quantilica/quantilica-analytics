@@ -61,6 +61,12 @@ from typing import Any
 from quantilica.core.lake import load_lake_converter
 
 from quantilica.analytics.lake import LAKE_SCRATCH_ENV
+from quantilica.analytics.lake_publish import (
+    LakePublishError,
+    read_marker,
+    write_build_manifest,
+    write_marker,
+)
 
 logger = logging.getLogger("quantilica.analytics.lake_build")
 
@@ -870,6 +876,16 @@ def lake_build(
             of an interrupted run to resume; an already finished run raises
             :class:`LakeBuildError`.
 
+    Publication markers (see :mod:`quantilica.analytics.lake_publish`): before
+    converting anything of a source, the build writes
+    ``<lake>/<source>/_em-atualizacao.json`` with the run id as ``build_id``.
+    When every task of the source finished ``ok`` (none failed in this run or
+    in the one being resumed), it writes, atomically,
+    ``<lake>/<source>/_build.json`` with the size of **every** Parquet of the
+    source (not only the rewritten ones). A source with a failed task, or a run
+    that is interrupted, writes no manifest and keeps the marker; the marker is
+    removed only by ``lake_audit(clear_marker=True)`` once the audit passes.
+
     A run that ends without interruption (with or without failed tasks) writes
     a final ``run_complete`` line. If the most recent run lacks it, it is
     resumed (same ``run_id``/file, its ``ok`` tasks skipped, ``resumed_run``
@@ -957,6 +973,13 @@ def lake_build(
         logger.info("lake build: nothing to do (%d tasks already done)", len(tasks))
         if resume is not None:
             _end_with_newline(path)
+            # A resumed run whose last task finished but whose closing line is
+            # missing: its sources still hold the marker of this run.
+            _publish(
+                summary,
+                lake_path,
+                [t.source for t in tasks if _marked_by(lake_path, t.source, run_id)],
+            )
             _close_run(path, run_id, scope, len(summary.previous_failures))
         summary.seconds = time.monotonic() - started
         return summary
@@ -979,10 +1002,18 @@ def lake_build(
     build_dir.mkdir(parents=True, exist_ok=True)
     if resume is not None:
         _end_with_newline(path)
+    for source in source_bytes:  # before anything of the source is written
+        try:
+            write_marker(lake_path / source, run_id)
+        except OSError as exc:
+            raise LakeBuildError(
+                f"cannot write the update marker of {source!r} in {lake_path}: {exc}"
+            ) from exc
 
     wake = keep_awake() if prevent_sleep else contextlib.nullcontext()
     with wake, _interrupts_as_keyboard_interrupt():
         _run(pending, summary, workers, lake_path, force, memory, threads, scratch_path)
+    _publish(summary, lake_path, list(source_bytes))
     # Só chega aqui sem interrupção: com tarefas com erro também se fecha a execução.
     _close_run(
         path, run_id, scope, len(summary.failed_tasks) + len(summary.previous_failures)
@@ -990,6 +1021,37 @@ def lake_build(
     summary.seconds = time.monotonic() - started
     logger.info("lake build %s finished:\n%s", summary.run_id, summary.format())
     return summary
+
+
+def _marked_by(lake_dir: Path, source: str, build_id: str) -> bool:
+    marker = read_marker(lake_dir / source)
+    return marker is not None and marker.get("build_id") == build_id
+
+
+def _publish(summary: BuildSummary, lake_dir: Path, sources: list[str]) -> None:
+    """``_build.json`` of each source of ``sources`` whose tasks all finished ok.
+
+    A source with a task that failed in this run, or that failed in the run being
+    resumed and was left alone, gets no manifest and keeps its marker.
+    """
+    from quantilica.analytics.lake_audit import list_source_parquets
+
+    broken = {s for s, _ in summary.previous_failures}
+    broken |= {t.source for t in summary.failed_tasks}
+    for source in dict.fromkeys(sources):
+        if source in broken:
+            logger.warning(
+                "lake build: %s has failed tasks; no _build.json, the update marker "
+                "stays",
+                source,
+            )
+            continue
+        try:
+            sizes = list_source_parquets(lake_dir, source)
+            write_build_manifest(lake_dir / source, summary.run_id, sizes)
+        except (OSError, LakePublishError) as exc:
+            summary.failed_sources[source] = f"build manifest not written: {exc}"
+            logger.error("lake build: %s: build manifest not written: %s", source, exc)
 
 
 def _choose_run(
