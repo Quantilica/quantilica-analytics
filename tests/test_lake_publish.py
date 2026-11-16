@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from lake_publish_fakes import ParquetConverter
 
 from quantilica.analytics import lake_audit
 from quantilica.analytics import lake_build as lb
-from quantilica.analytics.lake_audit import list_source_parquets
+from quantilica.analytics.lake_audit import MANIFEST_CATEGORIES, list_source_parquets
 from quantilica.analytics.lake_build import lake_build
 from quantilica.analytics.lake_publish import (
     BUILD_MANIFEST_NAME,
@@ -420,3 +421,229 @@ def test_unreadable_state_file_is_an_error(tmp_path):
     bad.write_text("not json")
     with pytest.raises(LakePublishError):
         read_state(bad)
+
+
+# --- revisão: retomada, build sem mudança, leitura única, repetição ------------------
+
+
+def _interrupt_before_closing(monkeypatch) -> None:
+    """Make a run end like an interrupted one: tasks recorded, no closing line."""
+    monkeypatch.setattr(lb, "_publish", lambda *a, **k: None)
+
+    def stop(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(lb, "_close_run", stop)
+
+
+def test_resumed_run_publishes_the_source_it_had_already_finished(
+    tmp_path, monkeypatch
+):
+    _raw(tmp_path, "aa", "bb")
+    control = tmp_path / "control"
+    first = {
+        "aa": ParquetConverter("aa", ["d"], control),
+        "bb": ParquetConverter("bb", ["d"], control, {"d": "raise"}),
+    }
+    with monkeypatch.context() as m:
+        _interrupt_before_closing(m)
+        with pytest.raises(KeyboardInterrupt):
+            _build(tmp_path, first)
+    lake = tmp_path / "lake"
+    assert not (lake / "aa" / BUILD_MANIFEST_NAME).exists()
+
+    # The resumed run only has bb's task left; aa finished before.
+    second = {
+        "aa": first["aa"],
+        "bb": ParquetConverter("bb", ["d"], control),
+    }
+    summary = _build(tmp_path, second, retry_errors=True)
+
+    assert summary.resumed_run and not summary.has_errors
+    for source in ("aa", "bb"):
+        manifest = read_build_manifest(lake / source)
+        assert manifest["build_id"] == summary.run_id
+        assert manifest["parquets"] == _actual_sizes(lake / source)
+
+
+def test_unchanged_source_keeps_its_manifest_and_loses_this_runs_marker(tmp_path):
+    from quantilica.analytics.lake_publish import clear_marker
+
+    _raw(tmp_path, "src")
+    conv = ParquetConverter("src", ["aa"], tmp_path / "control")
+    first = _build(tmp_path, {"src": conv})
+    source = tmp_path / "lake" / "src"
+    clear_marker(source)  # what the audit did
+    before = (source / BUILD_MANIFEST_NAME).read_bytes()
+
+    second = _build(tmp_path, {"src": conv}, force=True)
+
+    assert second.run_id != first.run_id
+    assert (source / BUILD_MANIFEST_NAME).read_bytes() == before  # same build_id
+    assert not (source / MARKER_NAME).exists()
+
+
+def test_changed_source_gets_a_new_manifest_and_keeps_the_marker(tmp_path):
+    from quantilica.analytics.lake_publish import clear_marker
+
+    _raw(tmp_path, "src")
+    conv = ParquetConverter("src", ["aa"], tmp_path / "control")
+    _build(tmp_path, {"src": conv})
+    source = tmp_path / "lake" / "src"
+    clear_marker(source)
+
+    os.environ["LAKE_FAKE_ROWS"] = "7"
+    try:
+        second = _build(tmp_path, {"src": conv}, force=True)
+    finally:
+        del os.environ["LAKE_FAKE_ROWS"]
+
+    assert read_build_manifest(source)["build_id"] == second.run_id
+    assert (source / MARKER_NAME).exists()
+
+
+def test_marker_left_by_an_earlier_run_is_not_removed_when_nothing_changed(tmp_path):
+    _raw(tmp_path, "src")
+    conv = ParquetConverter("src", ["aa"], tmp_path / "control")
+    _build(tmp_path, {"src": conv})  # leaves its marker
+    source = tmp_path / "lake" / "src"
+
+    second = _build(tmp_path, {"src": conv}, force=True)
+
+    assert (source / MARKER_NAME).exists()  # an earlier run's: the audit decides
+    assert read_build_manifest(source)["build_id"] == second.run_id
+
+
+def test_audit_reads_each_manifest_once(lake, tmp_path, monkeypatch):
+    audit_module = importlib.import_module("quantilica.analytics.lake_audit")
+
+    real = audit_module.read_build_manifest
+    calls: list[str] = []
+
+    def racy(source_dir):
+        calls.append(Path(source_dir).name)
+        data = real(source_dir)
+        if data is not None and calls.count(Path(source_dir).name) > 1:
+            data["build_id"] = "OUTRO"  # a second read would see another build
+        return data
+
+    monkeypatch.setattr(audit_module, "read_build_manifest", racy)
+
+    report = _audit(lake, tmp_path)
+
+    assert sorted(calls) == sorted(set(calls))  # once per source
+    assert {e["build_id"] for e in report.publicacao.values()} == {"B1"}
+
+
+def test_plain_audit_does_not_fail_on_manifest_divergence(lake, tmp_path):
+    victim = lake.parquet_for("vendas_2026@20261021.csv")
+    source = victim.relative_to(lake.lake).parts[0]
+    victim.unlink()
+
+    plain = lake_audit(lake.lake, converters={})
+
+    assert plain.ok, plain.to_text()
+    assert not [f for f in plain.findings if f.category in MANIFEST_CATEGORIES]
+    assert any(n.startswith(f"{source}:") and "_build.json" in n for n in plain.notes)
+    assert plain.publicacao[source]["resultado"] == "incompleto"
+    assert plain.checks["manifesto"].startswith("ok")
+    # With a state file the verdict is about publication: it fails.
+    with_state = lake_audit(lake.lake, converters={}, state=tmp_path / "estado.json")
+    assert not with_state.ok
+
+
+def test_read_only_counts_a_tmp_leftover_as_incomplete_not_failed(lake, tmp_path):
+    leftover = lake.lake / "gama" / "grupos" / ".tmp" / "resto.parquet"
+    leftover.parent.mkdir(parents=True, exist_ok=True)
+    leftover.write_bytes(b"x")
+
+    report = _audit(lake, tmp_path, input_dir=None, readers=False)
+
+    assert [f.category for f in report.findings] == ["tmp_sobrando"]
+    assert _result(report, "gama") == "incompleto"
+
+
+def test_marker_that_cannot_be_removed_is_a_note_and_the_audit_goes_on(
+    lake, tmp_path, monkeypatch
+):
+    audit_module = importlib.import_module("quantilica.analytics.lake_audit")
+
+    write_marker(lake.lake / "gama", "B1")
+    write_marker(lake.lake / "alfa", "B1")
+    real = audit_module.remove_marker
+
+    def flaky(source_dir):
+        if Path(source_dir).name == "gama":
+            raise PermissionError("[WinError 32] em uso")
+        return real(source_dir)
+
+    monkeypatch.setattr(audit_module, "remove_marker", flaky)
+    state = tmp_path / "estado.json"
+
+    report = lake_audit(lake.lake, converters={}, clear_marker=True, state=state)
+
+    assert report.markers_cleared == ["alfa"]
+    assert any("gama" in n and "marcador" in n for n in report.notes)
+    assert (lake.lake / "gama" / MARKER_NAME).exists()
+    assert state.exists() and read_state(state)["gama"]["resultado"] == "publicado"
+
+
+def test_atomic_write_retries_on_permission_error(tmp_path, monkeypatch):
+    from quantilica.analytics import lake_publish as pub
+
+    real = os.replace
+    attempts: list[int] = []
+    waits: list[float] = []
+
+    def busy(src, dst):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise PermissionError("[WinError 5] negado")
+        real(src, dst)
+
+    monkeypatch.setattr(pub.os, "replace", busy)
+    monkeypatch.setattr(pub.time, "sleep", waits.append)
+
+    pub.write_json_atomic(tmp_path / "x.json", {"a": 1})
+
+    assert json.loads((tmp_path / "x.json").read_text()) == {"a": 1}
+    assert len(attempts) == 3 and waits == [0.2, 0.4]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_atomic_write_gives_up_after_the_attempts_and_cleans_up(tmp_path, monkeypatch):
+    from quantilica.analytics import lake_publish as pub
+
+    def busy(src, dst):
+        raise PermissionError("[WinError 32] em uso")
+
+    monkeypatch.setattr(pub.os, "replace", busy)
+    monkeypatch.setattr(pub.time, "sleep", lambda s: None)
+
+    with pytest.raises(PermissionError):
+        pub.write_json_atomic(tmp_path / "x.json", {"a": 1})
+
+    assert not list(tmp_path.iterdir())
+
+
+def test_check_dataset_spills_to_its_own_scratch_folder_and_removes_it(
+    lake, tmp_path, monkeypatch
+):
+    from quantilica.analytics import lake as lake_module
+
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
+    seen: list[Path] = []
+    real = lake_module._check_readers_in
+
+    def spy(dataset_dir, descriptor, files, spill):
+        seen.append(spill)
+        assert spill.parent == scratch and spill.is_dir()
+        return real(dataset_dir, descriptor, files, spill)
+
+    monkeypatch.setattr(lake_module, "_check_readers_in", spy)
+
+    assert lake_module.check_dataset(lake.dataset_dir("alfa", "vendas")) == []
+
+    assert seen and not seen[0].exists()
+    assert list(scratch.iterdir()) == []

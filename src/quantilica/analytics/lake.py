@@ -3018,6 +3018,24 @@ _POLARS_MAX_COUNT = 2**32
 def _check_readers(
     dataset_dir: Path, descriptor: DatasetDescriptor, files: list[Path]
 ) -> list[str]:
+    # DuckDB spills to ".tmp" in the working directory by default: with the
+    # process inside a (read-only) lake that would write there. Each call gets
+    # its own spill folder, outside the lake, removed at the end.
+    base = Path(os.environ.get(LAKE_SCRATCH_ENV) or tempfile.gettempdir())
+    base.mkdir(parents=True, exist_ok=True)
+    spill = Path(tempfile.mkdtemp(prefix="duckdb-check-", dir=base))
+    try:
+        return _check_readers_in(dataset_dir, descriptor, files, spill)
+    finally:
+        shutil.rmtree(spill, ignore_errors=True)
+
+
+def _check_readers_in(
+    dataset_dir: Path,
+    descriptor: DatasetDescriptor,
+    files: list[Path],
+    spill: Path,
+) -> list[str]:
     import duckdb
 
     errors: list[str] = []
@@ -3028,10 +3046,7 @@ def _check_readers(
     # DuckDB, through the same view the consumers create.
     try:
         conn = duckdb.connect()
-        # DuckDB spills to ".tmp" in the working directory by default: with the
-        # process inside a (read-only) lake that would write there.
-        spill = Path(os.environ.get(LAKE_SCRATCH_ENV) or tempfile.gettempdir())
-        conn.execute(f"SET temp_directory = {_lit(str(spill / 'duckdb-check'))}")
+        conn.execute(f"SET temp_directory = {_lit(str(spill))}")
         conn.execute(duckdb_view_sql(dataset_dir, "_lake_check"))
         counts["duckdb"] = _first_value(
             conn.execute("SELECT count(*) FROM _lake_check")

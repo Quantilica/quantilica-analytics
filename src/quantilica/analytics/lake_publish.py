@@ -36,7 +36,8 @@ import contextlib
 import json
 import os
 import socket
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,13 @@ RESULT_UPDATING = "em_atualizacao"
 RESULT_INCOMPLETE = "incompleto"
 RESULT_FAILED = "falhou"
 RESULTS = (RESULT_PUBLISHED, RESULT_UPDATING, RESULT_INCOMPLETE, RESULT_FAILED)
+
+
+# A sync client or an antivirus may hold a file for a moment (WinError 5/32 on
+# Windows): replacing or removing it is tried again, waiting 0.2 s, 0.4 s...
+RETRY_ATTEMPTS = 5
+RETRY_FIRST_WAIT = 0.2
+RETRY_MAX_WAIT = 2.0
 
 
 class LakePublishError(ValueError):
@@ -72,11 +80,26 @@ def analytics_version() -> str:
         return "desconhecida"
 
 
+def _retrying(operation: Callable[[], None]) -> None:
+    """Run ``operation``, trying again when it fails with ``PermissionError``."""
+    wait = RETRY_FIRST_WAIT
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            operation()
+            return
+        except PermissionError:
+            if attempt == RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(wait)
+            wait = min(wait * 2, RETRY_MAX_WAIT)
+
+
 def write_json_atomic(path: Path, data: Mapping[str, Any]) -> None:
     """Write ``data`` as JSON to ``path``: a temporary file, then ``os.replace``.
 
     The temporary file sits next to ``path`` (same volume), is named
-    ``.<name>.<pid>.tmp`` and is removed if the write fails.
+    ``.<name>.<pid>.tmp`` and is removed if the write fails. ``os.replace``
+    is tried again (up to :data:`RETRY_ATTEMPTS` times) on ``PermissionError``.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}{TMP_SUFFIX}")
@@ -86,7 +109,7 @@ def write_json_atomic(path: Path, data: Mapping[str, Any]) -> None:
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        _retrying(lambda: os.replace(tmp, path))
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -160,9 +183,13 @@ def read_marker(source_dir: Path | str) -> dict[str, Any] | None:
 
 
 def clear_marker(source_dir: Path | str) -> bool:
-    """Remove the marker; whether there was one."""
+    """Remove the marker (trying again on ``PermissionError``); whether there was
+    one."""
+    path = marker_path(source_dir)
+    if not path.exists():
+        return False
     try:
-        marker_path(source_dir).unlink()
+        _retrying(path.unlink)
     except FileNotFoundError:
         return False
     return True

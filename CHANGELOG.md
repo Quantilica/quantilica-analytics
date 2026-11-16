@@ -18,6 +18,16 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - `lake_audit(..., clear_marker=True)`: remove o marcador das fontes `publicado` (única escrita da auditoria no lake; `ValueError` com `read_only`).
   - `list_source_parquets(lake, fonte)`: os Parquets da fonte como a auditoria os vê, com o tamanho.
 - Os arquivos `_em-atualizacao.json` e `_build.json` ficam na raiz da fonte e não viram dataset nem achado da auditoria.
+- Detalhes dos marcadores de publicação:
+  - Uma execução retomada publica toda fonte que marcou, inclusive a que já tinha terminado todas as tarefas antes (antes só as fontes com tarefa pendente recebiam o `_build.json`).
+  - Fonte que o build não mudou (mesmos Parquets e tamanhos do `_build.json` atual) mantém esse manifesto, com o mesmo `build_id`, e perde o marcador desta execução: o estado de quem lê continua valendo e o Drive não ganha versões à toa. Marcador deixado por uma execução anterior que falhou nunca é removido pelo build.
+  - A auditoria lê o `_build.json` uma vez por fonte: o `build_id` gravado no estado é o que foi conferido.
+  - A auditoria comum (sem `read_only` e sem `state`) não reprova por `manifesto_divergente` e `parquet_fora_do_manifesto`: viram avisos em `notes`, e o código de saída anterior fica. O resultado por fonte em `publicacao` continua levando essas divergências em conta. Com `read_only` ou `state` elas reprovam.
+  - Com `read_only`, `tmp_sobrando` deixa a fonte `incompleto` (resto que ainda não foi apagado pela sincronização), não `falhou`.
+  - `clear_marker`: a falha ao remover o marcador de uma fonte (`OSError`) vira aviso em `notes`; a auditoria segue e grava o estado e o relatório.
+  - A escrita atômica e a remoção do marcador tentam de novo (5 vezes, de 0,2 s a 2 s) quando o Windows devolve `PermissionError` (arquivo em uso).
+  - O disco temporário do DuckDB no `check_dataset` é uma pasta própria por chamada (`mkdtemp` em `QUANTILICA_LAKE_SCRATCH` ou no diretório temporário do sistema), removida no fim.
+- Limitações dos marcadores de publicação: o manifesto compara só nomes e tamanhos (um arquivo reescrito com o mesmo tamanho passa); Parquets gravados fora do `lake build` (os `convert` dos fetchers) não geram manifesto, e uma auditoria `read_only` chama essa fonte de `incompleto`.
 
 ### Alterado
 

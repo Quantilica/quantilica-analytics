@@ -58,7 +58,17 @@ is ``em_atualizacao``; a source without ``_build.json`` is ``incompleto``.
 ``state`` is the state file (outside the lake) that receives these results, and
 ``clear_marker=True`` removes the marker of each source that is ``publicado``
 (and whose marker is that of its manifest's build): the only write the audit can
-do in the lake.
+do in the lake; a marker that cannot be removed is a note, and the audit goes on.
+
+The manifest findings fail the audit only when it is about publication, that is,
+with ``read_only`` or ``state``. The plain audit (the builder machine's) shows
+them as notes and keeps its verdict; they still count for the source's result.
+Under ``read_only``, a ``tmp_sobrando`` finding also makes the source
+``incompleto`` (a leftover that has not been synced away), not ``falhou``.
+Parquets written outside ``lake build`` (the ``convert`` commands of the fetchers)
+leave no manifest: a read-only audit calls such a source ``incompleto``.
+The manifest compares names and sizes only: a file rewritten with the same size
+goes unnoticed.
 
 Only footers are read (plus the cheapest column of the last row group of each
 file), never whole files, and the footers are read by a thread pool. Raw files
@@ -589,21 +599,41 @@ def _publication_sources(lake_dir: Path, wanted: Collection[str] | None) -> set[
     return found
 
 
+@dataclass(frozen=True)
+class _Manifest:
+    """What one read of ``<source>/_build.json`` found (read once per audit, so
+    the ``build_id`` recorded in the state is the one that was checked)."""
+
+    data: dict[str, Any] | None = None
+    error: str | None = None
+
+    @property
+    def build_id(self) -> str | None:
+        value = self.data.get("build_id") if self.data else None
+        return value if isinstance(value, str) else None
+
+
+def _load_manifest(lake_dir: Path, source: str) -> _Manifest:
+    try:
+        return _Manifest(read_build_manifest(lake_dir / source))
+    except LakePublishError as exc:
+        return _Manifest(error=str(exc))
+
+
 def _check_manifest(
-    scan: _LakeScan, lake_dir: Path, source: str, *, required: bool
+    scan: _LakeScan, source: str, loaded: _Manifest, *, required: bool
 ) -> list[AuditFinding]:
     """Compare ``<source>/_build.json`` with the Parquets in the lake.
 
     Without a manifest it is a finding only when ``required`` (read-only audit:
     a lake from before the manifest cannot be told complete).
     """
-    try:
-        manifest = read_build_manifest(lake_dir / source)
-    except LakePublishError as exc:
+    manifest = loaded.data
+    if loaded.error is not None:
         return [
             AuditFinding(
                 "manifesto_divergente",
-                f"manifesto ilegível: {exc}",
+                f"manifesto ilegível: {loaded.error}",
                 f"{source}/{BUILD_MANIFEST_NAME}",
                 source,
             )
@@ -678,6 +708,7 @@ def _source_result(
     findings: Collection[AuditFinding],
     marker: Mapping[str, Any] | None,
     manifest_build: str | None,
+    incomplete: Collection[str] = MANIFEST_CATEGORIES,
 ) -> str:
     """The publication result of one source (see the module docstring)."""
     # A finding that belongs to no source (a folder that could not be listed)
@@ -687,7 +718,7 @@ def _source_result(
         not manifest_build or marker.get("build_id") != manifest_build
     ):
         return RESULT_UPDATING  # the build that set the marker did not finish
-    if any(f.category not in MANIFEST_CATEGORIES for f in mine):
+    if any(f.category not in incomplete for f in mine):
         return RESULT_FAILED
     if mine:
         return RESULT_INCOMPLETE
@@ -1114,9 +1145,22 @@ def lake_audit(
         | {s for s, _ in scan.datasets}
         | published
     ) - skipped
+    # Manifest divergences fail the audit only where the verdict is about
+    # publication (read-only, or a state file): the plain audit, which the
+    # builder machine runs, keeps its exit code and gets notes instead.
+    strict = read_only or state_path is not None
+    manifests = {s: _load_manifest(lake_path, s) for s in sorted(judged)}
+    divergences: list[AuditFinding] = []
     for source in sorted(judged):
-        findings += _check_manifest(scan, lake_path, source, required=read_only)
-    report.checks["manifesto"] = "ok"
+        divergences += _check_manifest(
+            scan, source, manifests[source], required=read_only
+        )
+    if strict:
+        findings += divergences
+        divergences = []
+    else:
+        report.notes += _divergence_notes(divergences)
+    report.checks["manifesto"] = "ok" if strict else "ok (avisos, não reprova)"
     if skipped:
         findings = [f for f in findings if f.source not in skipped]
         report.notes.append(
@@ -1142,7 +1186,18 @@ def lake_audit(
             stats = datasets[f"{f.source}/{f.dataset}"]
             stats["findings"] = stats.get("findings", 0) + 1
     report.datasets = datasets
-    _publication(report, lake_path, judged, marked, skipped, clear_marker)
+    _publication(
+        report,
+        lake_path,
+        manifests,
+        marked,
+        skipped,
+        clear_marker,
+        divergences,
+        incomplete=(
+            MANIFEST_CATEGORIES | {"tmp_sobrando"} if read_only else MANIFEST_CATEGORIES
+        ),
+    )
     if state_path is not None:
         update_state(state_path, report.publicacao)
     report.counts.update(
@@ -1161,33 +1216,45 @@ def _inside(path: Path, folder: Path) -> bool:
     return Path(os.path.realpath(path)).is_relative_to(os.path.realpath(folder))
 
 
-def _manifest_build_id(lake_dir: Path, source: str) -> str | None:
-    try:
-        manifest = read_build_manifest(lake_dir / source)
-    except LakePublishError:
-        return None
-    return manifest.get("build_id") if manifest else None
+def _divergence_notes(divergences: list[AuditFinding]) -> list[str]:
+    """One note per source for manifest findings that do not fail the audit."""
+    by_source: dict[str, list[AuditFinding]] = defaultdict(list)
+    for f in divergences:
+        by_source[f.source or ""].append(f)
+    return [
+        f"{source}: {len(items)} divergência(s) com o _build.json, por exemplo "
+        f"{items[0].path}: {items[0].message}"
+        for source, items in sorted(by_source.items())
+    ]
 
 
 def _publication(
     report: AuditReport,
     lake_dir: Path,
-    judged: Collection[str],
+    manifests: Mapping[str, _Manifest],
     marked: Mapping[str, Mapping[str, Any]],
     skipped: Collection[str],
     clear: bool,
+    divergences: Collection[AuditFinding] = (),
+    incomplete: Collection[str] = MANIFEST_CATEGORIES,
 ) -> None:
     """Fill ``report.publicacao`` and, if asked, remove the markers of the
-    sources that are published."""
+    sources that are published.
+
+    ``divergences`` are manifest findings kept out of the report (plain audit):
+    they still count for the result of their source. A marker that cannot be
+    removed becomes a note; the audit goes on.
+    """
     now = now_iso()
     for source in sorted(skipped):
         report.publicacao[source] = state_entry(
             marked[source].get("build_id"), RESULT_UPDATING, now
         )
-    for source in sorted(judged):
-        manifest_build = _manifest_build_id(lake_dir, source)
+    considered = [*report.findings, *divergences]
+    for source in sorted(manifests):
+        manifest_build = manifests[source].build_id
         result = _source_result(
-            source, report.findings, marked.get(source), manifest_build
+            source, considered, marked.get(source), manifest_build, incomplete
         )
         build_id = (
             marked[source].get("build_id")
@@ -1201,8 +1268,13 @@ def _publication(
                 "bate com o _build.json); o marcador fica"
             )
         elif clear and source in marked and result == RESULT_PUBLISHED:
-            if remove_marker(lake_dir / source):
-                report.markers_cleared.append(source)
+            try:
+                if remove_marker(lake_dir / source):
+                    report.markers_cleared.append(source)
+            except OSError as exc:
+                report.notes.append(
+                    f"{source}: não consegui remover o marcador ({exc}); tente de novo"
+                )
 
 
 @dataclass
