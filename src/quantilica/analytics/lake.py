@@ -14,7 +14,7 @@ the pieces that need heavy dependencies:
 from __future__ import annotations
 
 import codecs
-import errno
+import contextlib
 import fnmatch
 import gzip
 import json
@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -170,9 +171,9 @@ class GroupMember:
         key: The member's key in ``quantilica.members`` and in ``_origem``;
             default ``file_key(src)``. Use ``composite_file_key(src, member)``
             for a member of a ZIP.
-        columns: The member columns (``{"uf": "sp", "mes": 3}``), written as
-            literal text columns.
-            Every member of a group has the same column names.
+        columns: The member columns (``{"uf": "sp", "parte": "03"}``), written
+            as literal text columns. Every member of a group has the same column
+            names, and none of them may be the name of a data column.
         sha256: The digest of ``src`` when the caller already has it.
     """
 
@@ -187,23 +188,44 @@ class GroupMember:
 class GroupWriteResult(LakeWriteResult):
     """Outcome of :meth:`LakeWriter.write_group`.
 
-    ``outputs`` lists the file; ``rows`` is the
-    rows written (0 when skipped). ``written`` are the keys of the members
-    converted in this call, ``kept`` those carried over from the existing
-    file, ``removed`` the orphans dropped from it.
+    ``outputs`` lists the file; ``rows`` is the rows written (0 when skipped).
+    ``written`` are the keys of the members converted in this call, ``kept``
+    those carried over from the existing file, ``removed`` the members that left
+    it (the orphans) and ``replaced`` the per-raw-file Parquets deleted by
+    ``replaces``/``replace_partition``.
     """
 
     written: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    replaced: list[Path] = field(default_factory=list)
+
+
+# Fields of a ``quantilica.members`` entry: a member column cannot take these names.
+ENTRY_FIELDS = frozenset(
+    {
+        "origin_file",
+        "origin_sha256",
+        "rows",
+        "converted_at",
+        "contract_version",
+        "converter_version",
+    }
+)
 
 
 @dataclass
 class _GroupState:
-    """What the lake holds for a group: the usable members and the files."""
+    """What the lake holds for a group.
+
+    ``members`` is empty unless the file is ``usable``; ``known`` lists the keys
+    its footer names anyway (for ``removed``).
+    """
 
     members: dict[str, dict[str, Any]] = field(default_factory=dict)
     parts: list[Path] = field(default_factory=list)
+    usable: bool = True
+    known: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -214,12 +236,20 @@ class _GroupPlan:
     members: list[tuple[GroupMember, str, str]]  # (member, key, sha256)
     columns: list[str]
     changed: list[tuple[GroupMember, str, str]]
-    kept: list[str]
-    orphans: list[str]
+    kept: list[str]  # in the list and current
+    carried: list[str]  # not in the list, kept because prune=False
+    orphans: list[str]  # not in the list, dropped because prune=True
+    blocked: bool = False  # prune=False over a file that cannot be carried over
 
     @property
     def is_current(self) -> bool:
-        return not self.changed and not self.orphans and bool(self.state.parts)
+        return (
+            not self.changed
+            and not self.orphans
+            and not self.blocked
+            and bool(self.state.parts)
+            and self.state.usable
+        )
 
 
 # --- partition type vocabulary -------------------------------------------------
@@ -347,6 +377,49 @@ def _try_cast(column: str, duck: str, *, decimal_comma: bool = True) -> str:
     if decimal_comma and duck in ("DOUBLE", "FLOAT", "DECIMAL"):
         return f"TRY_CAST(replace(NULLIF({ident}, ''), ',', '.') AS {duck})"
     return f"TRY_CAST(NULLIF({ident}, '') AS {duck})"
+
+
+STAGE_PREFIX = "lake-stage-"
+STALE_STAGING_SECONDS = 24 * 3600
+
+
+def _remove_stale_staging(max_age: float = STALE_STAGING_SECONDS) -> None:
+    """Remove ``lake-stage-*`` directories in the scratch older than ``max_age`` s.
+
+    A crashed write leaves its staging directory in ``QUANTILICA_LAKE_SCRATCH``;
+    nobody else would remove it. Only directories with this module's prefix.
+    """
+    base = os.environ.get(LAKE_SCRATCH_ENV)
+    if not base or not Path(base).is_dir():
+        return
+    cutoff = time.time() - max_age
+    for entry in Path(base).glob(f"{STAGE_PREFIX}*"):
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+
+
+@contextlib.contextmanager
+def _polars_spill_in(directory: Path | None):
+    """Point Polars' spill directory (``POLARS_TEMP_DIR``) at ``directory``.
+
+    Only when the scratch is in use, so the spill of a streamed ``LazyFrame``
+    never lands in the lake. Restored on exit.
+    """
+    if directory is None or not os.environ.get(LAKE_SCRATCH_ENV):
+        yield
+        return
+    previous = os.environ.get("POLARS_TEMP_DIR")
+    os.environ["POLARS_TEMP_DIR"] = str(directory)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("POLARS_TEMP_DIR", None)
+        else:
+            os.environ["POLARS_TEMP_DIR"] = previous
 
 
 def _scratch_dir(staging: Path) -> Path:
@@ -687,6 +760,48 @@ def member_matches(
     )
 
 
+def _existing_ancestor(path: Path) -> Path:
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def _same_volume(a: Path, b: Path) -> bool:
+    """Whether ``a`` and ``b`` (or their nearest existing ancestors) share a device."""
+    try:
+        return (
+            os.stat(_existing_ancestor(a)).st_dev
+            == os.stat(_existing_ancestor(b)).st_dev
+        )
+    except OSError:
+        return False
+
+
+def _copy_to(tmp: Path, hop_dir: Path) -> Path:
+    """Copy ``tmp`` into ``hop_dir`` (flushed to disk); returns the copy's path."""
+    hop_dir.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=hop_dir, prefix=".", suffix=TMP_SUFFIX)
+    os.close(fd)
+    hop = Path(name)
+    try:
+        shutil.copyfile(tmp, hop)
+        with open(hop, "rb+") as fh:
+            os.fsync(fh.fileno())
+    except BaseException:
+        hop.unlink(missing_ok=True)
+        raise
+    return hop
+
+
+def _rmdir_if_empty_tmp(directory: Path) -> None:
+    """Remove a ``.tmp`` directory that a cross-volume copy left empty."""
+    if directory.name == TMP_DIRNAME:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
 def _durable_replace(tmp: Path, final: Path, hop_dir: Path | None = None) -> None:
     """``os.replace`` after flushing ``tmp`` to disk.
 
@@ -697,29 +812,28 @@ def _durable_replace(tmp: Path, final: Path, hop_dir: Path | None = None) -> Non
     When ``tmp`` is on another volume (the scratch directory), the rename is
     not possible: the file is copied next to ``final`` first (into ``hop_dir``,
     which must be on ``final``'s volume; default ``final``'s directory) and the
-    rename is done there, so ``final`` is never seen half written.
+    rename is done there, so ``final`` is never seen half written. The volumes
+    are compared by device before the rename is tried, and a failed rename
+    (whatever the errno a virtual disk returns) also falls back to the copy.
+    An empty ``.tmp`` directory left by the copy is removed.
     """
     with open(tmp, "rb+") as fh:
         os.fsync(fh.fileno())
-    try:
-        os.replace(tmp, final)
-        return
-    except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
+    if _same_volume(tmp, final):
+        try:
+            os.replace(tmp, final)
+            return
+        except OSError:
+            pass  # EXDEV, or whatever a virtual disk says: copy instead
     hop_dir = hop_dir or final.parent
-    hop_dir.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(dir=hop_dir, prefix=".", suffix=TMP_SUFFIX)
-    os.close(fd)
-    hop = Path(name)
+    hop = _copy_to(tmp, hop_dir)
     try:
-        shutil.copyfile(tmp, hop)
-        with open(hop, "rb+") as fh:
-            os.fsync(fh.fileno())
         os.replace(hop, final)
     except BaseException:
         hop.unlink(missing_ok=True)
         raise
+    finally:
+        _rmdir_if_empty_tmp(hop_dir)
     tmp.unlink(missing_ok=True)
 
 
@@ -747,6 +861,97 @@ def _version_fields(
     if converter_version is not None:
         out["converter_version"] = converter_version
     return out
+
+
+def _group_files(directory: Path, group_key: str) -> list[tuple[Path, dict, int]]:
+    """``(path, footer, rows)`` of the files of ``group_key``, one open each."""
+    if not directory.is_dir():
+        return []
+    pattern = re.compile(rf"^{re.escape(group_key)}(?:-(\d{{3}}))?\.parquet$")
+    found = []
+    for path in sorted(directory.glob("*.parquet")):
+        if not pattern.match(path.name):
+            continue
+        try:
+            meta = pq.ParquetFile(path).metadata
+        except (OSError, pa.ArrowException):
+            continue
+        footer = footer_from_metadata(meta)
+        if footer.get(META_FILE_KEY) == group_key:
+            found.append((path, footer, meta.num_rows))
+    return found
+
+
+def _canonical_type(conn, dtype: str | pl.DataType) -> str:
+    """DuckDB's canonical name of a type given as a DuckDB name or a Polars dtype."""
+    name = dtype if isinstance(dtype, str) else _duckdb_type(dtype)
+    try:
+        return conn.execute(f"SELECT typeof(CAST(NULL AS {name}))").fetchone()[0]
+    except Exception as exc:  # duckdb.Error
+        raise LakeError(f"schema: unknown type {dtype!r}") from exc
+
+
+def _describe(conn, source: str) -> dict[str, str]:
+    """``{column: type}`` of ``read_parquet(source)``; ``source`` is a SQL literal."""
+    rows = conn.execute(
+        f"DESCRIBE SELECT * FROM read_parquet({source}, hive_partitioning=false, "
+        "union_by_name=true)"
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _needs_schema(present: Mapping[str, str], wanted: Mapping[str, str]) -> bool:
+    return any(present.get(c) != t for c, t in wanted.items())
+
+
+def _with_schema(present: Mapping[str, str], wanted: Mapping[str, str]) -> dict:
+    return {**present, **wanted}
+
+
+def _schema_select(present: Mapping[str, str], wanted: Mapping[str, str]) -> str:
+    """Select list casting the ``wanted`` columns (nulls for a missing one)."""
+    items = [
+        f"CAST({_ident(c)} AS {t}) AS {_ident(c)}"
+        if c in present
+        else f"CAST(NULL AS {t}) AS {_ident(c)}"
+        for c, t in wanted.items()
+    ]
+    items += [_ident(c) for c in present if c not in wanted]
+    return ", ".join(items)
+
+
+def _check_same_schema(
+    key: str, desc: Mapping[str, str], reference: Mapping[str, str], label: str
+) -> None:
+    """Refuse a member whose columns or types differ from the group's."""
+    for column, kind in desc.items():
+        if column not in reference:
+            raise LakeError(
+                f"member {key!r} has column {column!r} ({kind}) that the group "
+                f"({label}) does not have; declare it in `schema` to fill it with "
+                "nulls in the others"
+            )
+        if reference[column] != kind:
+            raise LakeError(
+                f"member {key!r}: column {column!r} is {kind} but the group "
+                f"({label}) has {reference[column]}; declare the type in `schema` "
+                "to cast every member to it"
+            )
+    for column, kind in reference.items():
+        if column not in desc:
+            raise LakeError(
+                f"member {key!r} has no column {column!r} ({kind} in the group, "
+                f"{label}); declare it in `schema` to fill it with nulls"
+            )
+
+
+def _refuse_member_named(src: Path, names: Iterable[str], own: set[str]) -> None:
+    """A data column with the name of a member column would be silently lost."""
+    if clash := sorted(own.intersection(names)):
+        raise LakeError(
+            f"{src.name}: data column(s) {clash} have the name of a member column "
+            "(or of the provenance column); rename them in the member's data"
+        )
 
 
 # --- writer ------------------------------------------------------------------------
@@ -797,6 +1002,7 @@ class LakeWriter:
         )
         self.force = force
         self.max_part_bytes = max_part_bytes
+        _remove_stale_staging()
 
     # -- public API --
 
@@ -1160,8 +1366,9 @@ class LakeWriter:
     ) -> bool:
         """Whether :meth:`write_group` would skip this group.
 
-        Hashes the raw files and reads the footers, nothing else: a converter
-        can ask before decoding anything. Always ``False`` with ``force``.
+        Hashes the raw files and reads the footer once, nothing else: a
+        converter can ask before decoding anything. Always ``False`` with
+        ``force``.
         """
         if self.force:
             return False
@@ -1186,8 +1393,11 @@ class LakeWriter:
         converter_version: str | None = None,
         prune: bool = True,
         sort_by: Sequence[str] | None = None,
+        schema: Mapping[str, str | pl.DataType] | None = None,
+        replaces: Sequence[str] = (),
+        replace_partition: bool = False,
     ) -> GroupWriteResult:
-        """Write all the members of a group into ``<group_key>[-NNN].parquet``, once.
+        """Write all the members of a group into ``<group_key>.parquet``, once.
 
         The group is the set of raw files of one partition that share a Parquet.
         ``members`` is the complete list: the group is skipped when every member
@@ -1199,33 +1409,56 @@ class LakeWriter:
           from the existing file; only the changed ones are read from their
           ``data`` (a function is called only then).
         * With ``prune`` (the default), a member of the existing file that is no
-          longer in ``members`` is dropped from the rows and the footer. Pass
-          ``prune=False`` to write a partial list that only adds or replaces.
+          longer in ``members`` is dropped from the rows and the footer, and
+          listed in ``removed``. With ``prune=False`` the list may be partial:
+          the members of the file that are not in it are carried over untouched.
+          ``prune=False`` refuses (``LakeError``) to rewrite a file that is not
+          in a usable state (see below), since it could not carry its members.
         * ``contract_version`` and ``converter_version`` are recorded in each
           written member's entry. When given, a member counts as current only
           if its entry has the same value; an entry from before the versions
           were recorded has none and is therefore rewritten. When ``None``, the
           versions are not compared.
-        * A changed member's ``columns`` (``uf``, ``mes``...) also make it
+        * A changed member's ``columns`` (``uf``, ``parte``...) also make it
           stale, and so does a different set of column names in the footer.
-        * An existing file that is not consistent (another layout version,
-          other member columns, members that do not add up to its rows, or
-          ``-NNN`` parts) is rewritten whole, as if every member had changed.
+        * An existing file that is not usable (another layout version, other
+          member columns, members that do not add up to its rows, or ``-NNN``
+          parts) is rewritten whole, as if every member had changed; with
+          ``prune`` the members it listed that are not in ``members`` are
+          reported in ``removed``.
+
+        Schema: a group holds one schema. The staged members are compared, by
+        column name and type, with each other and with the existing file; a
+        difference (a type, a missing or an extra column) is a ``LakeError``
+        naming the member, the column and both types, instead of a silent
+        upcast. ``schema`` (column -> DuckDB type name or Polars dtype) lifts
+        that for the columns it lists: every member (and the existing rows) is
+        cast to it, and a column a member lacks is filled with nulls.
 
         Memory: nothing is collected. A ``LazyFrame`` is streamed to a staged
         Parquet, a ``Path`` or :class:`DuckSource` goes through DuckDB, and the
         file is written by DuckDB from those staged files plus the kept rows
-        of the existing file, spilling to disk. The staging directory is
-        ``QUANTILICA_LAKE_SCRATCH`` when set (see :meth:`write_duckdb`).
+        of the existing file, spilling to disk. The staging and spill
+        directories are under ``QUANTILICA_LAKE_SCRATCH`` when set (see
+        :meth:`write_duckdb`), never in the lake.
 
         One file: a group is always a single ``<group_key>.parquet``.
         ``max_part_bytes`` does not apply to it (it is ignored, with a warning)
         and a set of ``-NNN`` parts left by an older run is replaced.
 
-        Order: rows come as the kept rows (in their file order) followed by the
-        written members, each member's rows contiguous. ``sort_by`` (column
-        names) adds an ``ORDER BY`` inside each part, which costs a sort with
-        spill to disk; leave it out for a large group.
+        Order: without ``sort_by`` the rows are written with
+        ``preserve_insertion_order`` off, so the order of the rows, and of the
+        members among themselves, is not guaranteed (a member's rows are not
+        necessarily contiguous). ``sort_by`` (column names) adds an
+        ``ORDER BY``, which costs a sort with spill to disk.
+
+        Migration: ``replaces`` (file keys of per-raw-file Parquets of the same
+        partition) or ``replace_partition`` (every other Parquet directly in the
+        partition) are deleted after the group is published, under the same
+        lock, so the rows are not doubled. Only files whose footer has this
+        dataset's ``source_id`` and ``dataset_id`` are removed; they are listed
+        in ``replaced``. A skipped group also removes them (a rerun after a
+        crash between the publish and the removal).
 
         The dataset lock is held while the members' ``data`` are evaluated.
         """
@@ -1244,35 +1477,80 @@ class LakeWriter:
                 converter_version,
                 prune,
             )
+            if plan.blocked:
+                raise LakeError(
+                    f"group {group_key!r}: the existing file is not in a usable "
+                    "state (another layout version, other member columns, rows that "
+                    "do not add up, or numbered parts); with prune=False its "
+                    "members cannot be carried over. Rewrite it with prune=True."
+                )
             if plan.is_current and not self.force:
                 logger.info("lake: group %s is current", group_key)
-                return GroupWriteResult(
-                    None, plan.state.parts, "skipped", kept=list(plan.kept)
+                result = GroupWriteResult(
+                    None,
+                    plan.state.parts,
+                    "skipped",
+                    kept=[*plan.kept, *plan.carried],
                 )
-            staging = self._staging_dir()
-            try:
-                result = self._group_convert(
-                    plan,
-                    staging,
-                    partitions=partitions,
-                    converter=converter,
-                    contract_version=contract_version,
-                    converter_version=converter_version,
-                    sort_by=list(sort_by or ()),
-                )
-            finally:
-                self._cleanup_staging(staging)
-            self._save_descriptor(partitions, None, converter)
-        logger.info(
-            "lake: group %s -> %d part(s), %d rows (%d written, %d kept, %d removed)",
-            group_key,
-            len(result.outputs),
-            result.rows,
-            len(result.written),
-            len(result.kept),
-            len(result.removed),
-        )
+            else:
+                staging = self._staging_dir()
+                try:
+                    result = self._group_convert(
+                        plan,
+                        staging,
+                        partitions=partitions,
+                        converter=converter,
+                        contract_version=contract_version,
+                        converter_version=converter_version,
+                        sort_by=list(sort_by or ()),
+                        schema=schema,
+                    )
+                finally:
+                    self._cleanup_staging(staging)
+                self._save_descriptor(partitions, None, converter)
+            result.replaced = self._remove_replaced(
+                plan.target, group_key, result.outputs, replaces, replace_partition
+            )
+        if result.status == "converted":
+            logger.info(
+                "lake: group %s -> %d rows (%d written, %d kept, %d removed)",
+                group_key,
+                result.rows,
+                len(result.written),
+                len(result.kept),
+                len(result.removed),
+            )
         return result
+
+    def _remove_replaced(
+        self,
+        target: Path,
+        group_key: str,
+        outputs: list[Path],
+        replaces: Sequence[str],
+        replace_partition: bool,
+    ) -> list[Path]:
+        """Delete the per-raw-file Parquets a published group replaces."""
+        if not replaces and not replace_partition:
+            return []
+        if replace_partition:
+            candidates = sorted(target.glob("*.parquet"))
+        else:
+            candidates = [p for key in replaces for p in _part_files(target, key)]
+        removed = []
+        for path in candidates:
+            if path in outputs or not path.is_file():
+                continue
+            meta = _footer(path)
+            if (
+                meta.get("quantilica.source_id") != self.descriptor.source_id
+                or meta.get("quantilica.dataset_id") != self.descriptor.dataset_id
+                or meta.get(META_FILE_KEY) == group_key
+            ):
+                continue
+            path.unlink()
+            removed.append(path)
+        return removed
 
     def _plan_group(
         self,
@@ -1290,6 +1568,11 @@ class LakeWriter:
         if clash := reserved.intersection(columns):
             raise ValueError(
                 f"member columns {sorted(clash)} clash with reserved names"
+            )
+        if clash := ENTRY_FIELDS.intersection(columns):
+            raise ValueError(
+                f"member columns {sorted(clash)} clash with the fields of a "
+                "quantilica.members entry"
             )
         digests: dict[Path, str] = {}
         resolved: list[tuple[GroupMember, str, str]] = []
@@ -1310,7 +1593,12 @@ class LakeWriter:
             if key in seen:
                 raise ValueError(f"duplicate member key {key!r} in group {group_key!r}")
             seen.add(key)
-            digest = member.sha256 or digests.setdefault(src, sha256_file(src))
+            if member.sha256:
+                digest = member.sha256
+            else:
+                if src not in digests:
+                    digests[src] = sha256_file(src)
+                digest = digests[src]
             resolved.append((member, key, digest))
         target = self._target(partitions)
         state = self._group_state(target, group_key, columns)
@@ -1328,51 +1616,66 @@ class LakeWriter:
                 kept.append(key)
             else:
                 changed.append(item)
-        orphans = sorted(set(state.members) - seen) if prune and state.members else []
+        if prune:
+            orphans = sorted(set(state.known) - seen)
+            carried: list[str] = []
+        else:
+            orphans = []
+            carried = sorted(set(state.members) - seen)
         return _GroupPlan(
-            target, group_key, state, resolved, columns, changed, kept, orphans
+            target,
+            group_key,
+            state,
+            resolved,
+            columns,
+            changed,
+            kept,
+            carried,
+            orphans,
+            blocked=not prune and bool(state.parts) and not state.usable,
         )
 
     def _group_state(
         self, target: Path, group_key: str, columns: list[str]
     ) -> _GroupState:
-        """The group as the lake holds it, or an empty state when it is not usable.
+        """The group as the lake holds it, reading each footer once.
 
         An existing file that is not a grouped file is an error. A grouped file
-        that is not consistent (see :meth:`write_group`) is reported as having
-        files but no members, so every member is rewritten and the files are
-        replaced.
+        that is not usable (see :meth:`write_group`) is reported with its files
+        and the keys its footer lists (``known``) but no ``members``, so every
+        member is rewritten and the files are replaced.
         """
-        parts = _part_files(target, group_key)
-        if not parts:
+        files = _group_files(target, group_key)
+        if not files:
             return _GroupState()
-        footers = [(part, _footer(part)) for part in parts]
-        for part, kv in footers:
+        for path, kv, _rows in files:
             if META_MEMBERS not in kv:
                 raise LakeError(
-                    f"{part.name} is not the grouped file {group_key!r} "
+                    f"{path.name} is not the grouped file {group_key!r} "
                     f"(file key {kv.get(META_FILE_KEY)!r}); refusing to overwrite it"
                 )
-        unusable = _GroupState(parts=parts)
-        if [p.name for p in parts] != [f"{group_key}.parquet"]:
-            return unusable  # numbered parts: only a rewrite settles them
+        parts = [path for path, _, _ in files]
+        known: set[str] = set()
         merged: dict[str, dict[str, Any]] = {}
-        try:
-            for part, kv in footers:
-                if kv.get(META_LAYOUT) != str(self.descriptor.layout_version):
-                    return unusable
-                if json.loads(kv.get(META_MEMBER_COLUMNS, "[]")) != columns:
-                    return unusable
+        usable = [path.name for path in parts] == [f"{group_key}.parquet"]
+        for _path, kv, rows in files:
+            try:
                 entries = json.loads(kv[META_MEMBERS])
-                rows = pq.ParquetFile(part).metadata.num_rows
+                known.update(entries)
+                if kv.get(META_LAYOUT) != str(self.descriptor.layout_version):
+                    usable = False
+                if json.loads(kv.get(META_MEMBER_COLUMNS, "[]")) != columns:
+                    usable = False
                 if sum(int(e.get("rows", 0)) for e in entries.values()) != rows:
-                    return unusable
+                    usable = False
                 if merged.keys() & entries.keys():
-                    return unusable
+                    usable = False
                 merged.update(entries)
-        except (ValueError, AttributeError, TypeError, OSError, pa.ArrowException):
-            return unusable
-        return _GroupState(merged, parts)
+            except (ValueError, AttributeError, TypeError):
+                usable = False
+        return _GroupState(
+            merged if usable else {}, parts, usable=usable, known=sorted(known)
+        )
 
     def _group_convert(
         self,
@@ -1384,16 +1687,23 @@ class LakeWriter:
         contract_version: int | None,
         converter_version: str | None,
         sort_by: list[str],
+        schema: Mapping[str, str | pl.DataType] | None,
     ) -> GroupWriteResult:
         group_key = plan.group_key
-        reserved = [*partitions, *self.descriptor.partition_keys, *plan.columns]
-        reserved = list(dict.fromkeys([*reserved, ORIGIN_COLUMN]))
+        reserved = [*partitions, *self.descriptor.partition_keys]
         work = staging / "duck"
         work.mkdir()
         conn = _connect(work)
         try:
+            if not sort_by:
+                conn.execute("SET preserve_insertion_order = false")
+            wanted = {
+                name: _canonical_type(conn, dtype)
+                for name, dtype in (schema or {}).items()
+            }
+            carried = [*plan.kept, *plan.carried]
             entries: dict[str, dict[str, Any]] = {
-                k: plan.state.members[k] for k in plan.kept
+                k: plan.state.members[k] for k in carried
             }
             staged: dict[str, Path] = {}
             for i, (member, key, digest) in enumerate(plan.changed):
@@ -1407,6 +1717,7 @@ class LakeWriter:
                     dict(member.columns),
                     reserved,
                     out,
+                    spill=work,
                 )
                 staged[key] = out
                 entries[key] = {
@@ -1417,22 +1728,45 @@ class LakeWriter:
                     **member.columns,
                     **_version_fields(contract_version, converter_version),
                 }
+            existing = (
+                "[" + ", ".join(_lit(str(p)) for p in plan.state.parts) + "]"
+                if carried
+                else None
+            )
+            carried_select = "*"
+            reference: dict[str, str] | None = None
+            label = ""
+            if existing is not None:
+                reference = _describe(conn, existing)
+                label = "the existing file"
+                if wanted and _needs_schema(reference, wanted):
+                    carried_select = _schema_select(reference, wanted)
+                    reference = _with_schema(reference, wanted)
+            for key in sorted(staged):
+                desc = _describe(conn, _lit(str(staged[key])))
+                if wanted and _needs_schema(desc, wanted):
+                    staged[key] = self._cast_staged(
+                        conn, staged[key], desc, wanted, staging
+                    )
+                    desc = _with_schema(desc, wanted)
+                if reference is None:
+                    reference, label = desc, f"member {key!r}"
+                else:
+                    _check_same_schema(key, desc, reference, label)
 
             def order_of(k: str) -> tuple:
                 return tuple(entries[k].get(c) for c in plan.columns), k
 
-            order_kept = sorted(plan.kept, key=order_of)
             order_new = sorted(staged, key=order_of)
             meta = self._metadata(group_key, None, None, None, converter)
             meta[META_MEMBER_COLUMNS] = json.dumps(plan.columns)
             meta[META_MEMBERS] = json.dumps(entries, sort_keys=True, ensure_ascii=False)
             tmp_out = staging / f"{group_key}.parquet{TMP_SUFFIX}"
             branches = []
-            if plan.kept:
-                existing = "[" + ", ".join(_lit(str(p)) for p in plan.state.parts) + "]"
-                conn.register("keep", pa.table({"k": order_kept}))
+            if carried:
+                conn.register("keep", pa.table({"k": sorted(carried)}))
                 branches.append(
-                    f"SELECT * FROM read_parquet({existing}, "
+                    f"SELECT {carried_select} FROM read_parquet({existing}, "
                     "hive_partitioning=false, union_by_name=true) "
                     f"WHERE {_ident(ORIGIN_COLUMN)} IN (SELECT k FROM keep)"
                 )
@@ -1467,9 +1801,27 @@ class LakeWriter:
             "converted",
             total,
             written=list(staged),
-            kept=list(plan.kept),
+            kept=list(carried),
             removed=list(plan.orphans),
         )
+
+    @staticmethod
+    def _cast_staged(
+        conn,
+        path: Path,
+        present: dict[str, str],
+        wanted: dict[str, str],
+        staging: Path,
+    ) -> Path:
+        """Rewrite a staged member with the columns of ``wanted`` cast to it."""
+        out = path.with_name(path.name + ".cast")
+        conn.execute(
+            f"COPY (SELECT {_schema_select(present, wanted)} FROM "
+            f"read_parquet({_lit(str(path))}, hive_partitioning=false)) "
+            f"TO {_lit(str(out))} (FORMAT parquet, COMPRESSION zstd)"
+        )
+        path.unlink()
+        return out
 
     def _stage_member(
         self,
@@ -1480,14 +1832,23 @@ class LakeWriter:
         columns: dict[str, str],
         reserved: list[str],
         out: Path,
+        *,
+        spill: Path | None = None,
     ) -> int:
-        """Write the member's rows, with its columns and ``_origem``, to ``out``."""
+        """Write the member's rows, with its columns and ``_origem``, to ``out``.
+
+        Partition keys among the data columns are dropped (they live in the
+        folder); a data column named like a member column or ``_origem`` is an
+        error.
+        """
+        own = {*columns, ORIGIN_COLUMN}
         if isinstance(data, pl.LazyFrame | pl.DataFrame):
             names = (
                 data.collect_schema().names()
                 if isinstance(data, pl.LazyFrame)
                 else data.columns
             )
+            _refuse_member_named(src, names, own)
             frame = data.drop([c for c in reserved if c in names])
             remaining = (
                 frame.collect_schema().names()
@@ -1501,7 +1862,8 @@ class LakeWriter:
                 pl.lit(key, dtype=pl.String).alias(ORIGIN_COLUMN),
             )
             if isinstance(frame, pl.LazyFrame):
-                frame.sink_parquet(out, compression="zstd")  # streaming, no collect
+                with _polars_spill_in(spill):
+                    frame.sink_parquet(out, compression="zstd")  # streaming
             else:
                 frame.write_parquet(out, compression="zstd")
         elif isinstance(data, Path | DuckSource):
@@ -1514,6 +1876,7 @@ class LakeWriter:
                 r[0]
                 for r in conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
             ]
+            _refuse_member_named(src, names, own)
             drop = [c for c in reserved if c in names]
             if len(drop) == len(names):
                 raise LakeError(f"{src.name}: no payload columns to write")
@@ -1554,7 +1917,7 @@ class LakeWriter:
         scratch = os.environ.get(LAKE_SCRATCH_ENV)
         if scratch:
             Path(scratch).mkdir(parents=True, exist_ok=True)
-            return Path(tempfile.mkdtemp(dir=scratch, prefix="lake-stage-"))
+            return Path(tempfile.mkdtemp(dir=scratch, prefix=STAGE_PREFIX))
         base = self.dataset_dir / TMP_DIRNAME
         base.mkdir(parents=True, exist_ok=True)
         return Path(tempfile.mkdtemp(dir=base))
@@ -1638,6 +2001,19 @@ class LakeWriter:
                     f"{path.name} already belongs to file key {owner!r}; "
                     f"refusing to overwrite it with {key!r}"
                 )
+        hop_dir = self.dataset_dir / TMP_DIRNAME
+        if len(staged) > 1:
+            # Parts staged on another volume (the scratch) are first copied next
+            # to the destination, so the renames below run back to back and the
+            # window in which old and new parts coexist stays short.
+            moved = []
+            for tmp in staged:
+                if _same_volume(tmp, target):
+                    moved.append(tmp)
+                else:
+                    moved.append(_copy_to(tmp, hop_dir))
+                    tmp.unlink(missing_ok=True)
+            staged = moved
         # Highest part first: a partial publish never looks like a complete set.
         for tmp, final in reversed(list(zip(staged, outputs, strict=True))):
             self._move(tmp, final)
@@ -1645,6 +2021,7 @@ class LakeWriter:
         for orphan in _part_files(target, key):
             if orphan not in keep:
                 orphan.unlink()
+        _rmdir_if_empty_tmp(hop_dir)
         return outputs
 
     def _save_descriptor(
