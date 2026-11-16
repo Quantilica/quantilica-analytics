@@ -71,6 +71,25 @@ def test_tasks_follow_converter_dataset_ids_not_folder_names(tmp_path):
     assert "docs" not in summary.sources
 
 
+def test_build_leaves_other_folders_of_the_lake_root_alone(tmp_path):
+    # O lake pode guardar o retrato do ledger ao lado das fontes.
+    control = tmp_path / "control"
+    _raw(tmp_path, "src")
+    lake = tmp_path / "lake"
+    (lake / "ledger").mkdir(parents=True)
+    snapshot = lake / "ledger" / "ledger-vigente-latest.jsonl.gz"
+    snapshot.write_bytes(b"retrato")
+    conv = FakeConverter("src", ["a"], control)
+
+    summary = _build(tmp_path, {"src": conv})
+    again = _build(tmp_path, {"src": conv})
+
+    assert not summary.has_errors and not again.has_errors
+    assert list(summary.sources) == ["src"]
+    assert snapshot.read_bytes() == b"retrato"
+    assert sorted(p.name for p in lake.iterdir()) == [".build", "ledger", "src"]
+
+
 def test_failures_are_isolated_recorded_and_retried(tmp_path):
     control = tmp_path / "control"
     _raw(tmp_path, "src")

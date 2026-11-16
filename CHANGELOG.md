@@ -7,7 +7,10 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Corrigido
 
+- `lake build`: a checagem de espaço em disco segue os links. A estimativa passa a ser feita por volume de destino real: a pasta de cada fonte no lake é resolvida (`realpath`, o que cobre link simbólico e junção do Windows) e as fontes são agrupadas pelo volume onde estão. Antes, tudo era comparado com o espaço livre do volume da raiz do lake, e uma fonte que mora noutro volume por um link fazia o build se recusar a começar embora o destino real tivesse espaço. O scratch continua à parte: no volume do `--scratch`, ou, sem ele, somado ao volume de cada fonte. O erro (`InsufficientDiskError`) diz qual volume não comporta a sua parte, quais fontes caem nele e quanto falta.
+- `lake_audit`: pastas da raiz do lake que não são fonte são ignoradas, sem achado e sem contar em `datasets` ou `parquets`: as que começam com `.` ou `_`, e as que não têm `_dataset.json` nem Parquet em nenhum nível (por exemplo `ledger/`, com o retrato do ledger em `.jsonl.gz`). Uma pasta com Parquets e sem nenhum descritor continua sendo varrida (é uma fonte que perdeu os descritores). Quem nomeia a pasta em `sources` a varre de qualquer jeito.
 
 ## [0.12.1] - 2026-11-16
 

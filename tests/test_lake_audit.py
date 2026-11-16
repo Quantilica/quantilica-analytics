@@ -71,6 +71,64 @@ def test_without_input_skips_provenance_and_coverage(corpus) -> None:
     assert "não executada" in report.checks["cobertura"]
 
 
+def _plant_aux_folders(corpus) -> None:
+    """What the lake root may hold besides the sources."""
+    import gzip
+
+    ledger = corpus.lake / "ledger"
+    ledger.mkdir()
+    with gzip.open(ledger / "ledger-vigente-latest.jsonl.gz", "wt") as fh:
+        fh.write(json.dumps({"path": "alfa/x.csv", "sha256": "a" * 64}) + "\n")
+    (corpus.lake / ".build").mkdir()
+    (corpus.lake / ".build" / "20261116T000000Z.jsonl").write_text("{}\n")
+    aux = corpus.lake / "_auxiliar"
+    aux.mkdir()
+    (aux / "lixo.parquet").write_bytes(b"not a parquet")
+
+
+def test_folders_at_the_root_that_are_not_sources_are_ignored(corpus) -> None:
+    before = audit(corpus)
+    _plant_aux_folders(corpus)
+    (corpus.lake / "vazia").mkdir()
+    (corpus.lake / "arquivos").mkdir()
+    (corpus.lake / "arquivos" / "sub").mkdir()
+    (corpus.lake / "arquivos" / "sub" / "dados.csv").write_text("a\n1\n")
+
+    report = audit(corpus)
+
+    assert report.ok, report.to_text()
+    assert report.counts == before.counts
+    assert report.datasets.keys() == before.datasets.keys()
+    assert report.links == []
+
+
+def test_folder_without_descriptor_but_with_parquets_is_still_reported(corpus) -> None:
+    # Uma fonte que perdeu todos os descritores é defeito, não pasta auxiliar.
+    (corpus.lake / "orfa" / "dados").mkdir(parents=True)
+    (corpus.lake / "orfa" / "dados" / "p.parquet").write_bytes(b"not a parquet")
+
+    report = audit(corpus, readers=False)
+
+    assert paths(report, "parquet_corrompido") == ["orfa/dados/p.parquet"]
+
+
+def test_naming_an_auxiliary_folder_in_sources_scans_it(corpus) -> None:
+    _plant_aux_folders(corpus)
+    assert audit(corpus, sources=["alfa"], readers=False).ok
+    report = audit(corpus, sources=["_auxiliar"], readers=False)
+    assert paths(report, "fora_do_layout") == ["_auxiliar/lixo.parquet"]
+
+
+def test_ledger_folder_in_the_lake_does_not_disturb_ledger_option(corpus) -> None:
+    _plant_aux_folders(corpus)
+    snapshot = corpus.lake / "ledger" / "ledger-vigente-latest.jsonl.gz"
+    assert snapshot.exists()
+    # O ledger da opção `ledger=` é outro arquivo; a pasta `ledger/` não vira fonte.
+    report = audit(corpus, sources=None)
+    assert report.ok, report.to_text()
+    assert "ledger" not in {s for s, _ in (k.split("/") for k in report.datasets)}
+
+
 def test_missing_dirs_raise(tmp_path: Path) -> None:
     with pytest.raises(NotADirectoryError):
         lake_audit(tmp_path / "nada")

@@ -50,6 +50,11 @@ junctions are never counted twice: one that points inside the lake is skipped
 (its target is reached in place), and one that points outside is followed once
 per real destination.
 
+Folders at the lake root that are not sources (a name starting with ``.`` or
+``_``, such as ``.build``; or no ``_dataset.json`` and no Parquet at any level,
+such as a ``ledger`` folder with a ledger snapshot) are ignored: no finding, and
+not counted. Naming one in ``sources`` scans it anyway.
+
 Ledger export
 -------------
 ``ledger`` is a UTF-8 file with one raw file per record, a path relative to
@@ -98,6 +103,7 @@ from quantilica.core.lake import (
 from quantilica.core.manifests import MANIFEST_SIDECAR_SUFFIX, read_manifest_sidecar
 
 from quantilica.analytics.lake import (
+    DESCRIPTOR_FILENAME,
     META_FILE_KEY,
     META_MEMBERS,
     META_ORIGIN_SHA,
@@ -355,8 +361,56 @@ def _has_files(directory: Path) -> bool:
     return False
 
 
+def _has_descriptor_or_parquet(directory: Path) -> bool:
+    """Whether ``directory`` holds a ``_dataset.json`` or a Parquet at any level.
+
+    Stops at the first one, so a real source costs a couple of listings; links
+    are followed, once per real destination.
+    """
+    seen: set[str] = set()
+    stack = [str(directory)]
+    while stack:
+        current = stack.pop()
+        real = os.path.realpath(current)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.name == DESCRIPTOR_FILENAME or entry.name.endswith(
+                        ".parquet"
+                    ):
+                        return True
+                    if entry.is_dir():
+                        stack.append(entry.path)
+        except OSError:
+            continue
+    return False
+
+
+def _is_lake_source(entry: os.DirEntry[str]) -> bool:
+    """Whether a folder at the lake root is a source and not an auxiliary one.
+
+    The root may hold other things next to the sources: ``ledger/`` (the ledger
+    snapshot), ``.build/`` (the build state), anything prefixed with ``_``. A
+    folder is auxiliary when its name starts with ``.`` or ``_``, or when it has
+    no ``_dataset.json`` and no Parquet at any level. A folder with Parquets but
+    no descriptor is still scanned: it is a source that lost its descriptors, a
+    defect to report.
+    """
+    if entry.name.startswith((".", "_")):
+        return False
+    return _has_descriptor_or_parquet(Path(entry.path))
+
+
 def _scan_lake(lake_dir: Path, sources: Collection[str] | None) -> _LakeScan:
-    """Walk the lake once: Parquets, leftovers and datasets, links counted once."""
+    """Walk the lake once: Parquets, leftovers and datasets, links counted once.
+
+    Without ``sources``, the folders at the root that are not sources (see
+    :func:`_is_lake_source`) are skipped; naming a folder in ``sources`` scans
+    it whatever it holds.
+    """
     scan = _LakeScan()
     root_real = Path(os.path.realpath(lake_dir))
     visited: set[Path] = {root_real}
@@ -382,6 +436,8 @@ def _scan_lake(lake_dir: Path, sources: Collection[str] | None) -> _LakeScan:
                 if name.startswith("."):  # .build, .lock...
                     continue
                 if not rel and sources is not None and name not in sources:
+                    continue
+                if not rel and sources is None and not _is_lake_source(entry):
                     continue
                 if _is_link(entry):
                     target = Path(os.path.realpath(entry.path))
