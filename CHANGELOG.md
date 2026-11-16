@@ -7,6 +7,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+
+## [0.12.2] - 2026-11-16
 ### Corrigido
 
 - `lake build`: a checagem de espaço em disco segue os links. A estimativa passa a ser feita por volume de destino real: a pasta de cada fonte no lake é resolvida (`realpath`, o que cobre link simbólico e junção do Windows) e as fontes são agrupadas pelo volume onde estão. Antes, tudo era comparado com o espaço livre do volume da raiz do lake, e uma fonte que mora noutro volume por um link fazia o build se recusar a começar embora o destino real tivesse espaço. O scratch continua à parte: no volume do `--scratch`, ou, sem ele, somado ao volume de cada fonte. O erro (`InsufficientDiskError`) diz qual volume não comporta a sua parte, quais fontes caem nele e quanto falta.
