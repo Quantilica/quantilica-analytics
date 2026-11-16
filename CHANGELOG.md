@@ -7,6 +7,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+## [0.13.0] - 2026-11-16
+
 ### Adicionado
 
 - Marcadores de publicação para um lake numa pasta sincronizada por um cliente de nuvem, escrito por uma máquina e lido por outra, sem escrever nele (módulo novo `quantilica.analytics.lake_publish`). O cliente envia os arquivos em ordem qualquer, então quem lê precisa de um critério próprio de "publicado":
