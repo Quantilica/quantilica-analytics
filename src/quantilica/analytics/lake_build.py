@@ -334,39 +334,72 @@ def _existing_ancestor(path: Path) -> Path:
     return probe
 
 
+def _volume_of(path: Path) -> object:
+    """Identity of the volume that holds ``path`` (an existing path)."""
+    return os.stat(path).st_dev
+
+
+@dataclass
+class _VolumeNeed:
+    """What one run asks of one volume."""
+
+    probe: Path
+    required: int = 0
+    names: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+
+    def add(self, amount: int, name: str, source: str | None = None) -> None:
+        self.required += amount
+        if name not in self.names:
+            self.names.append(name)
+        if source is not None and source not in self.sources:
+            self.sources.append(source)
+
+
 def _check_disk(
     lake_dir: Path,
     scratch: Path | None,
-    pending_bytes: int,
+    source_bytes: Mapping[str, int],
     disk_factor: float,
     scratch_factor: float,
 ) -> None:
     """Raise :class:`InsufficientDiskError` if the volumes cannot hold the run.
 
-    The lake needs ``pending_bytes * disk_factor``. Scratch work needs
-    ``pending_bytes * scratch_factor``, on the scratch volume, or on the lake's
-    when there is no scratch directory or it shares the volume.
+    ``source_bytes`` is the pending raw data of each source. Each source needs
+    ``bytes * disk_factor`` on the volume where its folder really is: a source
+    folder that is a link (a symbolic link, a Windows junction) counts on the
+    volume it points to, not on the one of the lake root. Scratch work needs
+    ``bytes * scratch_factor``, on the scratch volume, or on the volume of the
+    source it works for when there is no scratch directory; a volume is counted
+    once, whoever uses it.
     """
-    lake_probe = _existing_ancestor(lake_dir)
-    need: dict[Path, tuple[int, list[str]]] = {
-        lake_probe: (int(pending_bytes * disk_factor), ["lake"])
-    }
-    scratch_need = int(pending_bytes * scratch_factor)
-    scratch_probe = _existing_ancestor(scratch) if scratch is not None else lake_probe
-    if scratch_probe == lake_probe or (
-        os.stat(scratch_probe).st_dev == os.stat(lake_probe).st_dev
-    ):
-        total, names = need[lake_probe]
-        need[lake_probe] = (total + scratch_need, names + ["scratch"])
-    else:
-        need[scratch_probe] = (scratch_need, ["scratch"])
-    for probe, (required, names) in need.items():
-        free = shutil.disk_usage(probe).free
-        if free < required:
+    needs: dict[object, _VolumeNeed] = {}
+
+    def need_for(path: Path) -> _VolumeNeed:
+        probe = _existing_ancestor(path)  # resolves links
+        return needs.setdefault(_volume_of(probe), _VolumeNeed(probe))
+
+    scratch_total = 0
+    for source, size in source_bytes.items():
+        here = need_for(lake_dir / source)
+        here.add(int(size * disk_factor), "lake", source)
+        scratch_need = int(size * scratch_factor)
+        if scratch is None:
+            here.add(scratch_need, "scratch")
+        else:
+            scratch_total += scratch_need
+    if scratch is not None:
+        need_for(scratch).add(scratch_total, "scratch")
+    pending_bytes = sum(source_bytes.values())
+    for need in needs.values():
+        free = shutil.disk_usage(need.probe).free
+        if free < need.required:
+            where = f" (sources: {', '.join(need.sources)})" if need.sources else ""
             raise InsufficientDiskError(
-                f"not enough free space for {' + '.join(names)} on {probe}: "
-                f"{free / 1e9:.1f} GB free, about {required / 1e9:.1f} GB needed "
-                f"for {pending_bytes / 1e9:.1f} GB of pending raw data "
+                f"not enough free space for {' + '.join(need.names)} on "
+                f"{need.probe}{where}: {free / 1e9:.1f} GB free, about "
+                f"{need.required / 1e9:.1f} GB needed there for "
+                f"{pending_bytes / 1e9:.1f} GB of pending raw data in all "
                 f"(disk_factor={disk_factor}, scratch_factor={scratch_factor}); "
                 "free space or pass check_disk=False to ignore"
             )
@@ -930,7 +963,8 @@ def lake_build(
 
     # Maiores fontes primeiro; dentro da fonte vale a ordem do conversor.
     pending.sort(key=lambda t: -t.size)
-    pending_bytes = sum({t.source: t.size for t in pending}.values())
+    source_bytes = {t.source: t.size for t in pending}
+    pending_bytes = sum(source_bytes.values())
     logger.info(
         "lake build %s%s: %d tasks (%d already done), %.1f GB raw, %d processes",
         summary.run_id,
@@ -941,7 +975,7 @@ def lake_build(
         workers,
     )
     if check_disk:
-        _check_disk(lake_path, scratch_path, pending_bytes, disk_factor, scratch_factor)
+        _check_disk(lake_path, scratch_path, source_bytes, disk_factor, scratch_factor)
     build_dir.mkdir(parents=True, exist_ok=True)
     if resume is not None:
         _end_with_newline(path)

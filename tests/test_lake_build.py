@@ -243,6 +243,103 @@ def test_disk_precheck_can_be_ignored_and_counts_scratch(tmp_path, monkeypatch):
     assert not summary.has_errors
 
 
+def _two_volumes(monkeypatch, other: Path, *, free_here: int, free_other: int):
+    """Dois volumes: tudo sob ``other`` está num volume à parte."""
+
+    def volume(path):
+        return (
+            "other" if Path(path).resolve().is_relative_to(other.resolve()) else "main"
+        )
+
+    def usage(path):
+        free = free_other if volume(path) == "other" else free_here
+        return _Usage(10**13, 10**13 - free, free)
+
+    monkeypatch.setattr(lb, "_volume_of", volume)
+    monkeypatch.setattr(lb.shutil, "disk_usage", usage)
+
+
+def _linked_source(tmp_path: Path, name: str, size: int) -> tuple[Path, Path]:
+    """Raw de ``name`` com ``size`` bytes e a pasta da fonte no lake como link."""
+    raw = _raw(tmp_path, name)
+    (raw / name / "big.bin").write_bytes(b"x" * size)
+    target = tmp_path / "volume-b" / name
+    target.mkdir(parents=True)
+    lake = tmp_path / "lake"
+    lake.mkdir(exist_ok=True)
+    (lake / name).symlink_to(target, target_is_directory=True)
+    return raw, target
+
+
+@pytest.mark.skipif(WINDOWS, reason="link simbólico exige privilégio no Windows")
+def test_disk_precheck_follows_source_links_to_their_volume(tmp_path, monkeypatch):
+    control = tmp_path / "control"
+    _linked_source(tmp_path, "linked", 10_000)
+    _raw(tmp_path, "plain")
+    (tmp_path / "input" / "plain" / "big.bin").write_bytes(b"x" * 1_000)
+    convs = {
+        "linked": FakeConverter("linked", ["a"], control),
+        "plain": FakeConverter("plain", ["a"], control),
+    }
+    # O volume do lake só comporta a fonte pequena; o link vai para um volume
+    # folgado. A estimativa total (11 KB) nunca caberia no volume do lake.
+    _two_volumes(monkeypatch, tmp_path / "volume-b", free_here=2_000, free_other=20_000)
+
+    summary = _build(tmp_path, convs, disk_factor=1.0, scratch_factor=0.0)
+
+    assert not summary.has_errors
+    assert (tmp_path / "volume-b" / "linked" / "a" / "part.txt").exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="link simbólico exige privilégio no Windows")
+def test_disk_precheck_names_the_volume_that_does_not_fit(tmp_path, monkeypatch):
+    control = tmp_path / "control"
+    _linked_source(tmp_path, "linked", 10_000)
+    conv = FakeConverter("linked", ["a"], control)
+    other = tmp_path / "volume-b"
+    # O volume do lake está vazio de problemas; o do link não comporta a fonte.
+    _two_volumes(monkeypatch, other, free_here=10**12, free_other=5_000)
+
+    with pytest.raises(InsufficientDiskError) as caught:
+        _build(tmp_path, {"linked": conv}, disk_factor=1.0, scratch_factor=0.0)
+
+    message = str(caught.value)
+    assert str(other / "linked") in message
+    assert "sources: linked" in message
+    assert count_calls(control, "linked", "a") == 0
+
+
+@pytest.mark.skipif(WINDOWS, reason="link simbólico exige privilégio no Windows")
+def test_disk_precheck_counts_scratch_on_its_own_volume(tmp_path, monkeypatch):
+    raw = _raw(tmp_path, "src")
+    (raw / "src" / "big.bin").write_bytes(b"x" * 10_000)
+    scratch = tmp_path / "volume-b" / "scratch"
+    scratch.mkdir(parents=True)
+    # O lake cabe (10 KB em 10 KB); o scratch (5 KB) não cabe no seu volume.
+    _two_volumes(monkeypatch, tmp_path / "volume-b", free_here=10_000, free_other=4_000)
+
+    with pytest.raises(InsufficientDiskError, match="for scratch on .*volume-b"):
+        lb._check_disk(tmp_path / "lake", scratch, {"src": 10_000}, 1.0, 0.5)
+    # Sem scratch próprio, o scratch soma ao volume da fonte (10 KB + 5 KB > 10 KB).
+    with pytest.raises(InsufficientDiskError, match="lake \\+ scratch"):
+        lb._check_disk(tmp_path / "lake", None, {"src": 10_000}, 1.0, 0.5)
+
+
+@pytest.mark.skipif(WINDOWS, reason="link simbólico exige privilégio no Windows")
+def test_disk_precheck_sums_sources_that_share_a_linked_volume(tmp_path, monkeypatch):
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    shared = tmp_path / "volume-b"
+    for name in ("one", "two"):
+        (shared / name).mkdir(parents=True)
+        (lake / name).symlink_to(shared / name, target_is_directory=True)
+    _two_volumes(monkeypatch, shared, free_here=10**12, free_other=15_000)
+
+    lb._check_disk(lake, None, {"one": 7_000}, 1.0, 0.0)
+    with pytest.raises(InsufficientDiskError, match="sources: one, two"):
+        lb._check_disk(lake, None, {"one": 7_000, "two": 9_000}, 1.0, 0.0)
+
+
 def test_disk_precheck_skipped_when_nothing_is_pending(tmp_path, monkeypatch):
     control = tmp_path / "control"
     _raw(tmp_path, "src")
