@@ -595,43 +595,6 @@ def test_replaces_so_depois_de_publicar(tmp_path: Path) -> None:
     assert (_dataset(lake) / "ano=2024" / "m00.parquet").is_file()  # nada removido
 
 
-def test_limpa_staging_antigo_do_scratch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    scratch = tmp_path / "scratch"
-    old, fresh, other = (
-        scratch / n for n in ("lake-stage-old", "lake-stage-new", "tmpx")
-    )
-    for d in (old, fresh, other):
-        (d / "sub").mkdir(parents=True)
-    stamp = os.stat(old).st_mtime - 3 * 24 * 3600
-    for d in (old, other):
-        os.utime(d, (stamp, stamp))
-    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
-    _writer(tmp_path / "lake")
-    assert not old.exists() and fresh.exists() and other.exists()
-
-
-def test_spill_do_polars_vai_para_o_scratch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    scratch = tmp_path / "scratch"
-    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
-    monkeypatch.delenv("POLARS_TEMP_DIR", raising=False)
-    seen: list[str | None] = []
-    original = pl.LazyFrame.sink_parquet
-
-    def spy(self, path, *args, **kwargs):
-        seen.append(os.environ.get("POLARS_TEMP_DIR"))
-        return original(self, path, *args, **kwargs)
-
-    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", spy)
-    member = GroupMember(_raw(tmp_path, "a.csv"), pl.DataFrame({"v": [1]}).lazy())
-    _writer(tmp_path / "lake").write_group("g", [member], partitions=PARTS)
-    assert seen and Path(seen[0]).is_relative_to(scratch)
-    assert "POLARS_TEMP_DIR" not in os.environ  # restaurada
-
-
 def test_publicacao_decide_pelo_dispositivo_e_limpa_o_tmp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -665,7 +628,7 @@ def test_publicacao_decide_pelo_dispositivo_e_limpa_o_tmp(
 
     def flaky(src, dst, *a, **k):
         if Path(src).is_relative_to(scratch):
-            raise OSError(errno.EIO, "disco virtual")
+            raise OSError(errno.EINVAL, "disco virtual")
         return real(src, dst, *a, **k)
 
     monkeypatch.setattr(os, "replace", flaky)
@@ -979,3 +942,371 @@ def test_rodape_do_grupo_e_aberto_uma_vez_por_checagem(
     opened.clear()
     assert writer.write_group("g", members, partitions=PARTS).status == "skipped"
     assert len(opened) == 1
+
+
+# --- remoção segura (replaces), esquema com perda, scratch ---------------------
+
+
+def _per_raw(writer: LakeWriter, tmp_path: Path, name: str, rows: int, parts=PARTS):
+    src = _raw(tmp_path, name)
+    res = writer.write_polars(
+        pl.DataFrame({"valor": range(rows)}), src, partitions=parts
+    )
+    return src, res.output
+
+
+def test_replace_partition_nao_apaga_outro_grupo_da_mesma_particao(
+    tmp_path: Path, caplog
+) -> None:
+    lake = tmp_path / "lake"
+    writer = _writer(lake)
+    a_src, a_old = _per_raw(writer, tmp_path, "a@20260101.csv", 2)
+    b_members = [
+        GroupMember(_raw(tmp_path, f"b{i}.csv"), pl.DataFrame({"valor": [i]}))
+        for i in range(2)
+    ]
+    writer.write_group("outro", b_members, partitions=PARTS)
+    other_group = a_old.parent / "outro.parquet"
+    mine = [GroupMember(a_src, pl.DataFrame({"valor": [0, 1]}))]
+    with caplog.at_level("WARNING", logger="quantilica.analytics.lake"):
+        res = writer.write_group("meu", mine, partitions=PARTS, replace_partition=True)
+    assert [p.name for p in res.replaced] == ["a.parquet"]
+    assert [p.name for p in res.not_replaced] == ["outro.parquet"]
+    assert other_group.is_file() and not a_old.exists()
+    assert "grouped file" in caplog.text
+
+
+def test_replace_partition_em_dataset_sem_particao(tmp_path: Path) -> None:
+    lake = tmp_path / "lake"
+    writer = _writer(lake, keys=[])
+    src, old = _per_raw(writer, tmp_path, "a@20260101.csv", 2, parts={})
+    other = [GroupMember(_raw(tmp_path, "z.csv"), pl.DataFrame({"valor": [1]}))]
+    writer.write_group("grupo_z", other, partitions={})
+    res = writer.write_group(
+        "grupo_a",
+        [GroupMember(src, pl.DataFrame({"valor": [0, 1]}))],
+        partitions={},
+        replace_partition=True,
+    )
+    names = sorted(p.name for p in _dataset(lake).glob("*.parquet"))
+    assert names == ["grupo_a.parquet", "grupo_z.parquet"]
+    assert [p.name for p in res.not_replaced] == ["grupo_z.parquet"]
+    assert not old.exists()
+
+
+def test_replaces_com_chave_fora_do_grupo_fica_com_aviso(
+    tmp_path: Path, caplog
+) -> None:
+    writer = _writer(tmp_path / "lake")
+    a_src, a_old = _per_raw(writer, tmp_path, "a@20260101.csv", 2)
+    _c_src, c_old = _per_raw(writer, tmp_path, "c@20260101.csv", 3)
+    with caplog.at_level("WARNING", logger="quantilica.analytics.lake"):
+        res = writer.write_group(
+            "g",
+            [GroupMember(a_src, pl.DataFrame({"valor": [0, 1]}))],
+            partitions=PARTS,
+            replaces=["a", "c"],
+        )
+    assert [p.name for p in res.replaced] == ["a.parquet"]
+    assert [p.name for p in res.not_replaced] == ["c.parquet"]
+    assert c_old.is_file() and not a_old.exists()
+    assert "not a member of the group" in caplog.text
+
+
+def test_replaces_membro_de_zip_com_chave_composta_pelo_sha_do_zip(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path / "lake")
+    zip_src, zip_old = _per_raw(writer, tmp_path, "pacote@20260101.zip", 4)
+    members = [
+        GroupMember(
+            zip_src,
+            pl.DataFrame({"valor": [i]}),
+            key=composite_file_key(zip_src, f"p{i}.csv"),
+        )
+        for i in range(2)
+    ]
+    res = writer.write_group("g", members, partitions=PARTS, replaces=["pacote"])
+    assert [p.name for p in res.replaced] == ["pacote.parquet"]
+    assert not zip_old.exists()
+
+
+def test_grupo_pulado_nao_apaga_arquivo_cujo_sha_nao_e_membro(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path / "lake")
+    a_src, _ = _per_raw(writer, tmp_path, "a@20260101.csv", 2)
+    members = [GroupMember(a_src, pl.DataFrame({"valor": [0, 1]}))]
+    writer.write_group("g", members, partitions=PARTS, replaces=["a"])
+    # Depois, outro caminho grava um Parquet legítimo na mesma partição.
+    _x, later = _per_raw(writer, tmp_path, "tardio@20260201.csv", 5)
+    res = writer.write_group(
+        "g", members, partitions=PARTS, replace_partition=True, replaces=["tardio"]
+    )
+    assert res.status == "skipped" and res.replaced == []
+    assert [p.name for p in res.not_replaced] == ["tardio.parquet"]
+    assert later.is_file()
+
+
+def _two_types(tmp_path: Path, a_frame: pl.DataFrame, b_frame: pl.DataFrame, schema):
+    writer = _writer(tmp_path / "lake")
+    a = GroupMember(_raw(tmp_path, "a.csv"), a_frame)
+    b = GroupMember(_raw(tmp_path, "b.csv"), b_frame)
+    return writer, [a, b], schema
+
+
+@pytest.mark.parametrize(
+    ("frame", "schema", "target"),
+    [
+        (pl.DataFrame({"v": [1.5]}), {"v": "BIGINT"}, "BIGINT"),  # arredonda
+        (pl.DataFrame({"v": ["007"]}), {"v": "INTEGER"}, "INTEGER"),  # perde zeros
+        (pl.DataFrame({"v": ["abc"]}), {"v": "BIGINT"}, "BIGINT"),  # não cabe
+        (
+            pl.DataFrame({"v": [1.2345]}).cast({"v": pl.Decimal(10, 4)}),
+            {"v": "DECIMAL(10,2)"},
+            "DECIMAL(10,2)",
+        ),
+        (
+            pl.DataFrame({"v": [1]}).select(
+                pl.lit(__import__("datetime").datetime(2024, 1, 1, 13)).alias("v")
+            ),
+            {"v": "DATE"},
+            "DATE",
+        ),
+    ],
+)
+def test_schema_com_perda_e_recusado(tmp_path: Path, frame, schema, target) -> None:
+    ok = pl.DataFrame({"v": [1]}).cast({"v": frame.schema["v"]}) if False else None
+    writer = _writer(tmp_path / "lake")
+    member = GroupMember(_raw(tmp_path, "a.csv"), frame)
+    with pytest.raises(LakeError, match="loses information") as err:
+        writer.write_group("g", [member], partitions=PARTS, schema=schema)
+    assert "'v'" in str(err.value) and target in str(err.value)
+    assert ok is None
+    assert not list(_dataset(tmp_path / "lake").rglob("*.parquet"))
+
+
+def test_schema_que_alarga_passa_e_linhas_ja_gravadas_sao_verificadas(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path / "lake")
+    a = GroupMember(
+        _raw(tmp_path, "a.csv"),
+        pl.DataFrame({"v": [1, 2]}).cast({"v": pl.Int32}),
+    )
+    writer.write_group("g", [a], partitions=PARTS)
+    b = GroupMember(_raw(tmp_path, "b.csv"), pl.DataFrame({"v": [3]}))
+    res = writer.write_group("g", [a, b], partitions=PARTS, schema={"v": "BIGINT"})
+    assert pl.read_parquet(res.output).schema["v"] == pl.Int64
+    c = GroupMember(_raw(tmp_path, "c2.csv"), pl.DataFrame({"v": ["4"]}))
+    res = writer.write_group("g", [a, b, c], partitions=PARTS, schema={"v": "VARCHAR"})
+    assert sorted(pl.read_parquet(res.output)["v"].to_list()) == ["1", "2", "3", "4"]
+    # O esquema só vale quando o grupo é reescrito: em dia, pula.
+    again = writer.write_group("g", [a, b, c], partitions=PARTS, schema={"v": "DOUBLE"})
+    assert again.status == "skipped"
+    # Estreitar as linhas já gravadas ("007" não volta de BIGINT) é recusado.
+    x = GroupMember(_raw(tmp_path, "x.csv"), pl.DataFrame({"v": ["007"]}))
+    writer.write_group("h", [x], partitions=PARTS)
+    y = GroupMember(_raw(tmp_path, "y.csv"), pl.DataFrame({"v": [8]}))
+    with pytest.raises(LakeError, match="the existing file.*loses information"):
+        writer.write_group("h", [x, y], partitions=PARTS, schema={"v": "BIGINT"})
+
+
+def test_schema_com_nome_reservado_e_recusado(tmp_path: Path) -> None:
+    writer = _writer(tmp_path / "lake")
+    member = GroupMember(
+        _raw(tmp_path, "a.csv"), pl.DataFrame({"v": [1]}), columns={"uf": "sp"}
+    )
+    for name in ("ano", "uf", ORIGIN_COLUMN):
+        with pytest.raises(ValueError, match="schema cannot declare"):
+            writer.write_group(
+                "g", [member], partitions=PARTS, schema={name: "VARCHAR"}
+            )
+
+
+def test_timestamp_ns_e_coluna_nula_sao_normalizados(tmp_path: Path) -> None:
+    import datetime as dt
+
+    writer = _writer(tmp_path / "lake")
+    ts = dt.datetime(2024, 1, 2, 3, 4, 5)
+    a = GroupMember(
+        _raw(tmp_path, "a.csv"),
+        pl.DataFrame({"t": [ts], "v": [1]}).cast({"t": pl.Datetime("us")}),
+    )
+    b = GroupMember(
+        _raw(tmp_path, "b.csv"),
+        pl.DataFrame({"t": [ts], "v": [None]}).cast(
+            {"t": pl.Datetime("ns"), "v": pl.Null}
+        ),
+    )
+    res = writer.write_group("g", [a, b], partitions=PARTS)
+    df = pl.read_parquet(res.output)
+    assert df.schema["t"] == pl.Datetime("us") and df.schema["v"] == pl.Int64
+    assert df["v"].to_list().count(None) == 1
+    # Nanossegundos que não cabem em TIMESTAMP: a normalização é recusada.
+    c = GroupMember(
+        _raw(tmp_path, "c.csv"),
+        pl.DataFrame({"t": [123456789]})
+        .cast({"t": pl.Datetime("ns")})
+        .with_columns(v=pl.lit(1)),
+    )
+    with pytest.raises(LakeError, match="loses information"):
+        writer.write_group("g2", [a, c], partitions=PARTS)
+    # Outras divergências continuam sendo erro.
+    d = GroupMember(_raw(tmp_path, "d.csv"), pl.DataFrame({"t": ["x"], "v": [1]}))
+    with pytest.raises(LakeError, match="column 't'"):
+        writer.write_group("g3", [a, d], partitions=PARTS)
+
+
+def test_configure_scratch_uma_vez_por_processo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import atexit
+
+    import quantilica.analytics.lake as lake_mod
+
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
+    monkeypatch.delenv("POLARS_TEMP_DIR", raising=False)
+    monkeypatch.setattr(lake_mod, "_scratch_configured", False)
+    registered = []
+    monkeypatch.setattr(atexit, "register", lambda *a, **k: registered.append(a))
+    _writer(tmp_path / "lake")
+    spill = Path(os.environ["POLARS_TEMP_DIR"])
+    assert spill == scratch / f"polars-{os.getpid()}" and spill.is_dir()
+    assert registered and registered[0][0] is lake_mod.shutil.rmtree
+    # Segunda criação: nada novo.
+    monkeypatch.setenv("POLARS_TEMP_DIR", "/outro")
+    _writer(tmp_path / "lake2")
+    assert os.environ["POLARS_TEMP_DIR"] == "/outro" and len(registered) == 1
+    monkeypatch.delenv("POLARS_TEMP_DIR")  # o monkeypatch restaura o que havia
+
+
+def test_configure_scratch_respeita_variavel_ja_definida(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import quantilica.analytics.lake as lake_mod
+
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
+    monkeypatch.setenv("POLARS_TEMP_DIR", str(tmp_path / "meu"))
+    monkeypatch.setattr(lake_mod, "_scratch_configured", False)
+    _writer(tmp_path / "lake")
+    assert os.environ["POLARS_TEMP_DIR"] == str(tmp_path / "meu")
+    assert not list(scratch.glob("polars-*"))
+
+
+def test_limpeza_do_scratch_so_de_processo_morto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+    import subprocess
+    import sys
+
+    import quantilica.analytics.lake as lake_mod
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    host = socket.gethostname()
+
+    def make(name: str, owner: dict | None, days: float) -> Path:
+        d = scratch / name
+        d.mkdir()
+        if owner is not None:
+            (d / "owner.json").write_text(json.dumps(owner))
+        old = d.stat().st_mtime - days * 24 * 3600
+        os.utime(d, (old, old))
+        return d
+
+    gone = [
+        make("lake-stage-dead", {"pid": dead.pid, "hostname": host}, 2),
+        make("lake-work-dead", {"pid": dead.pid, "hostname": host}, 2),
+        make("lake-stage-sem-dono", None, 8),
+    ]
+    stays = [
+        make("lake-stage-vivo", {"pid": os.getpid(), "hostname": host}, 30),
+        make("lake-stage-recente", {"pid": dead.pid, "hostname": host}, 0.1),
+        make("lake-stage-outro-host", {"pid": dead.pid, "hostname": "outro"}, 30),
+        make("lake-stage-sem-dono-novo", None, 3),
+        make("tmp-de-outro-programa", {"pid": dead.pid, "hostname": host}, 30),
+    ]
+    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
+    monkeypatch.setattr(lake_mod, "_scratch_configured", False)
+    monkeypatch.setenv("POLARS_TEMP_DIR", "x")  # só a limpeza interessa aqui
+    _writer(tmp_path / "lake")
+    assert not any(d.exists() for d in gone)
+    assert all(d.exists() for d in stays)
+
+
+def test_o_staging_e_o_diretorio_de_trabalho_levam_dono(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
+    writer = _writer(tmp_path / "lake")
+    staging = writer._staging_dir()
+    owner = json.loads((staging / "owner.json").read_text())
+    assert owner["pid"] == os.getpid() and staging.name.startswith("lake-stage-")
+    import quantilica.analytics.lake as lake_mod
+
+    work = lake_mod._scratch_dir(staging)
+    assert work.name.startswith("lake-work-") and (work / "owner.json").is_file()
+
+
+def test_rename_com_erro_que_nao_e_de_volume_e_relancado(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import quantilica.analytics.lake as lake_mod
+
+    src = tmp_path / "a.tmp"
+    src.write_bytes(b"x")
+    final = tmp_path / "out" / "a.parquet"
+    final.parent.mkdir()
+
+    def boom(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "sem espaço")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError) as err:
+        lake_mod._durable_replace(src, final)
+    assert err.value.errno == errno.ENOSPC and src.exists() and not final.exists()
+
+    def denied(*args, **kwargs):
+        raise PermissionError(errno.EACCES, "arquivo aberto")
+
+    monkeypatch.setattr(os, "replace", denied)
+    with pytest.raises(PermissionError):
+        lake_mod._durable_replace(src, final)
+
+
+def test_publicacao_de_varias_partes_limpa_as_copias_se_uma_falhar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import quantilica.analytics.lake as lake_mod
+
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("QUANTILICA_LAKE_SCRATCH", str(scratch))
+    monkeypatch.setattr(
+        lake_mod, "_same_volume", lambda a, b: not Path(a).is_relative_to(scratch)
+    )
+    real = lake_mod._copy_to
+    calls = []
+
+    def flaky(tmp, hop_dir):
+        calls.append(tmp)
+        if len(calls) == 3:
+            raise OSError(errno.ENOSPC, "disco cheio")
+        return real(tmp, hop_dir)
+
+    monkeypatch.setattr(lake_mod, "_copy_to", flaky)
+    writer = _writer(tmp_path / "lake", max_part_bytes=2000)
+    src = _raw(tmp_path, "grande@20260101.csv")
+    frame = pl.DataFrame({"valor": [f"linha {i} " * 20 for i in range(400)]})
+    with pytest.raises(OSError, match="disco cheio"):
+        writer.write_polars(frame, src, partitions=PARTS)
+    assert len(calls) == 3
+    dataset = _dataset(tmp_path / "lake")
+    assert not list(dataset.rglob("*.parquet"))
+    assert not (dataset / ".tmp").exists()  # as duas cópias já feitas foram apagadas
