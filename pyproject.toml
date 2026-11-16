@@ -78,3 +78,6 @@ artifacts = ["src/quantilica/analytics/data/*.parquet"]
 [build-system]
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+required-version = ">=0.9"
