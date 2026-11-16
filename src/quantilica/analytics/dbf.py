@@ -75,12 +75,12 @@ def read_dbc(path: str | Path, *, encoding: str | None = None) -> pl.DataFrame:
     with tempfile.TemporaryDirectory() as tmp:
         dst = Path(tmp) / (src.stem + ".dbf")
         try:
-            import datasus_dbc
+            import datasus_dbc  # pyright: ignore[reportMissingImports]  # dependência opcional, fora do ambiente de dev
 
             datasus_dbc.decompress(str(src), str(dst))
         except ImportError:
             try:
-                import pyreaddbc
+                import pyreaddbc  # pyright: ignore[reportMissingImports]  # dependência opcional, fora do ambiente de dev
 
                 pyreaddbc.dbc2dbf(str(src), str(dst))
             except ImportError:

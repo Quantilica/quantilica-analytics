@@ -102,7 +102,7 @@ def _clean_number_text(value: str | None) -> str:
     return text
 
 
-def _normalize_number_column(column: pl.String) -> pl.String:
+def _normalize_number_column(column: pl.Series) -> pl.Series:
     """Rewrite one String column from Brazilian to canonical float text.
 
     The acceptable shapes (``1.234,56``, ``1234,56``, ``1234.56``, sentinels)
@@ -465,8 +465,9 @@ def read_csv_resilient(
         for i, cand in enumerate(encodings):
             call_kwargs = dict(kwargs)
             call_kwargs["encoding"] = _utf8_name(cand)
-            if hasattr(source, "seek"):
-                source.seek(0)
+            seek = getattr(source, "seek", None)
+            if seek is not None:
+                seek(0)
             try:
                 df = pl.read_csv(source, **call_kwargs)
             except (pl.exceptions.ComputeError, UnicodeDecodeError, ValueError) as exc:
@@ -525,6 +526,15 @@ def _scan_csv_resilient(
     return pl.scan_csv(target, encoding="utf8", **kwargs)
 
 
+def _resolve_path(path_or_manifest: str | Path | DownloadManifest) -> Path:
+    """Path of a file given directly or through its download manifest."""
+    if isinstance(path_or_manifest, DownloadManifest):
+        if path_or_manifest.path is None:
+            raise TypeError("DownloadManifest.path is None; no file to read")
+        return Path(path_or_manifest.path)
+    return Path(path_or_manifest)
+
+
 class SmartReader:
     """A reader that understands Quantilica manifests and optimizes Polars loading."""
 
@@ -556,10 +566,7 @@ class SmartReader:
         Raises:
             ValueError: If the file format (extension) is not supported.
         """
-        if isinstance(path_or_manifest, DownloadManifest):
-            path = Path(path_or_manifest.path)
-        else:
-            path = Path(path_or_manifest)
+        path = _resolve_path(path_or_manifest)
 
         suffix = path.suffix.lower()
 
@@ -601,10 +608,7 @@ class SmartReader:
         Raises:
             ValueError: If the file format (extension) does not support lazy scanning.
         """
-        if isinstance(path_or_manifest, DownloadManifest):
-            path = Path(path_or_manifest.path)
-        else:
-            path = Path(path_or_manifest)
+        path = _resolve_path(path_or_manifest)
 
         suffix = path.suffix.lower()
 

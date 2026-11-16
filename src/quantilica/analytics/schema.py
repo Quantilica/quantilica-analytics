@@ -39,6 +39,10 @@ def _arrow_types_compatible(actual: pa.DataType, expected: pa.DataType) -> bool:
     return (actual, expected) in large_pair
 
 
+_DType = pl.DataType | type[pl.DataType]
+"""A Polars dtype given as an instance (``pl.Int64()``) or a class (``pl.Int64``)."""
+
+
 @dataclass(frozen=True)
 class Field:
     """A field in a data contract.
@@ -56,7 +60,7 @@ class Field:
     """
 
     name: str
-    dtype: pl.DataType | type[pl.DataType]
+    dtype: _DType
     required: bool = True
     description: str | None = None
     nullable: bool = True
@@ -207,14 +211,14 @@ class EraSchemaResolver:
 
     def __init__(
         self,
-        canonical_schema: DataContract | dict[str, pl.DataType],
+        canonical_schema: DataContract | dict[str, _DType],
         eras: dict[str, dict[str, str]] | None = None,
         *,
         era_mappings: dict[str, dict[str, str]] | None = None,
         default_values: dict[str, Any] | None = None,
     ) -> None:
         if isinstance(canonical_schema, DataContract):
-            self.schema: dict[str, pl.DataType] = {
+            self.schema: dict[str, _DType] = {
                 f.name: f.dtype for f in canonical_schema.fields
             }
         else:
@@ -224,7 +228,7 @@ class EraSchemaResolver:
         self.cast_failures: dict[str, int] = {}
 
     @staticmethod
-    def _count_cast_losses(series: pl.Series, dtype: pl.DataType) -> int:
+    def _count_cast_losses(series: pl.Series, dtype: _DType) -> int:
         """Non-null values of ``series`` that a lenient cast to ``dtype`` nulls."""
         casted = series.cast(dtype, strict=False)
         return int((casted.is_null() & series.is_not_null()).sum())

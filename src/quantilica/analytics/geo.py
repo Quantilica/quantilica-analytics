@@ -14,7 +14,7 @@ import re
 import struct
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import polars as pl
 
@@ -343,7 +343,7 @@ def _geojson_epsg(data: Mapping[str, Any]) -> int | None:
 
 def _make_transformer(source_epsg: int, target_epsg: int) -> Any:
     try:
-        from pyproj import Transformer
+        from pyproj import Transformer  # pyright: ignore[reportMissingImports]  # extra opcional "geo", fora do ambiente de dev
     except ImportError:
         raise ImportError(
             f"reprojecting from EPSG:{source_epsg} to EPSG:{target_epsg} needs "
@@ -384,7 +384,7 @@ def _read_vector_features(
 ) -> list[dict[str, Any]]:
     """Features of a shapefile/GeoPackage/... as GeoJSON-like dicts (target CRS)."""
     try:
-        import geopandas as gpd
+        import geopandas as gpd  # pyright: ignore[reportMissingModuleSource]  # extra opcional "geo", só stubs no dev
     except ImportError:
         raise ImportError(
             f"reading {path.name} needs geopandas (with pyogrio); install it "
@@ -448,8 +448,9 @@ def extract_wkb_and_bbox(
                 feature_list = data.get("features", [])
                 file_source_epsg = _geojson_epsg(data)
     elif isinstance(features_or_path, Mapping):
-        feature_list = features_or_path.get("features", [])
-        file_source_epsg = _geojson_epsg(features_or_path)
+        collection = cast("Mapping[str, Any]", features_or_path)
+        feature_list = collection.get("features", [])
+        file_source_epsg = _geojson_epsg(collection)
     elif isinstance(features_or_path, Iterable):
         feature_list = list(features_or_path)
 
