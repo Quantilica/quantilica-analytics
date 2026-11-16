@@ -14,6 +14,7 @@ the pieces that need heavy dependencies:
 from __future__ import annotations
 
 import codecs
+import errno
 import fnmatch
 import gzip
 import json
@@ -25,7 +26,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -137,6 +138,88 @@ class LakeWriteResult:
     @property
     def output(self) -> Path:
         return self.outputs[0]
+
+
+@dataclass(frozen=True)
+class DuckSource:
+    """Rows of a DuckDB ``SELECT``, for :class:`GroupMember` (read in streaming).
+
+    The query runs on the writer's DuckDB connection (its memory limit, thread
+    count and temporary directory), so it can read the raw file itself:
+    ``DuckSource("SELECT * FROM read_csv('/raw/a.csv', all_varchar=true)")``.
+    """
+
+    sql: str
+
+
+MemberData = pl.DataFrame | pl.LazyFrame | Path | DuckSource
+
+
+@dataclass(frozen=True)
+class GroupMember:
+    """One raw file (or one ZIP member) of a group for :meth:`LakeWriter.write_group`.
+
+    Attributes:
+        src: The raw file. Its ``sha256`` decides whether the member changed.
+        data: The member's rows: a ``DataFrame``, a ``LazyFrame`` (streamed with
+            ``sink_parquet``, never collected), a ``Path`` to a Parquet file, a
+            :class:`DuckSource`, or a function of no arguments returning any of
+            those. The function is called only for a member that has to be
+            written, so an expensive decode (a DBC, a ZIP) is skipped for the
+            members already in the group.
+        key: The member's key in ``quantilica.members`` and in ``_origem``;
+            default ``file_key(src)``. Use ``composite_file_key(src, member)``
+            for a member of a ZIP.
+        columns: The member columns (``{"uf": "sp", "mes": 3}``), written as
+            literal text columns.
+            Every member of a group has the same column names.
+        sha256: The digest of ``src`` when the caller already has it.
+    """
+
+    src: Path
+    data: MemberData | Callable[[], MemberData]
+    key: str | None = None
+    columns: Mapping[str, str] = field(default_factory=dict)
+    sha256: str | None = None
+
+
+@dataclass
+class GroupWriteResult(LakeWriteResult):
+    """Outcome of :meth:`LakeWriter.write_group`.
+
+    ``outputs`` lists the file; ``rows`` is the
+    rows written (0 when skipped). ``written`` are the keys of the members
+    converted in this call, ``kept`` those carried over from the existing
+    file, ``removed`` the orphans dropped from it.
+    """
+
+    written: list[str] = field(default_factory=list)
+    kept: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _GroupState:
+    """What the lake holds for a group: the usable members and the files."""
+
+    members: dict[str, dict[str, Any]] = field(default_factory=dict)
+    parts: list[Path] = field(default_factory=list)
+
+
+@dataclass
+class _GroupPlan:
+    target: Path
+    group_key: str
+    state: _GroupState
+    members: list[tuple[GroupMember, str, str]]  # (member, key, sha256)
+    columns: list[str]
+    changed: list[tuple[GroupMember, str, str]]
+    kept: list[str]
+    orphans: list[str]
+
+    @property
+    def is_current(self) -> bool:
+        return not self.changed and not self.orphans and bool(self.state.parts)
 
 
 # --- partition type vocabulary -------------------------------------------------
@@ -545,6 +628,35 @@ def _members(path: Path, group_key: str) -> dict[str, dict[str, Any]] | None:
     return json.loads(meta[META_MEMBERS])
 
 
+def _entry_is_current(
+    entry: Mapping[str, Any] | None,
+    sha256: str,
+    *,
+    columns: Mapping[str, Any] | None = None,
+    contract_version: int | None = None,
+    converter_version: str | None = None,
+) -> bool:
+    """Whether a ``quantilica.members`` entry is up to date for the raw file.
+
+    The digest must match. A version (contract, converter) is compared only
+    when the caller passes one: an entry written before versions were recorded
+    has none, so it is stale for a caller that passes a version and current for
+    one that does not. ``columns`` (the member columns' values) are compared
+    when given.
+    """
+    if entry is None or entry.get("origin_sha256") != sha256:
+        return False
+    if contract_version is not None and entry.get("contract_version") != (
+        contract_version
+    ):
+        return False
+    if converter_version is not None and entry.get("converter_version") != (
+        converter_version
+    ):
+        return False
+    return all(entry.get(k) == v for k, v in (columns or {}).items())
+
+
 def member_matches(
     path: Path,
     group_key: str,
@@ -552,26 +664,63 @@ def member_matches(
     sha256: str,
     *,
     layout_version: int = LAYOUT_VERSION,
+    contract_version: int | None = None,
+    converter_version: str | None = None,
 ) -> bool:
-    """Whether raw file ``key`` is in the grouped file ``path`` with ``sha256``."""
+    """Whether member ``key`` is in the grouped file ``path`` with ``sha256``.
+
+    ``key`` is the member's key in ``quantilica.members``: ``file_key(src)``, or
+    a composite key (``composite_file_key``) for a member of a ZIP. With
+    ``contract_version``/``converter_version`` the recorded versions must match
+    too; see :func:`_entry_is_current` for the rule on entries without them.
+    """
     if not path.is_file():
         return False
     if _footer(path).get(META_LAYOUT) != str(layout_version):
         return False
     members = _members(path, group_key) or {}
-    return members.get(key, {}).get("origin_sha256") == sha256
+    return _entry_is_current(
+        members.get(key),
+        sha256,
+        contract_version=contract_version,
+        converter_version=converter_version,
+    )
 
 
-def _durable_replace(tmp: Path, final: Path) -> None:
+def _durable_replace(tmp: Path, final: Path, hop_dir: Path | None = None) -> None:
     """``os.replace`` after flushing ``tmp`` to disk.
 
     Without the flush, a power loss right after the rename can leave ``final``
     with a truncated body (seen on Windows: "Parquet magic bytes not found"),
     and in a grouped file the old per-member files are already gone.
+
+    When ``tmp`` is on another volume (the scratch directory), the rename is
+    not possible: the file is copied next to ``final`` first (into ``hop_dir``,
+    which must be on ``final``'s volume; default ``final``'s directory) and the
+    rename is done there, so ``final`` is never seen half written.
     """
     with open(tmp, "rb+") as fh:
         os.fsync(fh.fileno())
-    os.replace(tmp, final)
+    try:
+        os.replace(tmp, final)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    hop_dir = hop_dir or final.parent
+    hop_dir.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=hop_dir, prefix=".", suffix=TMP_SUFFIX)
+    os.close(fd)
+    hop = Path(name)
+    try:
+        shutil.copyfile(tmp, hop)
+        with open(hop, "rb+") as fh:
+            os.fsync(fh.fileno())
+        os.replace(hop, final)
+    except BaseException:
+        hop.unlink(missing_ok=True)
+        raise
+    tmp.unlink(missing_ok=True)
 
 
 def _kv_options(meta: dict[str, str]) -> str:
@@ -579,6 +728,25 @@ def _kv_options(meta: dict[str, str]) -> str:
     return (
         f"FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880, KV_METADATA {{{kv}}}"
     )
+
+
+def _member_literal(name: str, value: str) -> pl.Expr:
+    """Literal text column for a member column."""
+    if not isinstance(value, str):
+        raise TypeError(f"member column {name!r}: expected str, got {value!r}")
+    return pl.lit(value, dtype=pl.String).alias(name)
+
+
+def _version_fields(
+    contract_version: int | None, converter_version: str | None
+) -> dict[str, Any]:
+    """The versions to record in a ``quantilica.members`` entry (only those given)."""
+    out: dict[str, Any] = {}
+    if contract_version is not None:
+        out["contract_version"] = contract_version
+    if converter_version is not None:
+        out["converter_version"] = converter_version
+    return out
 
 
 # --- writer ------------------------------------------------------------------------
@@ -666,9 +834,9 @@ class LakeWriter:
         ``parallel=False`` reads with a single thread, which DuckDB requires for
         quoted fields spanning lines. Latin-1 input with C1 bytes (0x80-0x9F),
         which DuckDB's decoder rejects, is first transcoded to UTF-8.
-        ``QUANTILICA_LAKE_SCRATCH`` moves the archive extraction and DuckDB's
-        temporary files to another directory (a faster disk, say); the Parquet
-        output is still staged next to the dataset and published by rename. ``required``
+        ``QUANTILICA_LAKE_SCRATCH`` moves the archive extraction, DuckDB's
+        temporary files and the staged Parquet to another directory (a faster
+        disk, say); only the finished file is moved into the lake. ``required``
         columns missing from the header raise :class:`LakeError` before
         anything is written, which rejects an HTML error page saved as CSV.
         Columns typed by ``contract`` go through ``TRY_CAST``; the failures
@@ -806,10 +974,20 @@ class LakeWriter:
         *,
         group_key: str,
         partitions: dict[str, Any] | None = None,
+        member_key: str | None = None,
+        contract_version: int | None = None,
+        converter_version: str | None = None,
     ) -> bool:
         """Whether ``src`` is already a member of the grouped file with its ``sha256``.
 
         The grouped counterpart of :meth:`is_current`. Always ``False`` with ``force``.
+
+        ``member_key`` is the member's key when it is not ``file_key(src)`` (a
+        ZIP member: ``composite_file_key(src, member)``). With
+        ``contract_version``/``converter_version`` the member counts as current
+        only if it was written with the same versions; a member written
+        without versions (an older footer, or a caller that did not pass any)
+        is then stale. Without them, versions are not compared.
         """
         if self.force:
             return False
@@ -818,9 +996,11 @@ class LakeWriter:
         return member_matches(
             target / f"{group_key}.parquet",
             group_key,
-            file_key(src),
+            member_key or file_key(src),
             sha256_file(src),
             layout_version=self.descriptor.layout_version,
+            contract_version=contract_version,
+            converter_version=converter_version,
         )
 
     def write_member(
@@ -830,24 +1010,31 @@ class LakeWriter:
         *,
         group_key: str,
         partitions: dict[str, Any] | None = None,
-        member_columns: dict[str, str] | None = None,
+        member_columns: Mapping[str, str] | None = None,
         converter: str = "quantilica-analytics",
+        member_key: str | None = None,
+        contract_version: int | None = None,
+        converter_version: str | None = None,
     ) -> LakeWriteResult:
         """Write ``src`` into the partition's grouped file ``<group_key>.parquet``.
 
         One Parquet per partition holds the rows of several raw files (the
         DATASUS publishes one file per state and month, most of them tiny).
         ``member_columns`` become literal columns (``{"uf": "sp"}``), every row
-        gets the raw file's key in ``_origem`` and the rows are sorted by the
-        member columns, so a filter on them skips row groups by their
-        statistics. Writing a member replaces only its own rows; the footer's
-        ``quantilica.members`` keeps the provenance of each one. The merge runs
+        gets the member's key in ``_origem`` (``member_key``, default
+        ``file_key(src)``) and the rows are sorted by the member columns, so a
+        filter on them skips row groups by their statistics. Writing a member
+        replaces only its own rows; the footer's ``quantilica.members`` keeps
+        the provenance of each one, and the versions when given. The merge runs
         in DuckDB, spilling to disk, under the dataset lock.
+
+        This rewrites the whole group for each member. To write a group of many
+        members, use :meth:`write_group`, which rewrites it once.
         """
         src = Path(src)
         partitions = dict(partitions or {})
         member_columns = dict(member_columns or {})
-        key = file_key(src)
+        key = member_key or file_key(src)
         digest = sha256_file(src)
         with dataset_lock(self.dataset_dir):
             target = self._target(partitions)
@@ -858,6 +1045,8 @@ class LakeWriter:
                 key,
                 digest,
                 layout_version=self.descriptor.layout_version,
+                contract_version=contract_version,
+                converter_version=converter_version,
             ):
                 return LakeWriteResult(src, [path], "skipped")
             staging = self._staging_dir()
@@ -873,6 +1062,8 @@ class LakeWriter:
                     partitions=partitions,
                     member_columns=member_columns,
                     converter=converter,
+                    contract_version=contract_version,
+                    converter_version=converter_version,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -893,6 +1084,8 @@ class LakeWriter:
         partitions: dict[str, Any],
         member_columns: dict[str, str],
         converter: str,
+        contract_version: int | None = None,
+        converter_version: str | None = None,
     ) -> LakeWriteResult:
         frame = data.collect() if isinstance(data, pl.LazyFrame) else data
         reserved = [*partitions, *member_columns, ORIGIN_COLUMN]
@@ -900,7 +1093,7 @@ class LakeWriter:
         if not frame.columns:
             raise LakeError(f"{src.name}: no payload columns to write")
         frame = frame.with_columns(
-            *(pl.lit(v, dtype=pl.String).alias(k) for k, v in member_columns.items()),
+            *(_member_literal(k, v) for k, v in member_columns.items()),
             pl.lit(key, dtype=pl.String).alias(ORIGIN_COLUMN),
         )
         members: dict[str, dict[str, Any]] = {}
@@ -920,6 +1113,7 @@ class LakeWriter:
             "rows": frame.height,
             "converted_at": datetime.now(UTC).isoformat(timespec="seconds"),
             **member_columns,
+            **_version_fields(contract_version, converter_version),
         }
         meta = self._metadata(group_key, None, None, None, converter)
         meta[META_MEMBERS] = json.dumps(members, sort_keys=True, ensure_ascii=False)
@@ -944,7 +1138,7 @@ class LakeWriter:
                 f"({_kv_options(meta)})"
             )
             rows = pq.ParquetFile(tmp_out).metadata.num_rows
-            _durable_replace(tmp_out, path)
+            self._move(tmp_out, path)
         except BaseException:
             tmp_out.unlink(missing_ok=True)
             raise
@@ -953,6 +1147,389 @@ class LakeWriter:
             if scratch != staging:
                 shutil.rmtree(scratch, ignore_errors=True)
         return LakeWriteResult(src, [path], "converted", int(rows))
+
+    def is_current_group(
+        self,
+        group_key: str,
+        members: Sequence[GroupMember],
+        *,
+        partitions: dict[str, Any] | None = None,
+        contract_version: int | None = None,
+        converter_version: str | None = None,
+        prune: bool = True,
+    ) -> bool:
+        """Whether :meth:`write_group` would skip this group.
+
+        Hashes the raw files and reads the footers, nothing else: a converter
+        can ask before decoding anything. Always ``False`` with ``force``.
+        """
+        if self.force:
+            return False
+        plan = self._plan_group(
+            group_key,
+            members,
+            dict(partitions or {}),
+            contract_version,
+            converter_version,
+            prune,
+        )
+        return plan.is_current
+
+    def write_group(
+        self,
+        group_key: str,
+        members: Sequence[GroupMember],
+        *,
+        partitions: dict[str, Any] | None = None,
+        converter: str = "quantilica-analytics",
+        contract_version: int | None = None,
+        converter_version: str | None = None,
+        prune: bool = True,
+        sort_by: Sequence[str] | None = None,
+    ) -> GroupWriteResult:
+        """Write all the members of a group into ``<group_key>[-NNN].parquet``, once.
+
+        The group is the set of raw files of one partition that share a Parquet.
+        ``members`` is the complete list: the group is skipped when every member
+        is in the file with the same ``sha256`` (and versions, see below), and
+        otherwise rewritten in a single pass, whatever the number of members
+        that changed. :meth:`write_member` would rewrite it once per member.
+
+        * Members already in the file and unchanged keep their rows, copied
+          from the existing file; only the changed ones are read from their
+          ``data`` (a function is called only then).
+        * With ``prune`` (the default), a member of the existing file that is no
+          longer in ``members`` is dropped from the rows and the footer. Pass
+          ``prune=False`` to write a partial list that only adds or replaces.
+        * ``contract_version`` and ``converter_version`` are recorded in each
+          written member's entry. When given, a member counts as current only
+          if its entry has the same value; an entry from before the versions
+          were recorded has none and is therefore rewritten. When ``None``, the
+          versions are not compared.
+        * A changed member's ``columns`` (``uf``, ``mes``...) also make it
+          stale, and so does a different set of column names in the footer.
+        * An existing file that is not consistent (another layout version,
+          other member columns, members that do not add up to its rows, or
+          ``-NNN`` parts) is rewritten whole, as if every member had changed.
+
+        Memory: nothing is collected. A ``LazyFrame`` is streamed to a staged
+        Parquet, a ``Path`` or :class:`DuckSource` goes through DuckDB, and the
+        file is written by DuckDB from those staged files plus the kept rows
+        of the existing file, spilling to disk. The staging directory is
+        ``QUANTILICA_LAKE_SCRATCH`` when set (see :meth:`write_duckdb`).
+
+        One file: a group is always a single ``<group_key>.parquet``.
+        ``max_part_bytes`` does not apply to it (it is ignored, with a warning)
+        and a set of ``-NNN`` parts left by an older run is replaced.
+
+        Order: rows come as the kept rows (in their file order) followed by the
+        written members, each member's rows contiguous. ``sort_by`` (column
+        names) adds an ``ORDER BY`` inside each part, which costs a sort with
+        spill to disk; leave it out for a large group.
+
+        The dataset lock is held while the members' ``data`` are evaluated.
+        """
+        partitions = dict(partitions or {})
+        if self.max_part_bytes is not None:
+            logger.warning(
+                "lake: max_part_bytes does not apply to a group; %s is one file",
+                group_key,
+            )
+        with dataset_lock(self.dataset_dir):
+            plan = self._plan_group(
+                group_key,
+                members,
+                partitions,
+                contract_version,
+                converter_version,
+                prune,
+            )
+            if plan.is_current and not self.force:
+                logger.info("lake: group %s is current", group_key)
+                return GroupWriteResult(
+                    None, plan.state.parts, "skipped", kept=list(plan.kept)
+                )
+            staging = self._staging_dir()
+            try:
+                result = self._group_convert(
+                    plan,
+                    staging,
+                    partitions=partitions,
+                    converter=converter,
+                    contract_version=contract_version,
+                    converter_version=converter_version,
+                    sort_by=list(sort_by or ()),
+                )
+            finally:
+                self._cleanup_staging(staging)
+            self._save_descriptor(partitions, None, converter)
+        logger.info(
+            "lake: group %s -> %d part(s), %d rows (%d written, %d kept, %d removed)",
+            group_key,
+            len(result.outputs),
+            result.rows,
+            len(result.written),
+            len(result.kept),
+            len(result.removed),
+        )
+        return result
+
+    def _plan_group(
+        self,
+        group_key: str,
+        members: Sequence[GroupMember],
+        partitions: dict[str, Any],
+        contract_version: int | None,
+        converter_version: str | None,
+        prune: bool,
+    ) -> _GroupPlan:
+        if not members:
+            raise ValueError("write_group needs at least one member.")
+        columns = list(members[0].columns)
+        reserved = {*partitions, *self.descriptor.partition_keys, ORIGIN_COLUMN}
+        if clash := reserved.intersection(columns):
+            raise ValueError(
+                f"member columns {sorted(clash)} clash with reserved names"
+            )
+        digests: dict[Path, str] = {}
+        resolved: list[tuple[GroupMember, str, str]] = []
+        seen: set[str] = set()
+        for member in members:
+            if list(member.columns) != columns:
+                raise ValueError(
+                    "every member of a group must have the same member columns; "
+                    f"got {list(member.columns)} and {columns}"
+                )
+            for name, value in member.columns.items():
+                if not isinstance(value, str):
+                    raise TypeError(
+                        f"member column {name!r}: expected str, got {value!r}"
+                    )
+            src = Path(member.src)
+            key = member.key or file_key(src)
+            if key in seen:
+                raise ValueError(f"duplicate member key {key!r} in group {group_key!r}")
+            seen.add(key)
+            digest = member.sha256 or digests.setdefault(src, sha256_file(src))
+            resolved.append((member, key, digest))
+        target = self._target(partitions)
+        state = self._group_state(target, group_key, columns)
+        changed: list[tuple[GroupMember, str, str]] = []
+        kept: list[str] = []
+        for item in resolved:
+            member, key, digest = item
+            if not self.force and _entry_is_current(
+                state.members.get(key),
+                digest,
+                columns=member.columns,
+                contract_version=contract_version,
+                converter_version=converter_version,
+            ):
+                kept.append(key)
+            else:
+                changed.append(item)
+        orphans = sorted(set(state.members) - seen) if prune and state.members else []
+        return _GroupPlan(
+            target, group_key, state, resolved, columns, changed, kept, orphans
+        )
+
+    def _group_state(
+        self, target: Path, group_key: str, columns: list[str]
+    ) -> _GroupState:
+        """The group as the lake holds it, or an empty state when it is not usable.
+
+        An existing file that is not a grouped file is an error. A grouped file
+        that is not consistent (see :meth:`write_group`) is reported as having
+        files but no members, so every member is rewritten and the files are
+        replaced.
+        """
+        parts = _part_files(target, group_key)
+        if not parts:
+            return _GroupState()
+        footers = [(part, _footer(part)) for part in parts]
+        for part, kv in footers:
+            if META_MEMBERS not in kv:
+                raise LakeError(
+                    f"{part.name} is not the grouped file {group_key!r} "
+                    f"(file key {kv.get(META_FILE_KEY)!r}); refusing to overwrite it"
+                )
+        unusable = _GroupState(parts=parts)
+        if [p.name for p in parts] != [f"{group_key}.parquet"]:
+            return unusable  # numbered parts: only a rewrite settles them
+        merged: dict[str, dict[str, Any]] = {}
+        try:
+            for part, kv in footers:
+                if kv.get(META_LAYOUT) != str(self.descriptor.layout_version):
+                    return unusable
+                if json.loads(kv.get(META_MEMBER_COLUMNS, "[]")) != columns:
+                    return unusable
+                entries = json.loads(kv[META_MEMBERS])
+                rows = pq.ParquetFile(part).metadata.num_rows
+                if sum(int(e.get("rows", 0)) for e in entries.values()) != rows:
+                    return unusable
+                if merged.keys() & entries.keys():
+                    return unusable
+                merged.update(entries)
+        except (ValueError, AttributeError, TypeError, OSError, pa.ArrowException):
+            return unusable
+        return _GroupState(merged, parts)
+
+    def _group_convert(
+        self,
+        plan: _GroupPlan,
+        staging: Path,
+        *,
+        partitions: dict[str, Any],
+        converter: str,
+        contract_version: int | None,
+        converter_version: str | None,
+        sort_by: list[str],
+    ) -> GroupWriteResult:
+        group_key = plan.group_key
+        reserved = [*partitions, *self.descriptor.partition_keys, *plan.columns]
+        reserved = list(dict.fromkeys([*reserved, ORIGIN_COLUMN]))
+        work = staging / "duck"
+        work.mkdir()
+        conn = _connect(work)
+        try:
+            entries: dict[str, dict[str, Any]] = {
+                k: plan.state.members[k] for k in plan.kept
+            }
+            staged: dict[str, Path] = {}
+            for i, (member, key, digest) in enumerate(plan.changed):
+                data = member.data() if callable(member.data) else member.data
+                out = staging / f"member-{i:06d}.parquet{TMP_SUFFIX}"
+                rows = self._stage_member(
+                    conn,
+                    data,
+                    Path(member.src),
+                    key,
+                    dict(member.columns),
+                    reserved,
+                    out,
+                )
+                staged[key] = out
+                entries[key] = {
+                    "origin_file": Path(member.src).name,
+                    "origin_sha256": digest,
+                    "rows": rows,
+                    "converted_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                    **member.columns,
+                    **_version_fields(contract_version, converter_version),
+                }
+
+            def order_of(k: str) -> tuple:
+                return tuple(entries[k].get(c) for c in plan.columns), k
+
+            order_kept = sorted(plan.kept, key=order_of)
+            order_new = sorted(staged, key=order_of)
+            meta = self._metadata(group_key, None, None, None, converter)
+            meta[META_MEMBER_COLUMNS] = json.dumps(plan.columns)
+            meta[META_MEMBERS] = json.dumps(entries, sort_keys=True, ensure_ascii=False)
+            tmp_out = staging / f"{group_key}.parquet{TMP_SUFFIX}"
+            branches = []
+            if plan.kept:
+                existing = "[" + ", ".join(_lit(str(p)) for p in plan.state.parts) + "]"
+                conn.register("keep", pa.table({"k": order_kept}))
+                branches.append(
+                    f"SELECT * FROM read_parquet({existing}, "
+                    "hive_partitioning=false, union_by_name=true) "
+                    f"WHERE {_ident(ORIGIN_COLUMN)} IN (SELECT k FROM keep)"
+                )
+            if staged:
+                files = "[" + ", ".join(_lit(str(staged[k])) for k in order_new) + "]"
+                branches.append(
+                    f"SELECT * FROM read_parquet({files}, "
+                    "hive_partitioning=false, union_by_name=true)"
+                )
+            query = " UNION ALL BY NAME ".join(branches)
+            if sort_by:
+                order_by = ", ".join(_ident(c) for c in sort_by)
+                query = f"SELECT * FROM ({query}) ORDER BY {order_by}"
+            conn.execute(
+                f"COPY ({query}) TO {_lit(str(tmp_out))} ({_kv_options(meta)})"
+            )
+            total = pq.ParquetFile(tmp_out).metadata.num_rows
+            expected = sum(int(e["rows"]) for e in entries.values())
+            if total != expected:
+                tmp_out.unlink(missing_ok=True)
+                raise LakeError(
+                    f"group {group_key!r}: the file has {total} rows but its "
+                    f"members add up to {expected}"
+                )
+            outputs = self._publish(plan.target, group_key, [tmp_out])
+        finally:
+            conn.close()
+            shutil.rmtree(work, ignore_errors=True)
+        return GroupWriteResult(
+            None,
+            outputs,
+            "converted",
+            total,
+            written=list(staged),
+            kept=list(plan.kept),
+            removed=list(plan.orphans),
+        )
+
+    def _stage_member(
+        self,
+        conn,
+        data: MemberData,
+        src: Path,
+        key: str,
+        columns: dict[str, str],
+        reserved: list[str],
+        out: Path,
+    ) -> int:
+        """Write the member's rows, with its columns and ``_origem``, to ``out``."""
+        if isinstance(data, pl.LazyFrame | pl.DataFrame):
+            names = (
+                data.collect_schema().names()
+                if isinstance(data, pl.LazyFrame)
+                else data.columns
+            )
+            frame = data.drop([c for c in reserved if c in names])
+            remaining = (
+                frame.collect_schema().names()
+                if isinstance(frame, pl.LazyFrame)
+                else frame.columns
+            )
+            if not remaining:
+                raise LakeError(f"{src.name}: no payload columns to write")
+            frame = frame.with_columns(
+                *(_member_literal(k, v) for k, v in columns.items()),
+                pl.lit(key, dtype=pl.String).alias(ORIGIN_COLUMN),
+            )
+            if isinstance(frame, pl.LazyFrame):
+                frame.sink_parquet(out, compression="zstd")  # streaming, no collect
+            else:
+                frame.write_parquet(out, compression="zstd")
+        elif isinstance(data, Path | DuckSource):
+            source = (
+                f"read_parquet({_lit(str(data))}, hive_partitioning=false)"
+                if isinstance(data, Path)
+                else f"({data.sql})"
+            )
+            names = [
+                r[0]
+                for r in conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
+            ]
+            drop = [c for c in reserved if c in names]
+            if len(drop) == len(names):
+                raise LakeError(f"{src.name}: no payload columns to write")
+            star = f"* EXCLUDE ({', '.join(_ident(c) for c in drop)})" if drop else "*"
+            extra = [f"{_lit(v)}::VARCHAR AS {_ident(k)}" for k, v in columns.items()]
+            extra.append(f"{_lit(key)}::VARCHAR AS {_ident(ORIGIN_COLUMN)}")
+            conn.execute(
+                f"COPY (SELECT {star}, {', '.join(extra)} FROM {source}) "
+                f"TO {_lit(str(out))} (FORMAT parquet, COMPRESSION zstd)"
+            )
+        else:
+            raise TypeError(
+                f"{src.name}: member data must be a DataFrame, LazyFrame, Path or "
+                f"DuckSource (or a function returning one), got {type(data).__name__}"
+            )
+        return int(pq.ParquetFile(out).metadata.num_rows)
 
     # -- shared plumbing --
 
@@ -967,16 +1544,32 @@ class LakeWriter:
         return partition_dir(self.dataset_dir, partitions)
 
     def _staging_dir(self) -> Path:
+        """Work directory of one write: the Parquet is staged here, then moved.
+
+        Under ``QUANTILICA_LAKE_SCRATCH`` when set (``lake build --scratch``
+        passes it to the converter processes), so the temporary Parquet stays
+        off the lake's volume and only the finished file is moved there (see
+        :func:`_durable_replace`). Otherwise ``<dataset>/.tmp``.
+        """
+        scratch = os.environ.get(LAKE_SCRATCH_ENV)
+        if scratch:
+            Path(scratch).mkdir(parents=True, exist_ok=True)
+            return Path(tempfile.mkdtemp(dir=scratch, prefix="lake-stage-"))
         base = self.dataset_dir / TMP_DIRNAME
         base.mkdir(parents=True, exist_ok=True)
         return Path(tempfile.mkdtemp(dir=base))
 
     def _cleanup_staging(self, staging: Path) -> None:
         shutil.rmtree(staging, ignore_errors=True)
-        try:
-            staging.parent.rmdir()  # only when no other writer left anything
-        except OSError:
-            pass
+        if staging.parent == self.dataset_dir / TMP_DIRNAME:
+            try:
+                staging.parent.rmdir()  # only when no other writer left anything
+            except OSError:
+                pass
+
+    def _move(self, tmp: Path, final: Path) -> None:
+        """Publish a staged file (see :func:`_durable_replace`)."""
+        _durable_replace(tmp, final, self.dataset_dir / TMP_DIRNAME)
 
     def _skip_if_current(
         self,
@@ -1047,7 +1640,7 @@ class LakeWriter:
                 )
         # Highest part first: a partial publish never looks like a complete set.
         for tmp, final in reversed(list(zip(staged, outputs, strict=True))):
-            _durable_replace(tmp, final)
+            self._move(tmp, final)
         keep = set(outputs)
         for orphan in _part_files(target, key):
             if orphan not in keep:

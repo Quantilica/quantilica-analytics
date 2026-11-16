@@ -7,6 +7,19 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Adicionado
+
+- `LakeWriter.write_group(group_key, members, ...)`: escreve todos os membros de um grupo (as partes de um mês, os membros de um ZIP, as séries de um ano) num único `<group_key>.parquet`, numa passada só. Pula o grupo inteiro quando nenhum membro mudou, reescreve uma vez quando algum mudou (`write_member` reescreve o grupo a cada membro) e copia do arquivo existente as linhas dos membros em dia: só o `data` dos membros alterados é avaliado (pode ser uma função, para não decodificar o que já está no lake). Nada é carregado na memória: `LazyFrame` vai por `sink_parquet`, `Path` de Parquet e `DuckSource` (um `SELECT` do DuckDB) passam pelo DuckDB, e o arquivo final sai de um `COPY` com spill em disco. A ordenação é opcional (`sort_by`, com custo de `ORDER BY` global); sem ela, as linhas dos membros em dia vêm primeiro e as dos membros novos depois, cada membro contíguo. O grupo é sempre um arquivo só: `max_part_bytes` não se aplica a ele (aviso no log).
+- `GroupMember` (arquivo bruto, `data`, chave própria, colunas de membro, `sha256` opcional), `DuckSource` e `GroupWriteResult` (`written`, `kept`, `removed`).
+- `LakeWriter.is_current_group()`: o mesmo teste de "em dia" do `write_group`, sem decodificar nada.
+- Membros órfãos: com `prune=True` (o padrão do `write_group`), membro do arquivo que saiu da lista sai das linhas e do rodapé.
+- Chave de membro composta: `write_member`, `is_current_member` e `member_matches` aceitam a chave do membro (`member_key`), como `composite_file_key` de um membro de ZIP.
+- Versões no skip: `write_group`, `write_member`, `is_current_member` e `member_matches` aceitam `contract_version` e `converter_version`, gravados em cada membro de `quantilica.members`. Quando o chamador passa uma versão, o membro só está em dia se a versão gravada for igual; um rodapé antigo, sem versão, é reconvertido. Sem versão no chamador, nada é comparado (os arquivos existentes seguem valendo).
+
+### Alterado
+
+- Com `QUANTILICA_LAKE_SCRATCH` definido (o `--scratch` do `lake build`), o Parquet temporário também é escrito lá, e não em `<dataset>/.tmp`; só o arquivo pronto vai para o destino. Entre volumes diferentes o arquivo é copiado para uma pasta do destino e renomeado ali, de modo que o leitor nunca vê arquivo pela metade. Sem a variável, nada muda.
+
 ### Corrigido
 - CI: o `uv sync` do workflow de testes deixa de passar `--index` e `--index-strategy` do índice Quantilica. O pacote não depende de nada que só exista no índice, e o GitHub Pages responde com 503 intermitente quando o caminho não existe, o que derrubava o job.
 
