@@ -45,7 +45,8 @@ class Field:
 
     Attributes:
         name (str): The name of the field.
-        dtype (pl.DataType): The expected Polars data type.
+        dtype (pl.DataType | type[pl.DataType]): The expected Polars data type
+            (instance or class, e.g. ``pl.Int64``).
         required (bool, optional): Whether the field must be present. Defaults to
             True.
         description (str | None, optional): An optional description of the field.
@@ -55,7 +56,7 @@ class Field:
     """
 
     name: str
-    dtype: pl.DataType
+    dtype: pl.DataType | type[pl.DataType]
     required: bool = True
     description: str | None = None
     nullable: bool = True

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import polars as pl
 from quantilica.core.manifests import DownloadManifest, read_manifest_sidecar
 
 from quantilica.analytics.schema import DataContract
+
+ParquetCompression = Literal["lz4", "uncompressed", "snappy", "gzip", "brotli", "zstd"]
+"""Codecs accepted by :meth:`polars.DataFrame.write_parquet`."""
 
 _TMP_SUFFIX = ".tmp.parquet"
 _SIDECAR_SUFFIX = ".manifest.json"
@@ -52,7 +55,7 @@ def to_parquet(
     manifest: DownloadManifest | None = None,
     contract: DataContract | None = None,
     source_path: str | Path | None = None,
-    compression: str = "zstd",
+    compression: ParquetCompression = "zstd",
     add_sidecar: bool = True,
     **kwargs: Any,
 ) -> Path:
@@ -90,8 +93,8 @@ def to_parquet(
         source_path (str | Path | None, optional): Raw source file whose
             manifest sidecar is used when ``manifest`` is None. Defaults to
             None.
-        compression (str, optional): The compression algorithm to use. Defaults to
-            "zstd".
+        compression (ParquetCompression, optional): The compression algorithm to
+            use. Defaults to "zstd".
         add_sidecar (bool, optional): Whether to persist the JSON sidecar
             manifest (``<target>.manifest.json``) alongside the Parquet file
             when a manifest is provided. Defaults to True.

@@ -53,6 +53,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.9.0",
     "pandas>=2.0",
+    "pyright>=1.1.400",
 ]
 
 [tool.pytest.ini_options]
@@ -64,6 +65,10 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+include = ["src"]
 
 [tool.hatch.build.targets.wheel]
 sources = ["src"]
