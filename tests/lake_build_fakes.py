@@ -107,3 +107,57 @@ class EnvControlConverter(FakeConverter):
 
 
 IMPORTABLE = EnvControlConverter("src", ["d"], Path("."))
+
+
+def _ano_2024(_path):
+    return {"ano": 2024}
+
+
+class ReadSpyConverter:
+    """Real spec converter (``LakeWriter`` underneath) that logs every raw file read
+    to hash it: the log is ``control_dir/hashed.log``, one path per line.
+
+    The spy sits on ``quantilica.core.manifests.sha256_file``, the only reader of
+    ``trusted_sha256``, inside the task process (patching the parent is useless
+    in a spawned process).
+    """
+
+    source_id = "demo"
+
+    def __init__(self, control_dir: Path) -> None:
+        self.control_dir = Path(control_dir)
+
+    def datasets(self) -> list[str]:
+        return ["vendas"]
+
+    def convert(self, input_dir, lake_dir, *, datasets=None, force=False):
+        import quantilica.core.manifests as manifests
+
+        from quantilica.analytics.lake import DatasetSpec, convert_with_specs
+
+        log = self.control_dir / "hashed.log"
+        real = manifests.sha256_file
+
+        def spy(path, *args, **kwargs):
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write(f"{path}\n")
+            return real(path, *args, **kwargs)
+
+        manifests.sha256_file = spy
+        specs = {
+            "vendas": DatasetSpec(
+                dataset_id="vendas",
+                partition_keys=("ano",),
+                partitions_from=_ano_2024,
+                reader="duckdb",
+                separator=";",
+            )
+        }
+        return convert_with_specs(
+            self.source_id,
+            specs,
+            Path(input_dir),
+            Path(lake_dir),
+            datasets=datasets,
+            force=force,
+        )

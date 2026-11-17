@@ -40,7 +40,6 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
-from quantilica.core.files import sha256_file
 from quantilica.core.lake import (
     DESCRIPTOR_FILENAME,
     HIVE_DEFAULT_PARTITION,
@@ -51,7 +50,7 @@ from quantilica.core.lake import (
     partition_dir,
     partition_types_for,
 )
-from quantilica.core.manifests import read_manifest_sidecar
+from quantilica.core.manifests import read_manifest_sidecar, trusted_sha256
 
 from quantilica.analytics.schema import DataContract
 from quantilica.analytics.writer import manifest_to_metadata
@@ -62,6 +61,23 @@ except PackageNotFoundError:  # pragma: no cover - source checkout without insta
     __version__ = "0.0.0"
 
 logger = logging.getLogger("quantilica.analytics.lake")
+
+
+def sha256_file(path: str | os.PathLike[str]) -> str:
+    """SHA-256 of a raw file, reusing the digest of its sidecar when it is trusted.
+
+    Every write path of :class:`LakeWriter` hashes its raw input through this
+    module-level name, which delegates to
+    :func:`quantilica.core.manifests.trusted_sha256`: with a valid
+    ``<file>.manifest.json`` whose size and mtime agree with the file, the bytes
+    are not read (they may live on a network mount, where reading them on every
+    build means downloading the source again). It stays a plain function of this
+    module, looked up at call time, so that callers can still replace
+    ``quantilica.analytics.lake.sha256_file`` to count or cache hashes; the
+    audit (``lake_audit``) keeps its own, always-reading hash.
+    """
+    return trusted_sha256(path)
+
 
 TMP_DIRNAME = ".tmp"
 TMP_SUFFIX = ".tmp"

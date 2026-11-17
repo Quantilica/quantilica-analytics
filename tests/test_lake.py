@@ -1329,3 +1329,87 @@ def test_drop_partition_columns_error_when_no_payload(
             file_key_name="empty_payload",
             partitions={"ano": 2025, "mes": "01"},
         )
+
+
+# --- sha256 pelo sidecar ----------------------------------------------------
+
+FAKE_SHA = "ef" * 32  # not the file's real digest: proves the sidecar was believed
+
+
+def _with_sidecar(src: Path, *, size: int | None = None) -> None:
+    import os
+
+    side = src.parent / (src.name + ".manifest.json")
+    side.write_text(
+        json.dumps(
+            {
+                "sha256": FAKE_SHA,
+                "size_bytes": src.stat().st_size if size is None else size,
+            }
+        ),
+        encoding="utf-8",
+    )
+    later = src.stat().st_mtime + 10
+    os.utime(side, (later, later))
+
+
+@pytest.fixture
+def hashed(monkeypatch) -> list[str]:
+    """Raw files actually read to be hashed (the reader behind ``trusted_sha256``)."""
+    import quantilica.core.manifests as manifests
+
+    monkeypatch.delenv("QUANTILICA_LAKE_REHASH", raising=False)
+    reads: list[str] = []
+    real = manifests.sha256_file
+
+    def spy(path, *args, **kwargs):
+        reads.append(str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(manifests, "sha256_file", spy)
+    return reads
+
+
+def test_writer_uses_sidecar_digest_without_reading_raw(
+    tmp_path, dataset_dir, descriptor, hashed
+):
+    src = tmp_path / "a.csv"
+    src.write_bytes(CSV_LATIN1)
+    _with_sidecar(src)
+    writer = LakeWriter(dataset_dir, descriptor)
+    parts = {"ano": 2025, "mes": "01"}
+    result = writer.write_duckdb(src, partitions=parts, encoding="latin-1")
+    assert footer(result.output)["quantilica.origin_sha256"] == FAKE_SHA
+    assert writer.is_current(src, partitions=parts)
+    assert hashed == []
+
+
+def test_writer_reads_raw_when_sidecar_size_differs(
+    tmp_path, dataset_dir, descriptor, hashed
+):
+    from quantilica.core.files import sha256_bytes
+
+    src = tmp_path / "a.csv"
+    src.write_bytes(CSV_LATIN1)
+    _with_sidecar(src, size=1)
+    result = LakeWriter(dataset_dir, descriptor).write_duckdb(
+        src, partitions={"ano": 2025, "mes": "01"}, encoding="latin-1"
+    )
+    assert footer(result.output)["quantilica.origin_sha256"] == sha256_bytes(CSV_LATIN1)
+    assert hashed == [str(src)]
+
+
+def test_writer_replaced_sha256_file_is_still_honored(
+    tmp_path, dataset_dir, descriptor, monkeypatch
+):
+    # Fetchers (anp) replace ``lake.sha256_file`` to cache digests: the module name
+    # must be the one the write paths call.
+    import quantilica.analytics.lake as lake_mod
+
+    src = tmp_path / "a.csv"
+    src.write_bytes(CSV_LATIN1)
+    monkeypatch.setattr(lake_mod, "sha256_file", lambda path: "12" * 32)
+    result = LakeWriter(dataset_dir, descriptor).write_duckdb(
+        src, partitions={"ano": 2025, "mes": "01"}, encoding="latin-1"
+    )
+    assert footer(result.output)["quantilica.origin_sha256"] == "12" * 32

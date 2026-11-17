@@ -897,3 +897,67 @@ def test_lake_build_profile_alias_depreciado(tmp_path, monkeypatch):
             prevent_sleep=False,
         )
     assert calls[-1] == {"workers": 1, "memory": "64GB"}
+
+
+# --- sha256 pelo sidecar ----------------------------------------------------
+
+FAKE_SHA = "cd" * 32  # not the file's real digest: proves the sidecar was believed
+
+
+def _vendas(tmp_path: Path, *, sidecar: bool) -> Path:
+    raw = tmp_path / "input" / "demo" / "vendas" / "vendas_2024@20261025.csv"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("produto;valor\nA;1\nB;2\n", encoding="utf-8")
+    if sidecar:
+        side = raw.parent / (raw.name + ".manifest.json")
+        side.write_text(
+            json.dumps({"sha256": FAKE_SHA, "size_bytes": raw.stat().st_size}),
+            encoding="utf-8",
+        )
+        later = raw.stat().st_mtime + 10
+        os.utime(side, (later, later))
+    return raw
+
+
+def _origin_sha(lake: Path) -> str:
+    import pyarrow.parquet as pq
+
+    (parquet,) = (lake / "demo" / "vendas").rglob("*.parquet")
+    raw = pq.ParquetFile(parquet).metadata.metadata
+    return raw[b"quantilica.origin_sha256"].decode()
+
+
+def test_build_does_not_read_raw_files_with_trusted_sidecars(tmp_path, monkeypatch):
+    from lake_build_fakes import ReadSpyConverter
+
+    monkeypatch.delenv("QUANTILICA_LAKE_REHASH", raising=False)
+    _vendas(tmp_path, sidecar=True)
+    control = tmp_path / "control"
+    control.mkdir()
+    _build(tmp_path, {"demo": ReadSpyConverter(control)})
+    assert not (control / "hashed.log").exists()
+    assert _origin_sha(tmp_path / "lake") == FAKE_SHA
+
+
+def test_build_reads_raw_files_without_sidecar(tmp_path, monkeypatch):
+    from lake_build_fakes import ReadSpyConverter
+
+    monkeypatch.delenv("QUANTILICA_LAKE_REHASH", raising=False)
+    raw = _vendas(tmp_path, sidecar=False)
+    control = tmp_path / "control"
+    control.mkdir()
+    _build(tmp_path, {"demo": ReadSpyConverter(control)})
+    assert str(raw) in (control / "hashed.log").read_text().splitlines()
+    assert _origin_sha(tmp_path / "lake") != FAKE_SHA
+
+
+def test_build_rehash_env_reads_raw_files_despite_sidecar(tmp_path, monkeypatch):
+    from lake_build_fakes import ReadSpyConverter
+
+    monkeypatch.setenv("QUANTILICA_LAKE_REHASH", "1")  # inherited by the task process
+    raw = _vendas(tmp_path, sidecar=True)
+    control = tmp_path / "control"
+    control.mkdir()
+    _build(tmp_path, {"demo": ReadSpyConverter(control)})
+    assert str(raw) in (control / "hashed.log").read_text().splitlines()
+    assert _origin_sha(tmp_path / "lake") != FAKE_SHA

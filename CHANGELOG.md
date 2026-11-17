@@ -7,6 +7,10 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Alterado
+
+- O `LakeWriter` (`write_duckdb`, `write_polars`, `write_member`, `write_group`, `is_current`, `is_current_member`, `is_current_group`) deixa de ler o bruto inteiro para calcular o sha256: o `quantilica.analytics.lake.sha256_file` passou a ser um invólucro de `quantilica.core.manifests.trusted_sha256`, que usa o sha256 do sidecar `<arquivo>.manifest.json` quando ele é confiável (JSON válido, `size_bytes` igual ao tamanho atual e arquivo não mais novo que o sidecar) e só lê o arquivo quando não é. Com o bruto numa montagem de rede, isso evita baixar a fonte inteira a cada build. `QUANTILICA_LAKE_REHASH=1` força sempre a leitura. O nome `lake.sha256_file` continua sendo o que os pontos de escrita chamam, então quem o substitui (para contar ou guardar hashes) segue funcionando. `lake_audit` não muda: continua lendo os arquivos. **Requer `quantilica-core` com `trusted_sha256`** (o piso em `pyproject.toml` sobe no release).
+
 ## [0.13.0] - 2026-11-16
 
 ### Adicionado
