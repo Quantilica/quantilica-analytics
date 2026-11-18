@@ -502,6 +502,57 @@ def test_changed_source_gets_a_new_manifest_and_keeps_the_marker(tmp_path):
     assert (source / MARKER_NAME).exists()
 
 
+needs_chmod = pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX permissions that bind the current user",
+)
+
+
+@needs_chmod
+def test_listing_error_in_a_source_folder_raises_instead_of_dropping_parquets(
+    tmp_path,
+):
+    _raw(tmp_path, "src")
+    conv = ParquetConverter("src", ["aa", "bbbb"], tmp_path / "control")
+    _build(tmp_path, {"src": conv})
+    lake = tmp_path / "lake"
+    assert len(list_source_parquets(lake, "src")) == 2
+    folder = lake / "src" / "bbbb" / "ano=2026"
+    folder.chmod(0)
+    try:
+        with pytest.raises(LakePublishError, match="incomplete"):
+            list_source_parquets(lake, "src")
+    finally:
+        folder.chmod(0o755)
+    assert len(list_source_parquets(lake, "src")) == 2
+
+
+@needs_chmod
+def test_build_with_an_unlistable_folder_writes_no_manifest_and_keeps_the_marker(
+    tmp_path,
+):
+    _raw(tmp_path, "src")
+    conv = ParquetConverter("src", ["aa", "bbbb"], tmp_path / "control")
+    first = _build(tmp_path, {"src": conv})
+    source = tmp_path / "lake" / "src"
+    before = (source / BUILD_MANIFEST_NAME).read_bytes()
+    assert "bbbb/ano=2026/p.parquet" in read_build_manifest(source)["parquets"]
+    folder = source / "bbbb" / "ano=2026"
+    folder.chmod(0)
+    try:
+        second = _build(tmp_path, {"src": conv}, force=True, datasets=["aa"])
+    finally:
+        folder.chmod(0o755)
+
+    assert second.has_errors and "src" in second.failed_sources
+    assert "build manifest not written" in second.failed_sources["src"]
+    # The manifest is the old one, still listing bbbb's Parquet, and the marker of
+    # the new run stays.
+    assert (source / BUILD_MANIFEST_NAME).read_bytes() == before
+    assert read_build_manifest(source)["build_id"] == first.run_id
+    assert json.loads((source / MARKER_NAME).read_text())["build_id"] == second.run_id
+
+
 def test_marker_left_by_an_earlier_run_is_not_removed_when_nothing_changed(tmp_path):
     _raw(tmp_path, "src")
     conv = ParquetConverter("src", ["aa"], tmp_path / "control")

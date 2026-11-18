@@ -575,8 +575,22 @@ def list_source_parquets(lake_dir: Path | str, source: str) -> dict[str, int]:
     Paths are relative to the source folder and use ``/``. It is the set that the
     build manifest records and that the audit compares with it: the same walk
     (links followed once, ``.tmp`` folders and leftovers left out).
+
+    Raises:
+        LakePublishError: A folder of the source (or the lake root) could not be
+            listed, so the set would be incomplete. Returning it anyway would
+            make a folder that fails to list (``EIO`` or ``ENOTCONN`` on a network
+            mount, no permission) vanish from the build manifest, and a publisher
+            comparing the manifest with the remote would delete its Parquets.
     """
-    return _parquet_sizes(_scan_lake(Path(lake_dir), [source]), source)
+    scan = _scan_lake(Path(lake_dir), [source])
+    if scan.errors:
+        shown = "; ".join(scan.errors[:3])
+        more = f" (+{len(scan.errors) - 3} more)" if len(scan.errors) > 3 else ""
+        raise LakePublishError(
+            f"{source}: Parquet listing is incomplete, {shown}{more}"
+        )
+    return _parquet_sizes(scan, source)
 
 
 def _publication_sources(lake_dir: Path, wanted: Collection[str] | None) -> set[str]:

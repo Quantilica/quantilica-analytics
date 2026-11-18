@@ -3586,8 +3586,11 @@ def convert_with_specs(
                 and not (spec.reader == "fixed_width" and is_layout_file(p))
             ]
         else:
+            # Compare lexically, never through ``resolve()``: the input may be a
+            # view of links into a mount, and resolving a link leaves the view
+            # (the file would then look like it belongs to no other dataset).
             other_dataset_dirs = {
-                (input_dir / s.dataset_id).resolve()
+                Path(os.path.abspath(input_dir / s.dataset_id))
                 for s in specs.values()
                 if s.dataset_id != spec.dataset_id
                 and (input_dir / s.dataset_id).is_dir()
@@ -3601,7 +3604,10 @@ def convert_with_specs(
                 and not p.name.endswith(".tmp")
                 and not p.name.startswith(".")
                 and not (spec.reader == "fixed_width" and is_layout_file(p))
-                and not any(p.resolve().is_relative_to(d) for d in other_dataset_dirs)
+                and not any(
+                    Path(os.path.abspath(p)).is_relative_to(d)
+                    for d in other_dataset_dirs
+                )
             ]
 
         if not raw_files:

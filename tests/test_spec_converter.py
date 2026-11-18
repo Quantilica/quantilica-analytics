@@ -134,3 +134,46 @@ def test_convert_with_specs_polars_and_filter(tmp_path: Path):
 
     ds_dir = lake_dir / "demo" / "clientes"
     assert (ds_dir / "ano=2023" / "clientes_2023.parquet").is_file()
+
+
+def test_other_dataset_folders_are_excluded_when_the_input_is_a_view_of_links(
+    tmp_path: Path,
+):
+    # The input is a view: every file is a link into a mount outside it. A dataset
+    # without a folder of its own reads what is left of the input, and the folders
+    # of the other datasets must stay out even though their files resolve to the
+    # mount.
+    mount = tmp_path / "mount"
+    mount.mkdir()
+    view = tmp_path / "view"
+    (view / "vendas").mkdir(parents=True)
+    for name, body in [
+        ("vendas_2024@20261025.csv", "produto;valor\nA;1\n"),
+        ("resto_2024@20261025.csv", "produto;valor\nB;2\n"),
+    ]:
+        (mount / name).write_text(body, encoding="utf-8")
+    (view / "vendas" / "vendas_2024@20261025.csv").symlink_to(
+        mount / "vendas_2024@20261025.csv"
+    )
+    (view / "resto_2024@20261025.csv").symlink_to(mount / "resto_2024@20261025.csv")
+
+    def specs():
+        return {
+            name: DatasetSpec(
+                dataset_id=name,
+                partition_keys=("ano",),
+                partitions_from=lambda p: {"ano": 2024},
+                reader="duckdb",
+                separator=";",
+            )
+            for name in ("vendas", "resto")
+        }
+
+    lake = tmp_path / "lake"
+    result = convert_with_specs(
+        "demo", specs(), view, lake, datasets=["resto"], converter="t"
+    )
+    assert not result.errors
+    assert result.converted == 1  # only resto's file, not vendas'
+    parquets = sorted(p.name for p in (lake / "demo" / "resto").rglob("*.parquet"))
+    assert parquets == ["resto_2024.parquet"]

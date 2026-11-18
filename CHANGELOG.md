@@ -7,6 +7,11 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Corrigido
+
+- `list_source_parquets` levanta `LakePublishError` quando uma pasta da fonte (ou a raiz do lake) não pode ser listada (`EIO` ou `ENOTCONN` numa montagem de rede, falta de permissão). Antes o erro era ignorado e os Parquets da pasta sumiam do `_build.json`, o que levaria um publicador a apagá-los do destino. No `lake_build` a fonte passa a constar em `failed_sources` (`build manifest not written`), sem novo manifesto e com o marcador mantido.
+- `convert_with_specs`: a exclusão das pastas dos outros datasets (quando o dataset não tem pasta própria e lê o que sobra do diretório de entrada) compara caminhos sem resolver links. Com a entrada sendo uma visão de links para uma montagem, `resolve()` saía da visão e arquivos de outro dataset eram convertidos também neste.
+
 ### Alterado
 
 - O `LakeWriter` (`write_duckdb`, `write_polars`, `write_member`, `write_group`, `is_current`, `is_current_member`, `is_current_group`) deixa de ler o bruto inteiro para calcular o sha256: o `quantilica.analytics.lake.sha256_file` passou a ser um invólucro de `quantilica.core.manifests.trusted_sha256`, que usa o sha256 do sidecar `<arquivo>.manifest.json` quando ele é confiável (JSON válido, `size_bytes` igual ao tamanho atual e arquivo não mais novo que o sidecar) e só lê o arquivo quando não é. Com o bruto numa montagem de rede, isso evita baixar a fonte inteira a cada build. `QUANTILICA_LAKE_REHASH=1` força sempre a leitura. O nome `lake.sha256_file` continua sendo o que os pontos de escrita chamam, então quem o substitui (para contar ou guardar hashes) segue funcionando. `lake_audit` não muda: continua lendo os arquivos. **Requer `quantilica-core` com `trusted_sha256`** (o piso em `pyproject.toml` sobe no release).
