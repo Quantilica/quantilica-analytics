@@ -7,6 +7,10 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Adicionado
+
+- `LakeWriter.origin_recorded(raw, *, member=None, contract_version=None, converter_version=None)`: diz se o bruto já está no lake sem saber a partição, para conversores que só a descobrem depois de ler os dados (coluna `ano`, por exemplo) e por isso não podem chamar `is_current` antes. Só lê rodapés de Parquet (nunca colunas), indexados uma vez por instância do writer e refeitos depois que ela escreve. É verdadeiro quando todos os Parquets que citam o arquivo de origem (`quantilica.origin_file` ou `origin_file` de uma entrada de `quantilica.members`) registram o `sha256` do bruto (o do sidecar, quando confiável) e a versão de layout do writer, com as mesmas regras de `origin_matches` (partes completas, uma só execução, versão do contrato) e `member_matches` (versões do contrato e do conversor, quando informadas). Um bruto que gerou um Parquet por ano só conta como registrado se todos os anos estiverem com o mesmo `sha256`. Sempre falso com `force`.
+
 ## [0.14.0] - 2026-11-18
 
 ### Corrigido

@@ -819,6 +819,26 @@ def origin_matches(
     return len(runs) == 1
 
 
+def _is_complete_set(key: str, parts: Sequence[_OriginRecord]) -> bool:
+    """Whether footers of ``key`` form a complete set written in a single run.
+
+    The same rule as :func:`origin_matches`, applied to already read footers: a
+    lone ``<key>.parquet`` or ``-001..-N`` without gaps, one ``converted_at``.
+    """
+    pattern = re.compile(rf"^{re.escape(key)}(?:-(\d{{3}}))?\.parquet$")
+    numbers = []
+    for rec in sorted(parts, key=lambda r: r.path.name):
+        m = pattern.match(rec.path.name)
+        if m is None:
+            return False
+        numbers.append(m.group(1))
+    if numbers != [None] and (
+        None in numbers or [int(n) for n in numbers] != list(range(1, len(numbers) + 1))
+    ):
+        return False
+    return len({rec.converted_at for rec in parts}) == 1
+
+
 def _members(path: Path, group_key: str) -> dict[str, dict[str, Any]] | None:
     """Members of the grouped file ``path``; ``None`` if it is not ``group_key``."""
     meta = _footer(path)
@@ -1163,6 +1183,24 @@ def _refuse_member_named(src: Path, names: Iterable[str], own: set[str]) -> None
         )
 
 
+@dataclass(frozen=True)
+class _OriginRecord:
+    """What one Parquet footer says about one raw file (see ``origin_recorded``).
+
+    ``entry`` is the ``quantilica.members`` entry for a grouped file and ``None``
+    for a file written per raw file, where the same facts sit in the footer's own
+    keys (``contract_version`` is then the footer's text, ``None`` when absent).
+    """
+
+    path: Path
+    file_key: str | None
+    sha256: str | None
+    layout: str | None
+    converted_at: str | None
+    contract_version: str | None
+    entry: Mapping[str, Any] | None
+
+
 # --- writer ------------------------------------------------------------------------
 
 
@@ -1211,6 +1249,7 @@ class LakeWriter:
         )
         self.force = force
         self.max_part_bytes = max_part_bytes
+        self._origin_cache: dict[str, list[_OriginRecord]] | None = None
         configure_scratch()
 
     # -- public API --
@@ -1327,6 +1366,125 @@ class LakeWriter:
             target, key, origin, sha256_file(origin), contract
         )
         return skipped is not None
+
+    def origin_recorded(
+        self,
+        raw: Path,
+        *,
+        member: str | None = None,
+        contract_version: int | None = None,
+        converter_version: str | None = None,
+    ) -> bool:
+        """Whether ``raw`` is already in the lake, whatever partition it went to.
+
+        The partition-free counterpart of :meth:`is_current`, for a converter
+        that only learns the partition after reading the data (an ``ano`` column,
+        say) and so cannot call :meth:`is_current` before reading. It looks at
+        the footers of every Parquet of the dataset, never at their columns: the
+        footers are read once per writer (lazily, and again after this writer
+        writes, replaces or removes something), so asking for many raw files
+        costs one pass over the footers, not one per call. Files written by
+        another process after the first call are not seen by this instance.
+
+        True only when:
+
+        * at least one Parquet cites ``member or raw.name`` as its origin file
+          (``quantilica.origin_file`` of a file written per raw file, or
+          ``origin_file`` of a ``quantilica.members`` entry of a grouped file);
+        * **every** Parquet that cites it records the digest of ``raw``
+          (:func:`sha256_file`, the sidecar's when it is trusted, so the raw file
+          is not read) and this writer's layout version. A raw file that produced
+          one Parquet per year is therefore current only when all the years are
+          in the lake with that digest; a changed raw file, even one that only
+          adds a year, is not current;
+        * for files written per raw file, the parts of each file key in a
+          partition folder form one complete set (a lone ``<key>.parquet`` or
+          ``-001..-N`` without gaps) written in a single run, and every part
+          records the same contract version as ``contract_version`` (``None``
+          when the file was written without a contract), as
+          :func:`origin_matches` requires;
+        * for grouped files, the entry's ``contract_version`` and
+          ``converter_version`` equal the ones given, when given (an entry
+          without a recorded version is stale for a caller that passes one), as
+          :func:`member_matches` requires.
+
+        ``member`` is the name the footers cite when it is not ``raw.name``.
+        Always ``False`` with ``force``, and for a dataset with no Parquet.
+        """
+        if self.force:
+            return False
+        raw = Path(raw)
+        records = self._origin_index().get(member or raw.name)
+        if not records:
+            return False
+        digest = sha256_file(raw)
+        layout = str(self.descriptor.layout_version)
+        expected_contract = None if contract_version is None else str(contract_version)
+        sets: dict[tuple[Path, str], list[_OriginRecord]] = {}
+        for rec in records:
+            if rec.sha256 != digest or rec.layout != layout:
+                return False
+            if rec.entry is not None:
+                if not _entry_is_current(
+                    rec.entry,
+                    digest,
+                    contract_version=contract_version,
+                    converter_version=converter_version,
+                ):
+                    return False
+            elif rec.contract_version != expected_contract or rec.file_key is None:
+                return False
+            else:
+                sets.setdefault((rec.path.parent, rec.file_key), []).append(rec)
+        return all(_is_complete_set(key, parts) for (_, key), parts in sets.items())
+
+    def _origin_index(self) -> dict[str, list[_OriginRecord]]:
+        """``{origin file name: records}`` of the dataset's footers (built once)."""
+        if self._origin_cache is None:
+            index: dict[str, list[_OriginRecord]] = {}
+            for path in _dataset_files(self.dataset_dir):
+                try:
+                    meta = pq.read_metadata(path)
+                except (OSError, pa.ArrowException):
+                    continue
+                footer = footer_from_metadata(meta)
+                common = {
+                    "path": path,
+                    "file_key": footer.get(META_FILE_KEY),
+                    "layout": footer.get(META_LAYOUT),
+                    "converted_at": footer.get(META_CONVERTED_AT),
+                }
+                if META_MEMBERS in footer:
+                    try:
+                        members = json.loads(footer[META_MEMBERS])
+                    except ValueError:
+                        continue
+                    for entry in members.values():
+                        name = entry.get("origin_file")
+                        if name:
+                            index.setdefault(name, []).append(
+                                _OriginRecord(
+                                    sha256=entry.get("origin_sha256"),
+                                    contract_version=None,
+                                    entry=entry,
+                                    **common,
+                                )
+                            )
+                elif name := footer.get("quantilica.origin_file"):
+                    index.setdefault(name, []).append(
+                        _OriginRecord(
+                            sha256=footer.get(META_ORIGIN_SHA),
+                            contract_version=footer.get(META_CONTRACT_VERSION),
+                            entry=None,
+                            **common,
+                        )
+                    )
+            self._origin_cache = index
+        return self._origin_cache
+
+    def _forget_origins(self) -> None:
+        """Drop the footer index: the dataset's files are about to change."""
+        self._origin_cache = None
 
     def write_polars(
         self,
@@ -1768,6 +1926,7 @@ class LakeWriter:
 
         Returns ``(removed, kept)``; see :meth:`write_group` for the test.
         """
+        self._forget_origins()
         if not replaces and not replace_partition:
             return [], []
         if replace_partition:
@@ -2200,7 +2359,9 @@ class LakeWriter:
 
     def _move(self, tmp: Path, final: Path) -> None:
         """Publish a staged file (see :func:`_durable_replace`)."""
+        self._forget_origins()
         _durable_replace(tmp, final, self.dataset_dir / TMP_DIRNAME)
+        self._forget_origins()
 
     def _skip_if_current(
         self,
@@ -2255,6 +2416,7 @@ class LakeWriter:
 
     def _publish(self, target: Path, key: str, staged: list[Path]) -> list[Path]:
         """Move staged parts into ``target`` and drop leftovers of older splits."""
+        self._forget_origins()
         target.mkdir(parents=True, exist_ok=True)
         names = (
             [f"{key}.parquet"]
@@ -2301,6 +2463,7 @@ class LakeWriter:
             if orphan not in keep:
                 orphan.unlink()
         _rmdir_if_empty_tmp(hop_dir)
+        self._forget_origins()
         return outputs
 
     def _save_descriptor(
