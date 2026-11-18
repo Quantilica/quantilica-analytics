@@ -219,7 +219,11 @@ class GroupMember:
             the member's entry as ``outputs`` (see
             :meth:`LakeWriter.origin_complete`). ``None`` records nothing; when
             given, a member whose entry lacks it or has a different list is
-            rewritten.
+            rewritten. Members that come from one ZIP and go to the same
+            dataset must all declare the **union** of the outputs of the ZIP
+            (the answer is about the raw file, and members with different
+            lists make it ``False``); a raw file that feeds two datasets needs
+            ``origin_complete`` in the writer of each one.
     """
 
     src: Path
@@ -796,16 +800,15 @@ def output_id(partitions: Mapping[str, Any] | None, file_key_name: str) -> str:
 
 
 def _normalize_outputs(
-    outputs: Collection[str], own: str | None = None
+    outputs: Collection[str], own: str | None = None, *, what: str = "origin_outputs"
 ) -> tuple[str, ...]:
     """Sorted, de-duplicated ``origin_outputs``; ``own`` must be one of them."""
     if isinstance(outputs, str) or not isinstance(outputs, Collection):
-        raise TypeError("origin_outputs must be a collection of output ids (str)")
+        raise TypeError(f"{what} must be a collection of output ids (str)")
     for item in outputs:
         if not isinstance(item, str) or not item:
             raise ValueError(
-                f"origin_outputs holds {item!r}; expected non-empty str ids "
-                "(see output_id)"
+                f"{what} holds {item!r}; expected non-empty str ids (see output_id)"
             )
     normalized = tuple(sorted(set(outputs)))
     if own is not None and own not in normalized:
@@ -1296,6 +1299,22 @@ class _OriginRecord:
     converter: str | None = None
 
 
+# A directory whose modification time is newer than this when it is listed may
+# still change within the same clock tick (or the file system's coarser
+# resolution: 1-2 s on some), so it is listed again until it ages past it.
+_ORIGIN_RACY_NS = 3_000_000_000
+
+
+@dataclass
+class _DirListing:
+    """One dataset directory as ``LakeWriter._sync_origins`` last listed it."""
+
+    mtime_ns: int
+    trusted: bool  # old enough that an unchanged mtime means unchanged content
+    subdirs: tuple[str, ...]
+    files: dict[str, tuple[int, int]]  # Parquet path -> (size, mtime_ns)
+
+
 # --- writer ------------------------------------------------------------------------
 
 
@@ -1344,11 +1363,16 @@ class LakeWriter:
         )
         self.force = force
         self.max_part_bytes = max_part_bytes
-        self._origin_cache: dict[str, list[_OriginRecord]] | None = None
-        self._origin_stamps: dict[str, tuple[int, int]] = {}
+        # Footer index (see ``_sync_origins``): what each Parquet's footer says,
+        # keyed by path with the (size, mtime_ns) it was read at; the directory
+        # listings that tell when to look again; and ``{origin name: {path:
+        # record}}`` kept in step with both.
         self._origin_files: dict[
             str, tuple[tuple[int, int], list[tuple[str, _OriginRecord]]]
         ] = {}
+        self._origin_dirs: dict[str, _DirListing] = {}
+        self._origin_dirty: set[str] = set()
+        self._origin_by_name: dict[str, dict[str, _OriginRecord]] = {}
         configure_scratch()
 
     # -- public API --
@@ -1483,6 +1507,7 @@ class LakeWriter:
         member: str | None = None,
         contract_version: int | None = None,
         converter_version: str | None = None,
+        expected: Collection[str] | None = None,
     ) -> bool:
         """Whether ``raw`` is already in the lake, whatever partition it went to.
 
@@ -1518,7 +1543,11 @@ class LakeWriter:
           :func:`member_matches` requires.
 
         ``member`` is the name the footers cite when it is not ``raw.name``.
-        Always ``False`` with ``force``, and for a dataset with no Parquet.
+        ``expected``, when the converter knows from the path or name of the raw
+        file which outputs it should have (:func:`output_id`), also requires a
+        Parquet with each of those ids among the ones that cite it; see
+        :meth:`origin_complete` for why that matters. Always ``False`` with
+        ``force``, and for a dataset with no Parquet.
 
         .. warning::
 
@@ -1530,12 +1559,16 @@ class LakeWriter:
            Parquet per year or per group) declare the outputs when writing
            (``origin_outputs``) and ask :meth:`origin_complete` instead.
         """
-        return (
-            self._current_records(
-                Path(raw), member, contract_version, converter_version, None
-            )
-            is not None
+        records = self._current_records(
+            Path(raw), member, contract_version, converter_version, None
         )
+        if records is None:
+            return False
+        if expected is not None:
+            wanted = _normalize_outputs(expected, what="expected")
+            present = {rec.output_id for rec in records}
+            return all(output in present for output in wanted)
+        return True
 
     def origin_complete(
         self,
@@ -1545,6 +1578,7 @@ class LakeWriter:
         contract_version: int | None = None,
         converter_version: str | None = None,
         converter: str | None = None,
+        expected: Collection[str] | None = None,
     ) -> bool:
         """Whether ``raw`` is in the lake with **every** output it should have.
 
@@ -1573,15 +1607,47 @@ class LakeWriter:
           conservative answer is to reopen the file);
         * every output in the declaration exists in the dataset (a Parquet
           with that :func:`output_id`, citing the raw file with the current
-          digest). An output the declaration does not list is ignored.
+          digest). An output the declaration does not list is ignored;
+        * ``expected``, when given, is a subset of the declaration (so every
+          output in it exists too). It is the outputs the converter knows this
+          raw file should have from its path or name (the year of
+          ``raw/2021/dados.csv``, say), as :func:`output_id` names them. Only
+          the Parquets whose declaration includes all of them are considered:
+          those that cite the same file name for a raw file of another folder
+          are not this raw file's.
 
         ``False`` with ``force``. The raw file is not read when its sidecar is
-        trusted (:func:`sha256_file`). Origins are looked up by file name, so
-        two raw files with the same name in different folders (same
-        ``origin_file``) are one origin here: they never make this ``True``
-        wrongly (their digests differ, so the answer is ``False``), but they
-        also never skip each other; pass ``member`` with a distinguishing name
-        when the converter has such files.
+        trusted (:func:`sha256_file`).
+
+        .. warning::
+
+           Origins are looked up by file name (``quantilica.origin_file`` is
+           the raw file's ``name``, not its path). Two raw files with the same
+           name **and the same bytes** in different folders
+           (``raw/2020/dados.csv`` and ``raw/2021/dados.csv``) are therefore the
+           same origin here: with the outputs of only the first one in the lake,
+           the answer for the second would be ``True`` and it would be skipped
+           wrongly. When the converter has files like that, pass ``expected``
+           with the outputs that file must have: the ones of the other folder
+           are not among them, so the answer is ``False`` until its own are
+           written. (Files with the same name and different bytes are told apart
+           by the digest and are never wrongly ``True``; ``member`` only
+           changes the name looked up, it does not tell the folders apart.)
+           Without ``expected`` the converter has to keep names unique: once
+           both folders are in the lake their declarations differ and the
+           answer stays ``False`` for both (the file is reopened and its writes
+           are skipped by :meth:`is_current`), which is safe but not fast.
+
+        .. note::
+
+           * A ZIP with several members that go to the same dataset (one
+             :meth:`write_member` per member, say) must declare the **union**
+             of the outputs of the whole ZIP in every write: ``origin_complete``
+             asks about the raw file, and Parquets with different declarations
+             make it ``False``.
+           * A raw file that feeds two datasets needs its own
+             ``origin_complete`` in the writer of each dataset: an answer
+             about one says nothing about the other.
 
         Example (a ZIP that yields one Parquet per year)::
 
@@ -1600,6 +1666,13 @@ class LakeWriter:
         )
         if not records:
             return False
+        if expected is not None:
+            wanted = set(_normalize_outputs(expected, what="expected"))
+            records = [
+                rec for rec in records if rec.outputs and wanted <= set(rec.outputs)
+            ]
+            if not records:
+                return False
         declarations = {rec.outputs for rec in records}
         if len(declarations) != 1:
             return False
@@ -1621,7 +1694,7 @@ class LakeWriter:
         what it skipped after :meth:`origin_complete` said ``True``.
         """
         raw = Path(raw)
-        records = self._origin_index().get(member or raw.name)
+        records = self._origin_records(member or raw.name)
         if not records:
             return None
         digest = sha256_file(raw)
@@ -1642,7 +1715,7 @@ class LakeWriter:
         """The records that cite ``raw`` when all of them are current, else ``None``."""
         if self.force:
             return None
-        records = self._origin_index().get(member or raw.name)
+        records = self._origin_records(member or raw.name)
         if not records:
             return None
         digest = sha256_file(raw)
@@ -1670,35 +1743,102 @@ class LakeWriter:
             return records
         return None
 
-    def _origin_index(self) -> dict[str, list[_OriginRecord]]:
-        """``{origin file name: records}`` of the dataset's footers.
+    def _origin_records(self, name: str) -> list[_OriginRecord]:
+        """The records of the Parquets that cite ``name``, in path order."""
+        self._sync_origins()
+        found = self._origin_by_name.get(name)
+        if not found:
+            return []
+        return [found[path] for path in sorted(found)]
 
-        Footers are read lazily, and a file is read again only when its size or
-        modification time changed. Every call lists the dataset's Parquets (names,
-        sizes and times: no footer is opened), so the index also follows what
-        another writer instance, or another process, adds, replaces or removes.
+    def _sync_origins(self) -> None:
+        """Bring the footer index up to date with the dataset's directories.
+
+        A Parquet's footer is read again only when its size or modification
+        time changed. To know which files to look at, every call stats each
+        *directory* of the dataset (the dataset folder and every partition
+        folder, ``.tmp`` apart: a handful) and lists again only the ones whose
+        modification time changed, since creating, renaming over or removing a
+        child changes it. Files of an unchanged directory keep their stamp
+        without being touched, so the cost of a query does not grow with the
+        number of Parquets, and what another writer instance or process adds,
+        replaces or removes is still seen. A listed directory is trusted only
+        when its time is older than ``_ORIGIN_RACY_NS`` at the moment it was
+        listed (a change in the same clock tick would not move it), and the
+        directories this writer publishes into are always listed again.
         A Parquet replaced by one with the same size and the same modification
         time to the clock's resolution would go unnoticed: the lake publishes by
         renaming a file written a moment before, so its time is new.
+
+        Limits: a file system that does not update a directory's modification
+        time on rename (some network mounts) is not followed outside this
+        writer's own writes; and a directory that holds many Parquets
+        (a dataset without partitions) is listed, with one ``stat`` per file,
+        each time it changes, which includes every write into it.
         """
-        stamps = _parquet_stamps(self.dataset_dir)
-        if self._origin_cache is not None and stamps == self._origin_stamps:
-            return self._origin_cache
-        files: dict[str, tuple[tuple[int, int], list[tuple[str, _OriginRecord]]]] = {}
-        for path, stamp in stamps.items():
+        started = time.time_ns()
+        dirty, self._origin_dirty = self._origin_dirty, set()
+        old = self._origin_dirs
+        new: dict[str, _DirListing] = {}
+        stack = [os.fspath(self.dataset_dir)]
+        while stack:
+            directory = stack.pop()
+            try:
+                mtime = os.stat(directory).st_mtime_ns
+            except OSError:
+                continue
+            prev = old.get(directory)
+            if (
+                prev is not None
+                and prev.trusted
+                and prev.mtime_ns == mtime
+                and directory not in dirty
+            ):
+                listing = prev
+            else:
+                listed = _list_origin_dir(directory)
+                if listed is None:
+                    continue
+                subdirs, files = listed
+                listing = _DirListing(
+                    mtime, started - mtime > _ORIGIN_RACY_NS, subdirs, files
+                )
+                self._apply_listing(prev.files if prev is not None else {}, files)
+            new[directory] = listing
+            stack.extend(listing.subdirs)
+        for directory, prev in old.items():
+            if directory not in new:
+                self._apply_listing(prev.files, {})
+        self._origin_dirs = new
+
+    def _apply_listing(
+        self,
+        before: Mapping[str, tuple[int, int]],
+        after: Mapping[str, tuple[int, int]],
+    ) -> None:
+        """Update the footer index for one directory listed again."""
+        for path in before.keys() - after.keys():
+            self._drop_origin_file(path)
+        for path, stamp in after.items():
             cached = self._origin_files.get(path)
             if cached is not None and cached[0] == stamp:
-                files[path] = cached
-            else:
-                files[path] = (stamp, self._read_origins(Path(path)))
-        index: dict[str, list[_OriginRecord]] = {}
-        for path in sorted(files):
-            for name, record in files[path][1]:
-                index.setdefault(name, []).append(record)
-        self._origin_files = files
-        self._origin_stamps = stamps
-        self._origin_cache = index
-        return index
+                continue
+            self._drop_origin_file(path)
+            pairs = self._read_origins(Path(path))
+            self._origin_files[path] = (stamp, pairs)
+            for name, record in pairs:
+                self._origin_by_name.setdefault(name, {})[path] = record
+
+    def _drop_origin_file(self, path: str) -> None:
+        cached = self._origin_files.pop(path, None)
+        if cached is None:
+            return
+        for name, _ in cached[1]:
+            holders = self._origin_by_name.get(name)
+            if holders is not None:
+                holders.pop(path, None)
+                if not holders:
+                    del self._origin_by_name[name]
 
     def _read_origins(self, path: Path) -> list[tuple[str, _OriginRecord]]:
         """The ``(origin file name, record)`` pairs one Parquet footer holds."""
@@ -1760,11 +1900,16 @@ class LakeWriter:
             )
         return found
 
-    def _forget_origins(self) -> None:
-        """Drop the footer index: the dataset's files are about to change."""
-        self._origin_cache = None
-        self._origin_stamps = {}
-        self._origin_files = {}
+    def _forget_origins(self, directory: Path) -> None:
+        """The files of ``directory`` (and the folders above it, which may be
+        new) are about to change: list them again at the next query. Footers
+        already read are kept; ``_sync_origins`` compares their stamps."""
+        current = Path(directory)
+        while True:
+            self._origin_dirty.add(os.fspath(current))
+            if current == self.dataset_dir or current == current.parent:
+                break
+            current = current.parent
 
     def _declared(
         self,
@@ -2247,7 +2392,7 @@ class LakeWriter:
 
         Returns ``(removed, kept)``; see :meth:`write_group` for the test.
         """
-        self._forget_origins()
+        self._forget_origins(target)
         if not replaces and not replace_partition:
             return [], []
         if replace_partition:
@@ -2686,9 +2831,8 @@ class LakeWriter:
 
     def _move(self, tmp: Path, final: Path) -> None:
         """Publish a staged file (see :func:`_durable_replace`)."""
-        self._forget_origins()
+        self._forget_origins(final.parent)
         _durable_replace(tmp, final, self.dataset_dir / TMP_DIRNAME)
-        self._forget_origins()
 
     def _skip_if_current(
         self,
@@ -2750,7 +2894,7 @@ class LakeWriter:
 
     def _publish(self, target: Path, key: str, staged: list[Path]) -> list[Path]:
         """Move staged parts into ``target`` and drop leftovers of older splits."""
-        self._forget_origins()
+        self._forget_origins(target)
         target.mkdir(parents=True, exist_ok=True)
         names = (
             [f"{key}.parquet"]
@@ -2797,7 +2941,6 @@ class LakeWriter:
             if orphan not in keep:
                 orphan.unlink()
         _rmdir_if_empty_tmp(hop_dir)
-        self._forget_origins()
         return outputs
 
     def _save_descriptor(
@@ -3294,36 +3437,33 @@ def _dataset_files(dataset_dir: Path) -> list[Path]:
     )
 
 
-def _parquet_stamps(dataset_dir: Path) -> dict[str, tuple[int, int]]:
-    """``{Parquet path: (size, mtime_ns)}`` of a dataset, footers not opened.
+def _list_origin_dir(
+    directory: str,
+) -> tuple[tuple[str, ...], dict[str, tuple[int, int]]] | None:
+    """One directory of a dataset: ``(subdirectories, {Parquet: (size, mtime_ns)})``.
 
     The same files as :func:`_dataset_files` (nothing under ``.tmp``), listed
-    with ``scandir`` and keyed by plain strings: cheap enough to run before
-    every origin lookup.
+    with ``scandir`` and keyed by plain strings; no footer is opened. ``None``
+    when the directory cannot be listed.
     """
-    found: dict[str, tuple[int, int]] = {}
-
-    def walk(directory: str) -> None:
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    try:
-                        name = entry.name
-                        if name.endswith(".parquet"):
-                            if entry.is_file():
-                                info = entry.stat()
-                                found[entry.path] = (info.st_size, info.st_mtime_ns)
-                        elif name != TMP_DIRNAME and entry.is_dir(
-                            follow_symlinks=False
-                        ):
-                            walk(entry.path)
-                    except OSError:
-                        continue
-        except OSError:
-            return
-
-    walk(os.fspath(dataset_dir))
-    return found
+    subdirs: list[str] = []
+    files: dict[str, tuple[int, int]] = {}
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                try:
+                    name = entry.name
+                    if name.endswith(".parquet"):
+                        if entry.is_file():
+                            info = entry.stat()
+                            files[entry.path] = (info.st_size, info.st_mtime_ns)
+                    elif name != TMP_DIRNAME and entry.is_dir(follow_symlinks=False):
+                        subdirs.append(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return None
+    return tuple(subdirs), files
 
 
 def scan_dataset(dataset_dir: Path) -> pl.LazyFrame:

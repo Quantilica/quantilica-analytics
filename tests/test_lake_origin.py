@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat as stat_module
 import time
 from pathlib import Path
 
@@ -189,7 +190,7 @@ def test_indice_lido_uma_vez_e_refeito_apos_escrita(
     calls.clear()
     assert writer.origin_recorded(raw)
     assert writer.origin_recorded(raw)
-    assert len(calls) == 4  # rebuilt once after the write
+    assert len(calls) == 1  # only the footer of the new file is read
 
 
 # --- origin_outputs / origin_complete ------------------------------------------------
@@ -743,9 +744,8 @@ def test_cache_nao_le_rodape_sem_mudanca(
     assert len(calls) == 1
 
 
-def test_colisao_de_basename_nunca_da_pulo_falso(tmp_path: Path) -> None:
-    """Two raw files named alike in different folders are one origin by name:
-    the answer is False for both once their digests differ, never True."""
+def test_colisao_de_basename_com_bytes_diferentes(tmp_path: Path) -> None:
+    """Same name, different bytes: told apart by the digest, never True."""
     a = _raw(tmp_path, "x/dados.zip", "aaa")
     b = _raw(tmp_path, "y/dados.zip", "bbb")
     writer = _writer(tmp_path)
@@ -755,5 +755,213 @@ def test_colisao_de_basename_nunca_da_pulo_falso(tmp_path: Path) -> None:
     _write_declared(writer, b, (2021,), _decl(2021))
     assert not writer.origin_complete(a)
     assert not writer.origin_complete(b)
-    # The way out is a distinguishing member name.
-    assert not writer.origin_complete(a, member="x/dados.zip")
+
+
+def test_colisao_de_basename_nunca_da_pulo_falso(tmp_path: Path) -> None:
+    """Same name AND same bytes in two folders are one origin by name: without
+    ``expected`` the second is wrongly True; with it, False until its own
+    outputs exist."""
+    a = _raw(tmp_path, "2020/dados.csv", "mesmo conteudo")
+    b = _raw(tmp_path, "2021/dados.csv", "mesmo conteudo")
+    writer = _writer(tmp_path)
+    _write_declared(writer, a, (2020,), _decl(2020, key="dados"), key="dados")
+    assert writer.origin_complete(a)
+    # The documented limit: the file name is all the footer knows.
+    assert writer.origin_complete(b)
+    # The correction: say which outputs the file must have.
+    assert writer.origin_complete(a, expected=_decl(2020, key="dados"))
+    assert not writer.origin_complete(b, expected=_decl(2021, key="dados"))
+    assert not writer.origin_recorded(b, expected=_decl(2021, key="dados"))
+    assert writer.origin_recorded(a, expected=_decl(2020, key="dados"))
+    # Written for 2021 too (each declares its own outputs): the plain answer is
+    # now False for both, and expected tells them apart.
+    _write_declared(writer, b, (2021,), _decl(2021, key="dados"), key="dados")
+    assert not writer.origin_complete(a)
+    assert writer.origin_complete(a, expected=_decl(2020, key="dados"))
+    assert writer.origin_complete(b, expected=_decl(2021, key="dados"))
+    assert writer.origin_recorded(b, expected=_decl(2021, key="dados"))
+    # An output it was not declared with is never complete.
+    assert not writer.origin_complete(b, expected=_decl(2021, 2022, key="dados"))
+
+
+def test_expected_exige_saidas_declaradas_e_existentes(tmp_path: Path) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    declared = _decl(2020, 2021)
+    _write_declared(writer, raw, (2020,), declared)
+    assert not writer.origin_complete(raw, expected=_decl(2020))  # 2021 missing
+    _write_declared(writer, raw, (2021,), declared)
+    assert writer.origin_complete(raw, expected=_decl(2020))
+    assert writer.origin_complete(raw, expected=declared)
+    assert not writer.origin_complete(raw, expected=_decl(2022))
+    with pytest.raises(ValueError):
+        writer.origin_complete(raw, expected=[""])
+    with pytest.raises(TypeError):
+        writer.origin_complete(raw, expected="ano=2020/acidentes")
+
+
+# --- cost of the index ---------------------------------------------------------------
+
+
+def test_laco_de_escritas_le_cada_rodape_uma_vez(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``if origin_complete: continue; write`` over N raw files reads O(N)
+    footers, not O(N^2): the writer keeps what it read after its own writes."""
+    n = 25
+    raws = [_raw(tmp_path, f"r{i:03d}.csv", f"conteudo {i}") for i in range(n)]
+    writer = _writer(tmp_path)
+    calls: list[object] = []
+    real = pq.read_metadata
+
+    def counting(path, *args, **kwargs):
+        calls.append(path)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_metadata", counting)
+    for i, raw in enumerate(raws):
+        outs = _decl(2000 + i, key=raw.stem)
+        if writer.origin_complete(raw):
+            continue
+        _write_declared(writer, raw, (2000 + i,), outs, key=raw.stem)
+    assert len(calls) <= n  # each file's footer once
+    calls.clear()
+    assert all(writer.origin_complete(raw) for raw in raws)
+    assert len(calls) <= 1  # the last file written, not read yet
+
+
+def test_diretorio_sem_mudanca_nao_e_listado_de_novo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from quantilica.analytics import lake
+
+    monkeypatch.setattr(lake, "_ORIGIN_RACY_NS", 0)
+    raw = _raw(tmp_path)
+    _write_declared(_writer(tmp_path), raw, (2020, 2021, 2022), _decl(2020, 2021, 2022))
+    writer = _writer(tmp_path)
+    listed: list[str] = []
+    real = lake._list_origin_dir
+
+    def counting(directory):
+        listed.append(directory)
+        return real(directory)
+
+    monkeypatch.setattr(lake, "_list_origin_dir", counting)
+    assert writer.origin_complete(raw)
+    assert len(listed) == 4  # dataset + 3 partitions
+    listed.clear()
+    for _ in range(10):
+        assert writer.origin_complete(raw)
+    assert not listed
+    # Another instance adds a file to one partition: that folder and the dataset
+    # folder (its ``.tmp`` and ``_dataset.json`` moved) are listed, no other.
+    other_raw = _raw(tmp_path, "outro.csv", "x")
+    _write_declared(
+        _writer(tmp_path), other_raw, (2021,), _decl(2021, key="outro"), key="outro"
+    )
+    assert writer.origin_complete(raw)
+    assert sorted(Path(d).name for d in listed) == ["acidentes", "ano=2021"]
+
+
+def test_particoes_aninhadas_sao_percorridas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file created two levels down does not touch the grandparent's time."""
+    from quantilica.analytics import lake
+
+    monkeypatch.setattr(lake, "_ORIGIN_RACY_NS", 0)
+    descriptor = DatasetDescriptor(
+        source_id="antt",
+        dataset_id="acidentes",
+        alias="acidentes",
+        partition_keys=["ano", "mes"],
+        partition_types={"ano": "int", "mes": "varchar"},
+    )
+    directory = tmp_path / "lake" / "antt" / "acidentes"
+
+    def writer() -> LakeWriter:
+        return LakeWriter(directory, descriptor)
+
+    raw = _raw(tmp_path)
+    parts = [{"ano": 2020, "mes": "01"}, {"ano": 2020, "mes": "02"}]
+    outs = [output_id(p, "acidentes") for p in parts]
+    first = writer()
+    first.write_polars(
+        pl.DataFrame({"v": [1]}),
+        raw,
+        partitions=parts[0],
+        file_key_name="acidentes",
+        origin_outputs=outs,
+    )
+    reader = writer()
+    assert not reader.origin_complete(raw)
+    # The second partition appears under an existing "ano=2020".
+    first.write_polars(
+        pl.DataFrame({"v": [2]}),
+        raw,
+        partitions=parts[1],
+        file_key_name="acidentes",
+        origin_outputs=outs,
+    )
+    assert reader.origin_complete(raw)
+    # A file added inside an existing leaf folder by another instance.
+    other = _raw(tmp_path, "z.csv", "z")
+    writer().write_polars(
+        pl.DataFrame({"v": [3]}),
+        other,
+        partitions=parts[1],
+        file_key_name="z",
+        origin_outputs=[output_id(parts[1], "z")],
+    )
+    assert reader.origin_complete(other)
+    # And a removal two levels down.
+    (directory / "ano=2020" / "mes=02" / "z.parquet").unlink()
+    assert not reader.origin_complete(other)
+
+
+def test_mudanca_no_mesmo_tique_do_relogio_e_vista(tmp_path: Path) -> None:
+    """A change that leaves the directory's time as it was (same clock tick) is
+    still seen while that time is recent."""
+    raw = _raw(tmp_path)
+    declared = _decl(2020, 2021)
+    other = _writer(tmp_path)
+    _write_declared(other, raw, (2020,), declared)
+    reader = _writer(tmp_path)
+    assert not reader.origin_complete(raw)
+    partition = other.dataset_dir / "ano=2020"
+    before = partition.stat().st_mtime_ns
+    _write_declared(other, raw, (2021,), declared)
+    dataset = other.dataset_dir
+    os.utime(dataset, ns=(before, before))  # as if nothing happened in this tick
+    assert reader.origin_complete(raw)
+
+
+def test_escritas_proprias_sem_mtime_de_diretorio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer's own writes are seen even when the directory looks old and
+    its time did not move."""
+    from quantilica.analytics import lake
+
+    monkeypatch.setattr(lake, "_ORIGIN_RACY_NS", 0)
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    declared = _decl(2020, 2021)
+    _write_declared(writer, raw, (2020,), declared)
+    assert not writer.origin_complete(raw)
+    real_stat = os.stat
+    frozen = {}
+
+    def fake_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        key = os.fspath(path)
+        if key in frozen:
+            return frozen[key]
+        if stat_module.S_ISDIR(result.st_mode):
+            frozen[key] = result
+        return result
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+    assert not writer.origin_complete(raw)  # directories frozen from here on
+    _write_declared(writer, raw, (2021,), declared)
+    assert writer.origin_complete(raw)
