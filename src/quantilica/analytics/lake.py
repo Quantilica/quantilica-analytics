@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -118,6 +118,11 @@ META_CONVERTED_AT = "quantilica.converted_at"
 # the member's file key in ORIGIN_COLUMN.
 META_MEMBERS = "quantilica.members"
 META_MEMBER_COLUMNS = "quantilica.member_columns"
+# Every output a raw file produces in the dataset (one Parquet per year, say),
+# declared by the converter before it writes the first one: a JSON list of
+# ``"<hive partition>/<file key>"`` (see :func:`output_id`). For a grouped file the
+# list is the ``outputs`` field of the member's ``quantilica.members`` entry.
+META_ORIGIN_OUTPUTS = "quantilica.origin_outputs"
 ORIGIN_COLUMN = "_origem"
 # Metadata that every Parquet in the lake must carry.
 REQUIRED_METADATA = (
@@ -209,6 +214,12 @@ class GroupMember:
             as literal text columns. Every member of a group has the same column
             names, and none of them may be the name of a data column.
         sha256: The digest of ``src`` when the caller already has it.
+        origin_outputs: Every output (group) this raw file feeds in the dataset,
+            as :func:`output_id` names them, this group included; recorded in
+            the member's entry as ``outputs`` (see
+            :meth:`LakeWriter.origin_complete`). ``None`` records nothing; when
+            given, a member whose entry lacks it or has a different list is
+            rewritten.
     """
 
     src: Path
@@ -216,6 +227,7 @@ class GroupMember:
     key: str | None = None
     columns: Mapping[str, str] = field(default_factory=dict)
     sha256: str | None = None
+    origin_outputs: Collection[str] | None = None
 
 
 @dataclass
@@ -246,6 +258,7 @@ ENTRY_FIELDS = frozenset(
         "converted_at",
         "contract_version",
         "converter_version",
+        "outputs",
     }
 )
 
@@ -764,6 +777,65 @@ def footer_from_metadata(metadata: pq.FileMetaData) -> dict[str, str]:
     }
 
 
+def output_id(partitions: Mapping[str, Any] | None, file_key_name: str) -> str:
+    """Name of one output of a dataset, as ``origin_outputs`` lists it.
+
+    ``"<hive partition folders>/<file key>"``, the folders built by the same
+    function the writer uses for the path (so values are encoded alike), relative
+    to the dataset: ``output_id({"ano": 2021, "mes": "01"}, "repetro__a")`` is
+    ``"ano=2021/mes=01/repetro__a"``, and without partitions the id is just the
+    file key. Part files (``-001``, ``-002``...) are one output. For a grouped
+    file the id is the partition and the group key.
+
+    Two raw files that give the same file key in the same partition are the same
+    output: ids are as unambiguous as the file keys the converter picks.
+    """
+    relative = partition_dir(Path("."), dict(partitions or {})).as_posix()
+    relative = "" if relative == "." else relative
+    return f"{relative}/{file_key_name}" if relative else file_key_name
+
+
+def _normalize_outputs(
+    outputs: Collection[str], own: str | None = None
+) -> tuple[str, ...]:
+    """Sorted, de-duplicated ``origin_outputs``; ``own`` must be one of them."""
+    if isinstance(outputs, str) or not isinstance(outputs, Collection):
+        raise TypeError("origin_outputs must be a collection of output ids (str)")
+    for item in outputs:
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                f"origin_outputs holds {item!r}; expected non-empty str ids "
+                "(see output_id)"
+            )
+    normalized = tuple(sorted(set(outputs)))
+    if own is not None and own not in normalized:
+        raise ValueError(
+            f"origin_outputs does not list the output being written, {own!r}; "
+            f"got {list(normalized)}"
+        )
+    return normalized
+
+
+def _outputs_field(outputs: Collection[str] | None) -> dict[str, list[str]]:
+    """The ``outputs`` field of a ``quantilica.members`` entry (none: no field)."""
+    return {} if outputs is None else {"outputs": list(_normalize_outputs(outputs))}
+
+
+def _parse_outputs(value: Any) -> tuple[str, ...] | None:
+    """The outputs declared by a footer value or entry field; ``None`` if absent
+    or malformed (the conservative reading: no declaration)."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        return None
+    return tuple(sorted(set(value)))
+
+
 def _part_files(directory: Path, key: str) -> list[Path]:
     """Parquet files in ``directory`` that belong to ``key`` (by footer)."""
     if not directory.is_dir():
@@ -784,13 +856,18 @@ def origin_matches(
     *,
     layout_version: int = LAYOUT_VERSION,
     contract_version: int | None = None,
+    origin_outputs: Collection[str] | None = None,
 ) -> bool:
     """Whether ``key`` is already in ``directory`` for this origin.
 
     True when the existing parts form one complete set (a lone ``<key>.parquet``
     or ``-001..-N`` without gaps) written in a single run, and every part
-    records the same ``sha256``, layout version and contract version.
+    records the same ``sha256``, layout version and contract version. With
+    ``origin_outputs`` every part must also record exactly that declaration
+    (``quantilica.origin_outputs``); a file written before the declaration
+    existed is then not current, so the next write adds it.
     """
+    declared = None if origin_outputs is None else _normalize_outputs(origin_outputs)
     parts = _part_files(directory, key)
     if not parts:
         return False
@@ -813,6 +890,10 @@ def origin_matches(
             meta.get(META_ORIGIN_SHA) != sha256
             or meta.get(META_LAYOUT) != str(layout_version)
             or meta.get(META_CONTRACT_VERSION) != expected_contract
+        ):
+            return False
+        if declared is not None and (
+            _parse_outputs(meta.get(META_ORIGIN_OUTPUTS)) != declared
         ):
             return False
         runs.add(meta.get(META_CONVERTED_AT))
@@ -854,6 +935,7 @@ def _entry_is_current(
     columns: Mapping[str, Any] | None = None,
     contract_version: int | None = None,
     converter_version: str | None = None,
+    origin_outputs: Collection[str] | None = None,
 ) -> bool:
     """Whether a ``quantilica.members`` entry is up to date for the raw file.
 
@@ -861,9 +943,10 @@ def _entry_is_current(
     when the caller passes one: an entry written before versions were recorded
     has none, so it is stale for a caller that passes a version and current for
     one that does not. ``columns`` (the member columns' values) are compared
-    when given.
+    when given, and so is ``origin_outputs`` against the entry's ``outputs``
+    (an entry without them is stale for a caller that declares them).
     """
-    if entry is None or entry.get("origin_sha256") != sha256:
+    if not isinstance(entry, Mapping) or entry.get("origin_sha256") != sha256:
         return False
     if contract_version is not None and entry.get("contract_version") != (
         contract_version
@@ -871,6 +954,10 @@ def _entry_is_current(
         return False
     if converter_version is not None and entry.get("converter_version") != (
         converter_version
+    ):
+        return False
+    if origin_outputs is not None and _parse_outputs(entry.get("outputs")) != (
+        _normalize_outputs(origin_outputs)
     ):
         return False
     return all(entry.get(k) == v for k, v in (columns or {}).items())
@@ -885,13 +972,15 @@ def member_matches(
     layout_version: int = LAYOUT_VERSION,
     contract_version: int | None = None,
     converter_version: str | None = None,
+    origin_outputs: Collection[str] | None = None,
 ) -> bool:
     """Whether member ``key`` is in the grouped file ``path`` with ``sha256``.
 
     ``key`` is the member's key in ``quantilica.members``: ``file_key(src)``, or
     a composite key (``composite_file_key``) for a member of a ZIP. With
     ``contract_version``/``converter_version`` the recorded versions must match
-    too; see :func:`_entry_is_current` for the rule on entries without them.
+    too; see :func:`_entry_is_current` for the rule on entries without them, which
+    also holds for ``origin_outputs``.
     """
     if not path.is_file():
         return False
@@ -903,6 +992,7 @@ def member_matches(
         sha256,
         contract_version=contract_version,
         converter_version=converter_version,
+        origin_outputs=origin_outputs,
     )
 
 
@@ -1199,6 +1289,11 @@ class _OriginRecord:
     converted_at: str | None
     contract_version: str | None
     entry: Mapping[str, Any] | None
+    # The Parquet's own output id (``output_id``) and what it declares about the
+    # raw file's outputs (``None``: nothing, or something malformed).
+    output_id: str | None = None
+    outputs: tuple[str, ...] | None = None
+    converter: str | None = None
 
 
 # --- writer ------------------------------------------------------------------------
@@ -1250,6 +1345,10 @@ class LakeWriter:
         self.force = force
         self.max_part_bytes = max_part_bytes
         self._origin_cache: dict[str, list[_OriginRecord]] | None = None
+        self._origin_stamps: dict[str, tuple[int, int]] = {}
+        self._origin_files: dict[
+            str, tuple[tuple[int, int], list[tuple[str, _OriginRecord]]]
+        ] = {}
         configure_scratch()
 
     # -- public API --
@@ -1275,8 +1374,12 @@ class LakeWriter:
         skip: int = 0,
         decimal_comma: bool = True,
         members: str | None = None,
+        origin_outputs: Collection[str] | None = None,
     ) -> LakeWriteResult:
         """Convert a CSV/TXT (or the members of a ZIP/7z) with DuckDB, streaming.
+
+        ``origin_outputs`` declares every output the raw file produces in the
+        dataset (see :meth:`origin_complete`); it must include this one.
 
         ``members`` (a case-insensitive glob) picks which text members of a
         ZIP/7z are read; a ``.gz`` is decompressed first.
@@ -1305,9 +1408,12 @@ class LakeWriter:
             raise ValueError("names is required when header is False.")
         digest = sha256_file(origin)
         key = file_key_name or file_key(origin)
+        declared = self._declared(origin_outputs, partitions, key)
         with dataset_lock(self.dataset_dir):
             target = self._target(partitions)
-            skipped = self._skip_if_current(target, key, origin, digest, contract)
+            skipped = self._skip_if_current(
+                target, key, origin, digest, contract, declared
+            )
             if skipped:
                 return skipped
             staging = self._staging_dir()
@@ -1334,6 +1440,7 @@ class LakeWriter:
                     skip=skip,
                     decimal_comma=decimal_comma,
                     members=members,
+                    origin_outputs=declared,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -1349,12 +1456,14 @@ class LakeWriter:
         file_key_name: str | None = None,
         src_origin: Path | None = None,
         contract: DataContract | None = None,
+        origin_outputs: Collection[str] | None = None,
     ) -> bool:
         """Whether ``src`` is already in the lake with its current ``sha256``.
 
         The same test the writers run before writing, exposed so a converter
         can skip an expensive read (a DBC decode, say) for a file that would be
-        skipped anyway. Always ``False`` with ``force``.
+        skipped anyway. Always ``False`` with ``force``. ``origin_outputs`` as
+        in :meth:`write_polars`.
         """
         if self.force:
             return False
@@ -1363,7 +1472,7 @@ class LakeWriter:
         target = self._target(dict(partitions or {}))
         key = file_key_name or file_key(origin)
         skipped = self._skip_if_current(
-            target, key, origin, sha256_file(origin), contract
+            target, key, origin, sha256_file(origin), contract, origin_outputs
         )
         return skipped is not None
 
@@ -1382,9 +1491,9 @@ class LakeWriter:
         say) and so cannot call :meth:`is_current` before reading. It looks at
         the footers of every Parquet of the dataset, never at their columns: the
         footers are read once per writer (lazily, and again after this writer
-        writes, replaces or removes something), so asking for many raw files
-        costs one pass over the footers, not one per call. Files written by
-        another process after the first call are not seen by this instance.
+        writes, replaces or removes something, or after the dataset's files
+        change under it), so asking for many raw files costs one pass over the
+        footers, not one per call.
 
         True only when:
 
@@ -1410,20 +1519,141 @@ class LakeWriter:
 
         ``member`` is the name the footers cite when it is not ``raw.name``.
         Always ``False`` with ``force``, and for a dataset with no Parquet.
+
+        .. warning::
+
+           This only proves that the Parquets that exist are current, not that
+           all the ones the raw file should produce exist: a conversion that
+           stopped halfway (a kill, no space left, an error in one year) leaves
+           a few of them, and the rest would never be tried again. For a raw
+           file that produces several outputs (a ZIP of several members, one
+           Parquet per year or per group) declare the outputs when writing
+           (``origin_outputs``) and ask :meth:`origin_complete` instead.
         """
-        if self.force:
+        return (
+            self._current_records(
+                Path(raw), member, contract_version, converter_version, None
+            )
+            is not None
+        )
+
+    def origin_complete(
+        self,
+        raw: Path,
+        *,
+        member: str | None = None,
+        contract_version: int | None = None,
+        converter_version: str | None = None,
+        converter: str | None = None,
+    ) -> bool:
+        """Whether ``raw`` is in the lake with **every** output it should have.
+
+        :meth:`origin_recorded` plus the declaration of the outputs: a converter
+        that knows the full list of outputs of a raw file before it writes the
+        first one passes it as ``origin_outputs`` to every write of that file
+        (:meth:`write_duckdb`, :meth:`write_polars`, :meth:`write_member`, or
+        ``GroupMember.origin_outputs`` for :meth:`write_group`), and the list is
+        recorded in each Parquet's footer (``quantilica.origin_outputs``, or
+        ``outputs`` in the member's entry). A conversion interrupted midway
+        leaves Parquets that name outputs which do not exist, and this method
+        says ``False`` until they are all there.
+
+        True only when:
+
+        * everything :meth:`origin_recorded` requires holds (same digest, layout
+          version and, when given, ``contract_version``/``converter_version``);
+        * ``converter``, when given, equals the footer's ``quantilica.converter``
+          of every Parquet that cites the raw file (the exact tag the converter
+          passes to the writer, ``"anp-fetcher 2.12.0"``, say). For a grouped
+          file that footer belongs to the last writer of the group, not of the
+          member: use ``converter_version`` to tell members apart;
+        * every Parquet that cites the raw file carries the same declaration
+          (a Parquet without one, written before declarations existed or by a
+          caller that did not pass it, makes the origin incomplete: the
+          conservative answer is to reopen the file);
+        * every output in the declaration exists in the dataset (a Parquet
+          with that :func:`output_id`, citing the raw file with the current
+          digest). An output the declaration does not list is ignored.
+
+        ``False`` with ``force``. The raw file is not read when its sidecar is
+        trusted (:func:`sha256_file`). Origins are looked up by file name, so
+        two raw files with the same name in different folders (same
+        ``origin_file``) are one origin here: they never make this ``True``
+        wrongly (their digests differ, so the answer is ``False``), but they
+        also never skip each other; pass ``member`` with a distinguishing name
+        when the converter has such files.
+
+        Example (a ZIP that yields one Parquet per year)::
+
+            years = years_in(zip_path)          # open it once, before writing
+            outs = [output_id({"ano": y}, key) for y in years]
+            if writer.origin_complete(zip_path, converter=tag):
+                skipped += len(outs)
+                continue
+            for y in years:
+                writer.write_polars(frame_of(y), zip_path,
+                                    partitions={"ano": y}, file_key_name=key,
+                                    converter=tag, origin_outputs=outs)
+        """
+        records = self._current_records(
+            Path(raw), member, contract_version, converter_version, converter
+        )
+        if not records:
             return False
+        declarations = {rec.outputs for rec in records}
+        if len(declarations) != 1:
+            return False
+        declared = next(iter(declarations))
+        if not declared:
+            return False
+        present = {rec.output_id for rec in records}
+        return all(output in present for output in declared)
+
+    def origin_outputs(
+        self, raw: Path, *, member: str | None = None
+    ) -> list[str] | None:
+        """The outputs declared for ``raw`` by the Parquets that cite it.
+
+        The declaration (``origin_outputs`` of the writes, sorted) shared by every
+        Parquet that cites ``member or raw.name`` with the current digest of
+        ``raw``; ``None`` when none does, when some lack it or when they differ.
+        Does not look at whether the outputs exist: it is how a converter counts
+        what it skipped after :meth:`origin_complete` said ``True``.
+        """
         raw = Path(raw)
         records = self._origin_index().get(member or raw.name)
         if not records:
-            return False
+            return None
+        digest = sha256_file(raw)
+        declarations = {rec.outputs for rec in records if rec.sha256 == digest}
+        if len(declarations) != 1:
+            return None
+        declared = next(iter(declarations))
+        return None if declared is None else list(declared)
+
+    def _current_records(
+        self,
+        raw: Path,
+        member: str | None,
+        contract_version: int | None,
+        converter_version: str | None,
+        converter: str | None,
+    ) -> list[_OriginRecord] | None:
+        """The records that cite ``raw`` when all of them are current, else ``None``."""
+        if self.force:
+            return None
+        records = self._origin_index().get(member or raw.name)
+        if not records:
+            return None
         digest = sha256_file(raw)
         layout = str(self.descriptor.layout_version)
         expected_contract = None if contract_version is None else str(contract_version)
         sets: dict[tuple[Path, str], list[_OriginRecord]] = {}
         for rec in records:
             if rec.sha256 != digest or rec.layout != layout:
-                return False
+                return None
+            if converter is not None and rec.converter != converter:
+                return None
             if rec.entry is not None:
                 if not _entry_is_current(
                     rec.entry,
@@ -1431,60 +1661,122 @@ class LakeWriter:
                     contract_version=contract_version,
                     converter_version=converter_version,
                 ):
-                    return False
+                    return None
             elif rec.contract_version != expected_contract or rec.file_key is None:
-                return False
+                return None
             else:
                 sets.setdefault((rec.path.parent, rec.file_key), []).append(rec)
-        return all(_is_complete_set(key, parts) for (_, key), parts in sets.items())
+        if all(_is_complete_set(key, parts) for (_, key), parts in sets.items()):
+            return records
+        return None
 
     def _origin_index(self) -> dict[str, list[_OriginRecord]]:
-        """``{origin file name: records}`` of the dataset's footers (built once)."""
-        if self._origin_cache is None:
-            index: dict[str, list[_OriginRecord]] = {}
-            for path in _dataset_files(self.dataset_dir):
-                try:
-                    meta = pq.read_metadata(path)
-                except (OSError, pa.ArrowException):
+        """``{origin file name: records}`` of the dataset's footers.
+
+        Footers are read lazily, and a file is read again only when its size or
+        modification time changed. Every call lists the dataset's Parquets (names,
+        sizes and times: no footer is opened), so the index also follows what
+        another writer instance, or another process, adds, replaces or removes.
+        A Parquet replaced by one with the same size and the same modification
+        time to the clock's resolution would go unnoticed: the lake publishes by
+        renaming a file written a moment before, so its time is new.
+        """
+        stamps = _parquet_stamps(self.dataset_dir)
+        if self._origin_cache is not None and stamps == self._origin_stamps:
+            return self._origin_cache
+        files: dict[str, tuple[tuple[int, int], list[tuple[str, _OriginRecord]]]] = {}
+        for path, stamp in stamps.items():
+            cached = self._origin_files.get(path)
+            if cached is not None and cached[0] == stamp:
+                files[path] = cached
+            else:
+                files[path] = (stamp, self._read_origins(Path(path)))
+        index: dict[str, list[_OriginRecord]] = {}
+        for path in sorted(files):
+            for name, record in files[path][1]:
+                index.setdefault(name, []).append(record)
+        self._origin_files = files
+        self._origin_stamps = stamps
+        self._origin_cache = index
+        return index
+
+    def _read_origins(self, path: Path) -> list[tuple[str, _OriginRecord]]:
+        """The ``(origin file name, record)`` pairs one Parquet footer holds."""
+        try:
+            meta = pq.read_metadata(path)
+        except (OSError, pa.ArrowException):
+            return []
+        footer = footer_from_metadata(meta)
+        directory = path.parent.relative_to(self.dataset_dir).as_posix()
+        file_key_ = footer.get(META_FILE_KEY)
+        output = None
+        if file_key_:
+            output = f"{directory}/{file_key_}" if directory != "." else file_key_
+        common = {
+            "path": path,
+            "file_key": file_key_,
+            "layout": footer.get(META_LAYOUT),
+            "converted_at": footer.get(META_CONVERTED_AT),
+            "output_id": output,
+            "converter": footer.get("quantilica.converter"),
+        }
+        found: list[tuple[str, _OriginRecord]] = []
+        if META_MEMBERS in footer:
+            try:
+                members = json.loads(footer[META_MEMBERS])
+            except ValueError:
+                return []
+            if not isinstance(members, dict):
+                return []
+            for entry in members.values():
+                if not isinstance(entry, dict):
                     continue
-                footer = footer_from_metadata(meta)
-                common = {
-                    "path": path,
-                    "file_key": footer.get(META_FILE_KEY),
-                    "layout": footer.get(META_LAYOUT),
-                    "converted_at": footer.get(META_CONVERTED_AT),
-                }
-                if META_MEMBERS in footer:
-                    try:
-                        members = json.loads(footer[META_MEMBERS])
-                    except ValueError:
-                        continue
-                    for entry in members.values():
-                        name = entry.get("origin_file")
-                        if name:
-                            index.setdefault(name, []).append(
-                                _OriginRecord(
-                                    sha256=entry.get("origin_sha256"),
-                                    contract_version=None,
-                                    entry=entry,
-                                    **common,
-                                )
-                            )
-                elif name := footer.get("quantilica.origin_file"):
-                    index.setdefault(name, []).append(
-                        _OriginRecord(
-                            sha256=footer.get(META_ORIGIN_SHA),
-                            contract_version=footer.get(META_CONTRACT_VERSION),
-                            entry=None,
-                            **common,
+                name = entry.get("origin_file")
+                if name and isinstance(name, str):
+                    found.append(
+                        (
+                            name,
+                            _OriginRecord(
+                                sha256=entry.get("origin_sha256"),
+                                contract_version=None,
+                                entry=entry,
+                                outputs=_parse_outputs(entry.get("outputs")),
+                                **common,
+                            ),
                         )
                     )
-            self._origin_cache = index
-        return self._origin_cache
+        elif name := footer.get("quantilica.origin_file"):
+            found.append(
+                (
+                    name,
+                    _OriginRecord(
+                        sha256=footer.get(META_ORIGIN_SHA),
+                        contract_version=footer.get(META_CONTRACT_VERSION),
+                        entry=None,
+                        outputs=_parse_outputs(footer.get(META_ORIGIN_OUTPUTS)),
+                        **common,
+                    ),
+                )
+            )
+        return found
 
     def _forget_origins(self) -> None:
         """Drop the footer index: the dataset's files are about to change."""
         self._origin_cache = None
+        self._origin_stamps = {}
+        self._origin_files = {}
+
+    def _declared(
+        self,
+        origin_outputs: Collection[str] | None,
+        partitions: Mapping[str, Any],
+        key: str,
+    ) -> tuple[str, ...] | None:
+        """``origin_outputs`` checked and normalized for the output ``key`` of
+        ``partitions`` (``None`` stays ``None``)."""
+        if origin_outputs is None:
+            return None
+        return _normalize_outputs(origin_outputs, output_id(partitions, key))
 
     def write_polars(
         self,
@@ -1495,6 +1787,7 @@ class LakeWriter:
         file_key_name: str | None = None,
         contract: DataContract | None = None,
         converter: str = "quantilica-analytics",
+        origin_outputs: Collection[str] | None = None,
     ) -> LakeWriteResult:
         """Write a DataFrame/LazyFrame that was read from ``src``.
 
@@ -1507,6 +1800,15 @@ class LakeWriter:
         the in-memory engine when the plan is not streamable). With
         ``max_part_bytes`` the frame is collected and split by rows, sized by
         its uncompressed estimate, so parts stay at or below the limit.
+
+        ``origin_outputs`` declares every output ``src`` produces in this dataset
+        (one Parquet per year, say), as :func:`output_id` names them and this
+        write's own included, and is recorded in the footer
+        (``quantilica.origin_outputs``) so that :meth:`origin_complete` can tell
+        a conversion that stopped halfway. Declare it before writing the first
+        output and pass the same list to all of them. Without it nothing changes.
+        A file already in the lake without that declaration (or with another) is
+        not skipped, so the next write adds it.
         """
         partitions = dict(partitions or {})
         if src is None and not file_key_name:
@@ -1514,10 +1816,13 @@ class LakeWriter:
         src = Path(src) if src is not None else None
         key = file_key_name or file_key(src)  # type: ignore[arg-type]
         digest = sha256_file(src) if src is not None else None
+        declared = self._declared(origin_outputs, partitions, key)
         with dataset_lock(self.dataset_dir):
             target = self._target(partitions)
             if digest is not None:
-                skipped = self._skip_if_current(target, key, src, digest, contract)
+                skipped = self._skip_if_current(
+                    target, key, src, digest, contract, declared
+                )
                 if skipped:
                     return skipped
             if contract is not None:
@@ -1534,6 +1839,7 @@ class LakeWriter:
                     contract,
                     converter,
                     partitions=partitions,
+                    origin_outputs=declared,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -1550,6 +1856,7 @@ class LakeWriter:
         member_key: str | None = None,
         contract_version: int | None = None,
         converter_version: str | None = None,
+        origin_outputs: Collection[str] | None = None,
     ) -> bool:
         """Whether ``src`` is already a member of the grouped file with its ``sha256``.
 
@@ -1560,7 +1867,8 @@ class LakeWriter:
         ``contract_version``/``converter_version`` the member counts as current
         only if it was written with the same versions; a member written
         without versions (an older footer, or a caller that did not pass any)
-        is then stale. Without them, versions are not compared.
+        is then stale. Without them, versions are not compared. The same holds
+        for ``origin_outputs`` (see :meth:`write_member`).
         """
         if self.force:
             return False
@@ -1574,6 +1882,7 @@ class LakeWriter:
             layout_version=self.descriptor.layout_version,
             contract_version=contract_version,
             converter_version=converter_version,
+            origin_outputs=origin_outputs,
         )
 
     def write_member(
@@ -1588,6 +1897,7 @@ class LakeWriter:
         member_key: str | None = None,
         contract_version: int | None = None,
         converter_version: str | None = None,
+        origin_outputs: Collection[str] | None = None,
     ) -> LakeWriteResult:
         """Write ``src`` into the partition's grouped file ``<group_key>.parquet``.
 
@@ -1603,12 +1913,19 @@ class LakeWriter:
 
         This rewrites the whole group for each member. To write a group of many
         members, use :meth:`write_group`, which rewrites it once.
+
+        ``origin_outputs`` lists every group (as :func:`output_id` names them:
+        partition and group key) that ``src`` feeds, this one included; it is
+        recorded as ``outputs`` in the member's entry, for
+        :meth:`origin_complete`. A member whose entry lacks it, or has another
+        list, is rewritten even if its digest is current.
         """
         src = Path(src)
         partitions = dict(partitions or {})
         member_columns = dict(member_columns or {})
         key = member_key or file_key(src)
         digest = sha256_file(src)
+        declared = self._declared(origin_outputs, partitions, group_key)
         with dataset_lock(self.dataset_dir):
             target = self._target(partitions)
             path = target / f"{group_key}.parquet"
@@ -1620,6 +1937,7 @@ class LakeWriter:
                 layout_version=self.descriptor.layout_version,
                 contract_version=contract_version,
                 converter_version=converter_version,
+                origin_outputs=declared,
             ):
                 return LakeWriteResult(src, [path], "skipped")
             staging = self._staging_dir()
@@ -1637,6 +1955,7 @@ class LakeWriter:
                     converter=converter,
                     contract_version=contract_version,
                     converter_version=converter_version,
+                    origin_outputs=declared,
                 )
             finally:
                 self._cleanup_staging(staging)
@@ -1659,6 +1978,7 @@ class LakeWriter:
         converter: str,
         contract_version: int | None = None,
         converter_version: str | None = None,
+        origin_outputs: tuple[str, ...] | None = None,
     ) -> LakeWriteResult:
         frame = data.collect() if isinstance(data, pl.LazyFrame) else data
         reserved = [*partitions, *member_columns, ORIGIN_COLUMN]
@@ -1688,6 +2008,7 @@ class LakeWriter:
             "converted_at": datetime.now(UTC).isoformat(timespec="seconds"),
             **member_columns,
             **_version_fields(contract_version, converter_version),
+            **_outputs_field(origin_outputs),
         }
         meta = self._metadata(group_key, None, None, None, converter)
         meta[META_MEMBERS] = json.dumps(members, sort_keys=True, ensure_ascii=False)
@@ -1994,6 +2315,8 @@ class LakeWriter:
             )
         digests: dict[Path, str] = {}
         resolved: list[tuple[GroupMember, str, str]] = []
+        declared: dict[str, tuple[str, ...]] = {}
+        own = output_id(partitions, group_key)
         seen: set[str] = set()
         for member in members:
             if list(member.columns) != columns:
@@ -2011,6 +2334,8 @@ class LakeWriter:
             if key in seen:
                 raise ValueError(f"duplicate member key {key!r} in group {group_key!r}")
             seen.add(key)
+            if member.origin_outputs is not None:
+                declared[key] = _normalize_outputs(member.origin_outputs, own)
             if member.sha256:
                 digest = member.sha256
             else:
@@ -2030,6 +2355,7 @@ class LakeWriter:
                 columns=member.columns,
                 contract_version=contract_version,
                 converter_version=converter_version,
+                origin_outputs=declared.get(key),
             ):
                 kept.append(key)
             else:
@@ -2144,6 +2470,7 @@ class LakeWriter:
                     "converted_at": datetime.now(UTC).isoformat(timespec="seconds"),
                     **member.columns,
                     **_version_fields(contract_version, converter_version),
+                    **_outputs_field(member.origin_outputs),
                 }
             existing = (
                 "[" + ", ".join(_lit(str(p)) for p in plan.state.parts) + "]"
@@ -2370,6 +2697,7 @@ class LakeWriter:
         src: Path | None,
         digest: str,
         contract: DataContract | None,
+        origin_outputs: Collection[str] | None = None,
     ) -> LakeWriteResult | None:
         if self.force:
             return None
@@ -2380,6 +2708,7 @@ class LakeWriter:
             digest,
             layout_version=self.descriptor.layout_version,
             contract_version=version,
+            origin_outputs=origin_outputs,
         ):
             return LakeWriteResult(src, _part_files(target, key), "skipped")
         return None
@@ -2391,6 +2720,7 @@ class LakeWriter:
         digest: str | None,
         contract: DataContract | None,
         converter: str,
+        origin_outputs: Collection[str] | None = None,
     ) -> dict[str, str]:
         manifest = read_manifest_sidecar(src) if src is not None else None
         meta = manifest_to_metadata(manifest)
@@ -2412,6 +2742,10 @@ class LakeWriter:
         if contract is not None:
             meta[META_CONTRACT_ID] = contract.dataset_id
             meta[META_CONTRACT_VERSION] = str(contract.version)
+        if origin_outputs is not None:
+            meta[META_ORIGIN_OUTPUTS] = json.dumps(
+                list(_normalize_outputs(origin_outputs)), ensure_ascii=False
+            )
         return meta
 
     def _publish(self, target: Path, key: str, staged: list[Path]) -> list[Path]:
@@ -2508,6 +2842,7 @@ class LakeWriter:
         skip: int = 0,
         decimal_comma: bool = True,
         members: str | None = None,
+        origin_outputs: Collection[str] | None = None,
     ) -> LakeWriteResult:
         scratch = _scratch_dir(staging)
         conn = _connect(scratch)
@@ -2561,7 +2896,9 @@ class LakeWriter:
                     partition_keys=partition_keys,
                     decimal_comma=decimal_comma,
                 )
-            meta = self._metadata(key, origin or src, digest, contract, converter)
+            meta = self._metadata(
+                key, origin or src, digest, contract, converter, origin_outputs
+            )
             if cast_nulls:
                 meta[META_CAST_NULLS] = json.dumps(cast_nulls, sort_keys=True)
             kv = ", ".join(f"{_lit(k)}: {_lit(v)}" for k, v in meta.items())
@@ -2718,6 +3055,7 @@ class LakeWriter:
         contract: DataContract | None,
         converter: str,
         partitions: dict[str, Any] | None = None,
+        origin_outputs: Collection[str] | None = None,
     ) -> LakeWriteResult:
         partition_keys = set(self.descriptor.partition_keys)
         if partitions:
@@ -2742,7 +3080,7 @@ class LakeWriter:
                 "No payload columns left to write after dropping partition "
                 f"keys {partition_keys}"
             )
-        meta = self._metadata(key, src, digest, contract, converter)
+        meta = self._metadata(key, src, digest, contract, converter, origin_outputs)
         target.mkdir(parents=True, exist_ok=True)
         if self.max_part_bytes is None:
             tmp_out = staging / f"{key}.parquet{TMP_SUFFIX}"
@@ -2954,6 +3292,38 @@ def _dataset_files(dataset_dir: Path) -> list[Path]:
         for p in dataset_dir.rglob("*.parquet")
         if TMP_DIRNAME not in p.relative_to(dataset_dir).parts
     )
+
+
+def _parquet_stamps(dataset_dir: Path) -> dict[str, tuple[int, int]]:
+    """``{Parquet path: (size, mtime_ns)}`` of a dataset, footers not opened.
+
+    The same files as :func:`_dataset_files` (nothing under ``.tmp``), listed
+    with ``scandir`` and keyed by plain strings: cheap enough to run before
+    every origin lookup.
+    """
+    found: dict[str, tuple[int, int]] = {}
+
+    def walk(directory: str) -> None:
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        name = entry.name
+                        if name.endswith(".parquet"):
+                            if entry.is_file():
+                                info = entry.stat()
+                                found[entry.path] = (info.st_size, info.st_mtime_ns)
+                        elif name != TMP_DIRNAME and entry.is_dir(
+                            follow_symlinks=False
+                        ):
+                            walk(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            return
+
+    walk(os.fspath(dataset_dir))
+    return found
 
 
 def scan_dataset(dataset_dir: Path) -> pl.LazyFrame:
