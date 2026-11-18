@@ -952,6 +952,208 @@ def test_diretorio_que_sumiu_nao_e_erro(tmp_path: Path) -> None:
     assert writer.origin_complete(raw)
 
 
+# --- parts of the same key left in the folder by a publish that did not finish -------
+
+
+def _snapshot(folder: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in folder.glob("*.parquet")}
+
+
+def _restore(folder: Path, saved: dict[str, bytes], names) -> None:
+    for name in names:
+        (folder / name).write_bytes(saved[name])
+
+
+def test_orfas_de_sha_antigo_de_publish_interrompido(tmp_path: Path) -> None:
+    raw = _raw(tmp_path, content="v1")
+    writer = _writer(tmp_path)
+    writer.max_part_bytes = 200
+    writer.write_polars(
+        pl.DataFrame({"v": list(range(5000))}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    folder = writer.dataset_dir / "ano=2020"
+    old = _snapshot(folder)
+    assert len(old) > 2
+    raw.write_text("v2")
+    _writer(tmp_path).write_polars(
+        pl.DataFrame({"v": [1]}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    assert _writer(tmp_path).origin_complete(raw)
+    # the process died after the rename of the new file, before the unlinks
+    _restore(folder, old, [n for n in old if n != "acidentes.parquet"])
+    fresh = _writer(tmp_path)
+    assert not fresh.origin_complete(raw)
+    assert not fresh.origin_recorded(raw)
+    assert fresh.origin_outputs(raw) is None
+
+
+def test_orfas_sem_declaracao_do_mesmo_sha(tmp_path: Path) -> None:
+    raw = _raw(tmp_path, content="v1")
+    writer = _writer(tmp_path)
+    writer.max_part_bytes = 200
+    writer.write_polars(
+        pl.DataFrame({"v": list(range(5000))}), raw, partitions={"ano": 2020}
+    )
+    folder = writer.dataset_dir / "ano=2020"
+    old = _snapshot(folder)
+    _writer(tmp_path).write_polars(
+        pl.DataFrame({"v": [1]}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    assert _writer(tmp_path).origin_complete(raw)
+    _restore(folder, old, [n for n in old if n != "acidentes.parquet"])
+    assert not _writer(tmp_path).origin_complete(raw)
+
+
+def test_orfas_de_divisao_maior_do_sha_antigo(tmp_path: Path) -> None:
+    raw = _raw(tmp_path, content="v1")
+    writer = _writer(tmp_path)
+    writer.max_part_bytes = 200
+    writer.write_polars(
+        pl.DataFrame({"v": list(range(9000))}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    folder = writer.dataset_dir / "ano=2020"
+    old = _snapshot(folder)
+    raw.write_text("v2")
+    writer.write_polars(
+        pl.DataFrame({"v": list(range(3000))}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    new = {p.name for p in folder.glob("*.parquet")}
+    extra = [n for n in old if n not in new]
+    assert extra and len(new) > 1
+    assert _writer(tmp_path).origin_complete(raw)
+    _restore(folder, old, extra)
+    assert not _writer(tmp_path).origin_complete(raw)
+
+
+def test_orfas_de_outra_etiqueta_de_conversor(tmp_path: Path) -> None:
+    raw = _raw(tmp_path, content="v1")
+    writer = _writer(tmp_path)
+    writer.max_part_bytes = 200
+    writer.write_polars(
+        pl.DataFrame({"v": list(range(5000))}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+        converter="x 1.0",
+    )
+    folder = writer.dataset_dir / "ano=2020"
+    old = _snapshot(folder)
+    _writer(tmp_path, force=True).write_polars(
+        pl.DataFrame({"v": [1]}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+        converter="x 1.1",
+    )
+    assert _writer(tmp_path).origin_complete(raw, converter="x 1.1")
+    _restore(folder, old, [n for n in old if n != "acidentes.parquet"])
+    assert not _writer(tmp_path).origin_complete(raw, converter="x 1.1")
+
+
+def test_ultima_parte_ilegivel_nao_deixa_o_resto_parecer_completo(
+    tmp_path: Path,
+) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    writer.max_part_bytes = 200
+    writer.write_polars(
+        pl.DataFrame({"v": list(range(5000))}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    assert _writer(tmp_path).origin_complete(raw)
+    last = sorted((writer.dataset_dir / "ano=2020").glob("*.parquet"))[-1]
+    last.write_bytes(b"lixo")  # footer unreadable
+    assert not _writer(tmp_path).origin_complete(raw)
+
+
+def test_parte_orfa_ilegivel_de_outro_ano_nao_interfere(tmp_path: Path) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    _write_declared(writer, raw, (2020, 2021), _decl(2020, 2021))
+    other = writer.dataset_dir / "ano=2019"
+    other.mkdir()
+    (other / "acidentes-001.parquet").write_bytes(b"lixo")  # another partition
+    (writer.dataset_dir / "ano=2020" / "outra-chave-001.parquet").write_bytes(b"x")
+    assert _writer(tmp_path).origin_complete(raw)
+
+
+def test_falha_no_laco_de_orfas_do_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = _raw(tmp_path, content="v1")
+    writer = _writer(tmp_path)
+    writer.max_part_bytes = 200
+    writer.write_polars(
+        pl.DataFrame({"v": list(range(5000))}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    raw.write_text("v2")
+    original = Path.unlink
+
+    def failing(self: Path, *args, **kwargs):
+        if self.name.startswith("acidentes-") and not self.name.endswith(".tmp"):
+            raise OSError(5, "Input/output error")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing)
+    with pytest.raises(OSError):
+        _writer(tmp_path).write_polars(
+            pl.DataFrame({"v": [1]}),
+            raw,
+            partitions={"ano": 2020},
+            origin_outputs=_decl(2020),
+        )
+    monkeypatch.setattr(Path, "unlink", original)
+    folder = writer.dataset_dir / "ano=2020"
+    assert len(list(folder.glob("acidentes-*.parquet"))) > 1  # orphans stayed
+    assert not _writer(tmp_path).origin_complete(raw)
+    # the next build converts again (the orphans make is_current false) and heals
+    retry = _writer(tmp_path)
+    retry.write_polars(
+        pl.DataFrame({"v": [1]}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    assert [p.name for p in folder.glob("*.parquet")] == ["acidentes.parquet"]
+    assert _writer(tmp_path).origin_complete(raw)
+
+
+def test_origin_outputs_aceita_os_filtros_de_origin_complete(tmp_path: Path) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    declared = _decl(2020, 2021)
+    _write_declared(writer, raw, (2020, 2021), declared, converter="x 1.0")
+    fresh = _writer(tmp_path)
+    assert fresh.origin_complete(raw, converter="x 1.0")
+    assert fresh.origin_outputs(raw, converter="x 1.0") == sorted(declared)
+    assert fresh.origin_outputs(raw, expected=_decl(2020)) == sorted(declared)
+    assert fresh.origin_outputs(raw, contract_version=None) == sorted(declared)
+    assert fresh.origin_outputs(raw, converter="x 2.0") is None
+    assert fresh.origin_outputs(raw, contract_version=3) is None
+    assert fresh.origin_outputs(raw, expected=_decl(2019)) is None
+    assert _writer(tmp_path, force=True).origin_outputs(raw) is None
+
+
 # --- digest passed by the caller -----------------------------------------------------
 
 

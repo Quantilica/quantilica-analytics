@@ -839,11 +839,17 @@ def _parse_outputs(value: Any) -> tuple[str, ...] | None:
     return tuple(sorted(set(value)))
 
 
+def _part_pattern(key: str) -> re.Pattern[str]:
+    """File names a writer gives the output of ``key``: ``<key>.parquet`` or one
+    of its ``<key>-NNN.parquet`` parts (what :meth:`LakeWriter._publish` writes)."""
+    return re.compile(rf"^{re.escape(key)}(?:-(\d{{3}}))?\.parquet$")
+
+
 def _part_files(directory: Path, key: str) -> list[Path]:
     """Parquet files in ``directory`` that belong to ``key`` (by footer)."""
     if not directory.is_dir():
         return []
-    pattern = re.compile(rf"^{re.escape(key)}(?:-(\d{{3}}))?\.parquet$")
+    pattern = _part_pattern(key)
     found = []
     for path in sorted(directory.glob("*.parquet")):
         match = pattern.match(path.name)
@@ -874,7 +880,7 @@ def origin_matches(
     parts = _part_files(directory, key)
     if not parts:
         return False
-    pattern = re.compile(rf"^{re.escape(key)}(?:-(\d{{3}}))?\.parquet$")
+    pattern = _part_pattern(key)
     numbers = []
     for p in parts:
         m = pattern.match(p.name)
@@ -909,7 +915,7 @@ def _is_complete_set(key: str, parts: Sequence[_OriginRecord]) -> bool:
     The same rule as :func:`origin_matches`, applied to already read footers: a
     lone ``<key>.parquet`` or ``-001..-N`` without gaps, one ``converted_at``.
     """
-    pattern = re.compile(rf"^{re.escape(key)}(?:-(\d{{3}}))?\.parquet$")
+    pattern = _part_pattern(key)
     numbers = []
     for rec in sorted(parts, key=lambda r: r.path.name):
         m = pattern.match(rec.path.name)
@@ -1546,9 +1552,11 @@ class LakeWriter:
           :func:`member_matches` requires.
 
         ``member`` is the name the footers cite when it is not ``raw.name``.
-        ``digest``, when the caller already has the trusted digest of ``raw``
-        (:func:`sha256_file`), is used instead of computing it again, which on a
-        slow mount would read the sidecar (or the file) once more per call.
+        ``digest``, when the caller already has the digest of ``raw``, is used
+        instead of computing it again, which on a slow mount would read the
+        sidecar (or the file) once more per call. It must be
+        ``sha256_file(raw)`` of this very raw file, not another file's or a
+        stale value: it is compared as is with the one in the footers.
         ``expected``, when the converter knows from the path or name of the raw
         file which outputs it should have (:func:`output_id`), also requires a
         Parquet with each of those ids among the ones that cite it; see
@@ -1613,21 +1621,33 @@ class LakeWriter:
           the ones given, when given, as :func:`member_matches` requires; and
           ``converter``, when given, equals the footer's ``quantilica.converter``
           (the exact tag the converter passes to the writer,
-          ``"anp-fetcher 2.12.0"``, say; for a grouped file that footer belongs
-          to the last writer of the group, not of the member: use
-          ``converter_version`` to tell members apart);
+          ``"anp-fetcher 2.12.0"``, say). ``converter_version`` is compared only
+          for grouped files; for a Parquet written per raw file it is not (use
+          ``converter=`` to tell revisions apart), and for a grouped file the
+          footer's ``quantilica.converter`` belongs to the last writer of the
+          group, not of the member (use ``converter_version`` there);
         * carries a declaration of the outputs.
 
         True only when there is at least one candidate, all of them carry the
-        same declaration, the candidates' parts of each file key in a partition
-        folder form one complete set (a lone ``<key>.parquet`` or ``-001..-N``
-        without gaps, written in a single run), and every output in the
-        declaration exists among the candidates (a Parquet with that
-        :func:`output_id`). An output the declaration does not list is ignored.
+        same declaration, the parts of each file key in a partition folder form
+        one complete set (a lone ``<key>.parquet`` or ``-001..-N`` without gaps,
+        written in a single run), and every output in the declaration exists
+        among the candidates (a Parquet with that :func:`output_id`). An output
+        the declaration does not list is ignored.
+
+        The completeness of a set is judged on the **folder**: once a key has a
+        candidate, every file of that folder named like its output
+        (``<key>.parquet``, ``<key>-NNN.parquet``) must be a candidate of the
+        set. A part of the same key that is not (an old split a publish that
+        died did not remove, with an old digest, another converter tag or no
+        declaration; one whose footer cannot be read; one of another run) would
+        duplicate rows, so the answer is ``False`` until a new write removes it.
+        Only the file names are looked at, not their footers.
 
         Parquets that cite the raw file but are not candidates are leftovers of
-        earlier runs and do not count, for or against: a key renamed after a
-        layout revision, a file from before a collision fix, a year that
+        earlier runs and do not count, for or against, as long as they are not
+        parts of a key that has candidates in the same folder: a key renamed
+        after a layout revision, a file from before a collision fix, a year that
         disappeared from the raw file (they record an old digest, another
         converter tag, another version or no declaration). Without this the raw
         file would be reopened at every build for ever. What stays safe: a lake
@@ -1691,18 +1711,17 @@ class LakeWriter:
                                     partitions={"ano": y}, file_key_name=key,
                                     converter=tag, origin_outputs=outs)
         """
-        records = self._declared_candidates(
-            Path(raw), member, contract_version, converter_version, converter, digest
+        records = self._complete_candidates(
+            Path(raw),
+            member,
+            contract_version,
+            converter_version,
+            converter,
+            expected,
+            digest,
         )
         if not records:
             return False
-        if expected is not None:
-            wanted = set(_normalize_outputs(expected, what="expected"))
-            records = [
-                rec for rec in records if rec.outputs and wanted <= set(rec.outputs)
-            ]
-            if not records:
-                return False
         declarations = {rec.outputs for rec in records}
         if len(declarations) != 1:
             return False
@@ -1717,30 +1736,57 @@ class LakeWriter:
         raw: Path,
         *,
         member: str | None = None,
+        contract_version: int | None = None,
+        converter_version: str | None = None,
+        converter: str | None = None,
+        expected: Collection[str] | None = None,
         digest: str | None = None,
     ) -> list[str] | None:
         """The outputs declared for ``raw`` by the Parquets that cite it.
 
         The declaration (``origin_outputs`` of the writes, sorted) shared by
-        every Parquet that cites ``member or raw.name`` with the current digest
-        of ``raw`` and carries a declaration (one without it is a leftover, as
-        in :meth:`origin_complete`); ``None`` when none does or when they
-        differ. Does not look at whether the outputs exist: it is how a
-        converter counts what it skipped after :meth:`origin_complete` said
-        ``True``. ``digest`` as in :meth:`origin_complete`.
+        the candidates of :meth:`origin_complete` (same filters, same
+        ``digest``): the Parquets that cite ``member or raw.name`` with the
+        current digest of ``raw`` and carry a declaration, and whose parts are
+        complete; ``None`` when there are none or when they differ. Does not
+        look at whether the declared outputs exist. It is how a converter counts
+        what it skipped after :meth:`origin_complete` said ``True``, so pass it
+        the arguments of that call.
         """
-        raw = Path(raw)
-        records = self._origin_records(member or raw.name)
-        if not records:
-            return None
-        if digest is None:
-            digest = sha256_file(raw)
-        declarations = {
-            rec.outputs for rec in records if rec.sha256 == digest and rec.outputs
-        }
+        records = self._complete_candidates(
+            Path(raw),
+            member,
+            contract_version,
+            converter_version,
+            converter,
+            expected,
+            digest,
+        )
+        declarations = {rec.outputs for rec in records if rec.outputs}
         if len(declarations) != 1:
             return None
         return list(next(iter(declarations)))
+
+    def _complete_candidates(
+        self,
+        raw: Path,
+        member: str | None,
+        contract_version: int | None,
+        converter_version: str | None,
+        converter: str | None,
+        expected: Collection[str] | None,
+        digest: str | None,
+    ) -> list[_OriginRecord]:
+        """:meth:`_declared_candidates` narrowed by ``expected``."""
+        records = self._declared_candidates(
+            raw, member, contract_version, converter_version, converter, digest
+        )
+        if expected is not None:
+            wanted = set(_normalize_outputs(expected, what="expected"))
+            records = [
+                rec for rec in records if rec.outputs and wanted <= set(rec.outputs)
+            ]
+        return records
 
     def _declared_candidates(
         self,
@@ -1794,15 +1840,35 @@ class LakeWriter:
         expected_contract = None if contract_version is None else str(contract_version)
         return rec.contract_version == expected_contract and rec.file_key is not None
 
-    @staticmethod
-    def _sets_are_complete(records: Sequence[_OriginRecord]) -> bool:
+    def _sets_are_complete(self, records: Sequence[_OriginRecord]) -> bool:
         """Whether the records of files written per raw file form, per file key
-        and folder, one complete set of parts (grouped entries have none)."""
+        and folder, one complete set of parts (grouped entries have none).
+
+        The set is the folder's, not only the records': every file of the folder
+        named like the key's output (``<key>.parquet``, ``<key>-NNN.parquet``)
+        must be one of ``records``. A part of the same key that is not among
+        them (an older split a publish that died did not remove, one that cites
+        another digest, converter tag or no declaration, one whose footer cannot
+        be read) is a duplicate of the rows in the folder, so the answer is
+        ``False``. Leftovers of other keys, and of folders no record is in, do
+        not matter. Only the listing already held is looked at, no footer.
+        """
         sets: dict[tuple[Path, str], list[_OriginRecord]] = {}
         for rec in records:
             if rec.entry is None and rec.file_key is not None:
                 sets.setdefault((rec.path.parent, rec.file_key), []).append(rec)
-        return all(_is_complete_set(key, parts) for (_, key), parts in sets.items())
+        for (directory, key), parts in sets.items():
+            if not _is_complete_set(key, parts):
+                return False
+            listing = self._origin_dirs.get(os.fspath(directory))
+            if listing is None:
+                return False
+            pattern = _part_pattern(key)
+            mine = {os.fspath(rec.path) for rec in parts}
+            for path in listing.files:
+                if pattern.match(os.path.basename(path)) and path not in mine:
+                    return False
+        return True
 
     def _current_records(
         self,
