@@ -7,6 +7,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+## [0.14.0] - 2026-11-18
+
 ### Corrigido
 
 - `list_source_parquets` levanta `LakePublishError` quando uma pasta da fonte (ou a raiz do lake) não pode ser listada (`EIO` ou `ENOTCONN` numa montagem de rede, falta de permissão). Antes o erro era ignorado e os Parquets da pasta sumiam do `_build.json`, o que levaria um publicador a apagá-los do destino. No `lake_build` a fonte passa a constar em `failed_sources` (`build manifest not written`), sem novo manifesto e com o marcador mantido.
