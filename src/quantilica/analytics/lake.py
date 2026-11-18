@@ -1372,6 +1372,8 @@ class LakeWriter:
         ] = {}
         self._origin_dirs: dict[str, _DirListing] = {}
         self._origin_dirty: set[str] = set()
+        # Directories that exist but could not be listed at the last sync.
+        self._origin_unlisted: set[str] = set()
         self._origin_by_name: dict[str, dict[str, _OriginRecord]] = {}
         configure_scratch()
 
@@ -1508,6 +1510,7 @@ class LakeWriter:
         contract_version: int | None = None,
         converter_version: str | None = None,
         expected: Collection[str] | None = None,
+        digest: str | None = None,
     ) -> bool:
         """Whether ``raw`` is already in the lake, whatever partition it went to.
 
@@ -1543,6 +1546,9 @@ class LakeWriter:
           :func:`member_matches` requires.
 
         ``member`` is the name the footers cite when it is not ``raw.name``.
+        ``digest``, when the caller already has the trusted digest of ``raw``
+        (:func:`sha256_file`), is used instead of computing it again, which on a
+        slow mount would read the sidecar (or the file) once more per call.
         ``expected``, when the converter knows from the path or name of the raw
         file which outputs it should have (:func:`output_id`), also requires a
         Parquet with each of those ids among the ones that cite it; see
@@ -1560,7 +1566,7 @@ class LakeWriter:
            (``origin_outputs``) and ask :meth:`origin_complete` instead.
         """
         records = self._current_records(
-            Path(raw), member, contract_version, converter_version, None
+            Path(raw), member, contract_version, converter_version, None, digest
         )
         if records is None:
             return False
@@ -1579,6 +1585,7 @@ class LakeWriter:
         converter_version: str | None = None,
         converter: str | None = None,
         expected: Collection[str] | None = None,
+        digest: str | None = None,
     ) -> bool:
         """Whether ``raw`` is in the lake with **every** output it should have.
 
@@ -1592,32 +1599,55 @@ class LakeWriter:
         leaves Parquets that name outputs which do not exist, and this method
         says ``False`` until they are all there.
 
-        True only when:
+        Only some of the Parquets that cite the raw file are looked at, the
+        *candidates*; the others are leftovers and are ignored. A candidate
 
-        * everything :meth:`origin_recorded` requires holds (same digest, layout
-          version and, when given, ``contract_version``/``converter_version``);
-        * ``converter``, when given, equals the footer's ``quantilica.converter``
-          of every Parquet that cites the raw file (the exact tag the converter
-          passes to the writer, ``"anp-fetcher 2.12.0"``, say). For a grouped
-          file that footer belongs to the last writer of the group, not of the
-          member: use ``converter_version`` to tell members apart;
-        * every Parquet that cites the raw file carries the same declaration
-          (a Parquet without one, written before declarations existed or by a
-          caller that did not pass it, makes the origin incomplete: the
-          conservative answer is to reopen the file);
-        * every output in the declaration exists in the dataset (a Parquet
-          with that :func:`output_id`, citing the raw file with the current
-          digest). An output the declaration does not list is ignored;
-        * ``expected``, when given, is a subset of the declaration (so every
-          output in it exists too). It is the outputs the converter knows this
-          raw file should have from its path or name (the year of
-          ``raw/2021/dados.csv``, say), as :func:`output_id` names them. Only
-          the Parquets whose declaration includes all of them are considered:
-          those that cite the same file name for a raw file of another folder
-          are not this raw file's.
+        * cites ``member or raw.name`` as its origin file;
+        * records the current digest of ``raw`` (:func:`sha256_file`, the
+          sidecar's when it is trusted, or ``digest`` when the caller passes it)
+          and this writer's layout version;
+        * passes the filters: for a file written per raw file, the contract
+          version equals ``contract_version`` (``None`` for a file written
+          without a contract) as :func:`origin_matches` requires; for a grouped
+          file, the entry's ``contract_version`` and ``converter_version`` equal
+          the ones given, when given, as :func:`member_matches` requires; and
+          ``converter``, when given, equals the footer's ``quantilica.converter``
+          (the exact tag the converter passes to the writer,
+          ``"anp-fetcher 2.12.0"``, say; for a grouped file that footer belongs
+          to the last writer of the group, not of the member: use
+          ``converter_version`` to tell members apart);
+        * carries a declaration of the outputs.
+
+        True only when there is at least one candidate, all of them carry the
+        same declaration, the candidates' parts of each file key in a partition
+        folder form one complete set (a lone ``<key>.parquet`` or ``-001..-N``
+        without gaps, written in a single run), and every output in the
+        declaration exists among the candidates (a Parquet with that
+        :func:`output_id`). An output the declaration does not list is ignored.
+
+        Parquets that cite the raw file but are not candidates are leftovers of
+        earlier runs and do not count, for or against: a key renamed after a
+        layout revision, a file from before a collision fix, a year that
+        disappeared from the raw file (they record an old digest, another
+        converter tag, another version or no declaration). Without this the raw
+        file would be reopened at every build for ever. What stays safe: a lake
+        written before declarations existed has no candidate (``False``); a new
+        conversion that stopped halfway leaves declared outputs missing
+        (``False``, since the leftovers of the old digest do not stand in for
+        them); a raw file whose digest changed and has nothing new written has
+        no candidate (``False``).
+
+        ``expected``, when given, is the outputs the converter knows from the
+        path or name of this raw file that it should have (the year of
+        ``raw/2021/dados.csv``, say), as :func:`output_id` names them. Only the
+        candidates whose declaration includes all of them are considered (so
+        every output in it exists too): those that cite the same file name for
+        a raw file of another folder are not this raw file's.
 
         ``False`` with ``force``. The raw file is not read when its sidecar is
-        trusted (:func:`sha256_file`).
+        trusted (:func:`sha256_file`) or when ``digest`` is given. If a
+        directory of the dataset cannot be listed (an I/O error on a mount) the
+        answer is ``False`` until it can: see :meth:`LakeWriter._sync_origins`.
 
         .. warning::
 
@@ -1661,8 +1691,8 @@ class LakeWriter:
                                     partitions={"ano": y}, file_key_name=key,
                                     converter=tag, origin_outputs=outs)
         """
-        records = self._current_records(
-            Path(raw), member, contract_version, converter_version, converter
+        records = self._declared_candidates(
+            Path(raw), member, contract_version, converter_version, converter, digest
         )
         if not records:
             return False
@@ -1683,26 +1713,96 @@ class LakeWriter:
         return all(output in present for output in declared)
 
     def origin_outputs(
-        self, raw: Path, *, member: str | None = None
+        self,
+        raw: Path,
+        *,
+        member: str | None = None,
+        digest: str | None = None,
     ) -> list[str] | None:
         """The outputs declared for ``raw`` by the Parquets that cite it.
 
-        The declaration (``origin_outputs`` of the writes, sorted) shared by every
-        Parquet that cites ``member or raw.name`` with the current digest of
-        ``raw``; ``None`` when none does, when some lack it or when they differ.
-        Does not look at whether the outputs exist: it is how a converter counts
-        what it skipped after :meth:`origin_complete` said ``True``.
+        The declaration (``origin_outputs`` of the writes, sorted) shared by
+        every Parquet that cites ``member or raw.name`` with the current digest
+        of ``raw`` and carries a declaration (one without it is a leftover, as
+        in :meth:`origin_complete`); ``None`` when none does or when they
+        differ. Does not look at whether the outputs exist: it is how a
+        converter counts what it skipped after :meth:`origin_complete` said
+        ``True``. ``digest`` as in :meth:`origin_complete`.
         """
         raw = Path(raw)
         records = self._origin_records(member or raw.name)
         if not records:
             return None
-        digest = sha256_file(raw)
-        declarations = {rec.outputs for rec in records if rec.sha256 == digest}
+        if digest is None:
+            digest = sha256_file(raw)
+        declarations = {
+            rec.outputs for rec in records if rec.sha256 == digest and rec.outputs
+        }
         if len(declarations) != 1:
             return None
-        declared = next(iter(declarations))
-        return None if declared is None else list(declared)
+        return list(next(iter(declarations)))
+
+    def _declared_candidates(
+        self,
+        raw: Path,
+        member: str | None,
+        contract_version: int | None,
+        converter_version: str | None,
+        converter: str | None,
+        digest: str | None,
+    ) -> list[_OriginRecord]:
+        """The candidates of :meth:`origin_complete`: the records that cite
+        ``raw`` and are current and declared; the rest are ignored. Empty when
+        the candidates do not form complete sets of parts."""
+        if self.force:
+            return []
+        records = self._origin_records(member or raw.name)
+        if not records:
+            return []
+        if digest is None:
+            digest = sha256_file(raw)
+        kept = [
+            rec
+            for rec in records
+            if rec.outputs
+            and self._record_is_current(
+                rec, digest, contract_version, converter_version, converter
+            )
+        ]
+        return kept if self._sets_are_complete(kept) else []
+
+    def _record_is_current(
+        self,
+        rec: _OriginRecord,
+        digest: str,
+        contract_version: int | None,
+        converter_version: str | None,
+        converter: str | None,
+    ) -> bool:
+        """Whether one record has the digest, layout version and filters."""
+        if rec.sha256 != digest or rec.layout != str(self.descriptor.layout_version):
+            return False
+        if converter is not None and rec.converter != converter:
+            return False
+        if rec.entry is not None:
+            return _entry_is_current(
+                rec.entry,
+                digest,
+                contract_version=contract_version,
+                converter_version=converter_version,
+            )
+        expected_contract = None if contract_version is None else str(contract_version)
+        return rec.contract_version == expected_contract and rec.file_key is not None
+
+    @staticmethod
+    def _sets_are_complete(records: Sequence[_OriginRecord]) -> bool:
+        """Whether the records of files written per raw file form, per file key
+        and folder, one complete set of parts (grouped entries have none)."""
+        sets: dict[tuple[Path, str], list[_OriginRecord]] = {}
+        for rec in records:
+            if rec.entry is None and rec.file_key is not None:
+                sets.setdefault((rec.path.parent, rec.file_key), []).append(rec)
+        return all(_is_complete_set(key, parts) for (_, key), parts in sets.items())
 
     def _current_records(
         self,
@@ -1711,6 +1811,7 @@ class LakeWriter:
         contract_version: int | None,
         converter_version: str | None,
         converter: str | None,
+        digest: str | None = None,
     ) -> list[_OriginRecord] | None:
         """The records that cite ``raw`` when all of them are current, else ``None``."""
         if self.force:
@@ -1718,34 +1819,24 @@ class LakeWriter:
         records = self._origin_records(member or raw.name)
         if not records:
             return None
-        digest = sha256_file(raw)
-        layout = str(self.descriptor.layout_version)
-        expected_contract = None if contract_version is None else str(contract_version)
-        sets: dict[tuple[Path, str], list[_OriginRecord]] = {}
+        if digest is None:
+            digest = sha256_file(raw)
         for rec in records:
-            if rec.sha256 != digest or rec.layout != layout:
+            if not self._record_is_current(
+                rec, digest, contract_version, converter_version, converter
+            ):
                 return None
-            if converter is not None and rec.converter != converter:
-                return None
-            if rec.entry is not None:
-                if not _entry_is_current(
-                    rec.entry,
-                    digest,
-                    contract_version=contract_version,
-                    converter_version=converter_version,
-                ):
-                    return None
-            elif rec.contract_version != expected_contract or rec.file_key is None:
-                return None
-            else:
-                sets.setdefault((rec.path.parent, rec.file_key), []).append(rec)
-        if all(_is_complete_set(key, parts) for (_, key), parts in sets.items()):
-            return records
-        return None
+        return records if self._sets_are_complete(records) else None
 
     def _origin_records(self, name: str) -> list[_OriginRecord]:
-        """The records of the Parquets that cite ``name``, in path order."""
+        """The records of the Parquets that cite ``name``, in path order.
+
+        Empty (which every query reads as "not in the lake") while a directory
+        of the dataset cannot be listed: see :meth:`_sync_origins`.
+        """
         self._sync_origins()
+        if self._origin_unlisted:
+            return []
         found = self._origin_by_name.get(name)
         if not found:
             return []
@@ -1775,8 +1866,21 @@ class LakeWriter:
         writer's own writes; and a directory that holds many Parquets
         (a dataset without partitions) is listed, with one ``stat`` per file,
         each time it changes, which includes every write into it.
+
+        A directory that exists but cannot be listed (``EIO``, ``ENOTCONN`` or
+        a permission error on a mount) makes the whole dataset unknown, not
+        only that folder: the Parquets in it could be the leftovers that make
+        another answer wrong as much as the outputs that make it right. The
+        queries (:meth:`origin_recorded`, :meth:`origin_complete`,
+        :meth:`origin_outputs`) therefore answer ``False``/``None`` for every
+        raw file until a later call lists the directory again (the conservative
+        answer is to reopen the raw file; nothing is skipped on a guess). The
+        error is not raised, because a query is a pure test and the converter
+        can still write (a write into the unreadable folder fails on its own).
+        A directory that vanished (``ENOENT``) is just gone.
         """
         started = time.time_ns()
+        unlisted: set[str] = set()
         dirty, self._origin_dirty = self._origin_dirty, set()
         old = self._origin_dirs
         new: dict[str, _DirListing] = {}
@@ -1785,7 +1889,10 @@ class LakeWriter:
             directory = stack.pop()
             try:
                 mtime = os.stat(directory).st_mtime_ns
+            except (FileNotFoundError, NotADirectoryError):
+                continue
             except OSError:
+                unlisted.add(directory)
                 continue
             prev = old.get(directory)
             if (
@@ -1796,7 +1903,11 @@ class LakeWriter:
             ):
                 listing = prev
             else:
-                listed = _list_origin_dir(directory)
+                try:
+                    listed = _list_origin_dir(directory)
+                except OSError:
+                    unlisted.add(directory)
+                    continue
                 if listed is None:
                     continue
                 subdirs, files = listed
@@ -1810,6 +1921,7 @@ class LakeWriter:
             if directory not in new:
                 self._apply_listing(prev.files, {})
         self._origin_dirs = new
+        self._origin_unlisted = unlisted
 
     def _apply_listing(
         self,
@@ -3444,7 +3556,9 @@ def _list_origin_dir(
 
     The same files as :func:`_dataset_files` (nothing under ``.tmp``), listed
     with ``scandir`` and keyed by plain strings; no footer is opened. ``None``
-    when the directory cannot be listed.
+    when the directory (or an entry of it) vanished meanwhile; any other
+    ``OSError`` (``EIO``, permission) propagates, so that the caller does not
+    take a listing it could not complete for the whole truth.
     """
     subdirs: list[str] = []
     files: dict[str, tuple[int, int]] = {}
@@ -3459,9 +3573,9 @@ def _list_origin_dir(
                             files[entry.path] = (info.st_size, info.st_mtime_ns)
                     elif name != TMP_DIRNAME and entry.is_dir(follow_symlinks=False):
                         subdirs.append(entry.path)
-                except OSError:
+                except (FileNotFoundError, NotADirectoryError):
                     continue
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
     return tuple(subdirs), files
 

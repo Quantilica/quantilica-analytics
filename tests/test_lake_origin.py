@@ -269,8 +269,10 @@ def test_declaracao_em_parte_dos_parquets(tmp_path: Path) -> None:
     writer = _writer(tmp_path)
     _write_years(writer, raw, years=(2020,))  # without declaration
     _write_declared(writer, raw, (2021,), _decl(2020, 2021))
+    # The undeclared Parquet is a leftover: it does not stand in for the output
+    # the declaration names (2020), so the origin is still incomplete.
     assert not writer.origin_complete(raw)
-    assert writer.origin_outputs(raw) is None
+    assert writer.origin_outputs(raw) == _decl(2020, 2021)
 
 
 def test_sha_mudou(tmp_path: Path) -> None:
@@ -752,9 +754,13 @@ def test_colisao_de_basename_com_bytes_diferentes(tmp_path: Path) -> None:
     _write_declared(writer, a, (2020,), _decl(2020))
     assert writer.origin_complete(a)
     assert not writer.origin_complete(b)  # other content, same name
+    # Each is in the lake with its own, complete outputs (other partitions).
     _write_declared(writer, b, (2021,), _decl(2021))
+    assert writer.origin_complete(a)
+    assert writer.origin_complete(b)
+    # When b replaces a's output itself, a is no longer there.
+    _write_declared(writer, b, (2020,), _decl(2020))
     assert not writer.origin_complete(a)
-    assert not writer.origin_complete(b)
 
 
 def test_colisao_de_basename_nunca_da_pulo_falso(tmp_path: Path) -> None:
@@ -798,6 +804,181 @@ def test_expected_exige_saidas_declaradas_e_existentes(tmp_path: Path) -> None:
         writer.origin_complete(raw, expected=[""])
     with pytest.raises(TypeError):
         writer.origin_complete(raw, expected="ano=2020/acidentes")
+
+
+# --- leftovers (Parquets that cite the raw file but are not current) -----------------
+
+
+def test_sobra_sem_declaracao_com_conjunto_declarado_completo(tmp_path: Path) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    # A leftover of a layout from before declarations: same raw, other key.
+    _write_years(writer, raw, years=(2019,), file_key_name="antigo")
+    _write_declared(writer, raw, (2020, 2021), _decl(2020, 2021))
+    assert writer.origin_recorded(raw)  # the leftover has the current digest too
+    assert writer.origin_complete(raw)
+    assert _writer(tmp_path).origin_complete(raw)
+    assert writer.origin_outputs(raw) == _decl(2020, 2021)
+    # The declared set is still demanded.
+    (writer.dataset_dir / "ano=2021" / "acidentes.parquet").unlink()
+    assert not _writer(tmp_path).origin_complete(raw)
+
+
+def test_sobra_com_sha_antigo(tmp_path: Path) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    _write_declared(writer, raw, (2018, 2019, 2020), _decl(2018, 2019, 2020))
+    raw.write_text("revisado: sem 2018")  # the year vanished from the raw file
+    declared = _decl(2019, 2020)
+    assert not _writer(tmp_path).origin_complete(raw)  # nothing new written
+    _write_declared(writer, raw, (2019,), declared)
+    assert not _writer(tmp_path).origin_complete(raw)  # interrupted: 2020 missing
+    _write_declared(writer, raw, (2020,), declared)
+    fresh = _writer(tmp_path)
+    assert fresh.origin_complete(raw)  # 2018 (old sha) is a leftover
+    assert fresh.origin_outputs(raw) == declared
+    assert not fresh.origin_recorded(raw)
+
+
+def test_sobra_com_etiqueta_de_revisao_antiga(tmp_path: Path) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    _write_declared(
+        writer,
+        raw,
+        (2019,),
+        _decl(2019, key="velho"),
+        key="velho",
+        converter="anp-fetcher 2.11.0",
+    )
+    declared = _decl(2020, 2021)
+    _write_declared(writer, raw, (2020, 2021), declared, converter="anp-fetcher 2.12.0")
+    fresh = _writer(tmp_path)
+    assert fresh.origin_complete(raw, converter="anp-fetcher 2.12.0")
+    assert fresh.origin_complete(raw, converter="anp-fetcher 2.11.0")  # its own set
+    assert not fresh.origin_complete(raw, converter="anp-fetcher 2.13.0")
+    # Without the filter both generations are candidates and disagree.
+    assert not fresh.origin_complete(raw)
+
+
+def test_sobra_de_outra_versao_de_contrato(tmp_path: Path) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    v1 = DataContract(dataset_id="acidentes", version=1, fields=[Field("v", pl.Int64)])
+    v2 = DataContract(dataset_id="acidentes", version=2, fields=[Field("v", pl.Int64)])
+    _write_declared(
+        writer, raw, (2019,), _decl(2019, key="velho"), key="velho", contract=v1
+    )
+    _write_declared(writer, raw, (2020,), _decl(2020), contract=v2)
+    fresh = _writer(tmp_path)
+    assert fresh.origin_complete(raw, contract_version=2)
+    assert fresh.origin_complete(raw, contract_version=1)  # only velho/2019 counts
+    assert not fresh.origin_complete(raw, contract_version=3)
+    assert not fresh.origin_complete(raw)  # written with a contract, asked without
+
+
+def test_declarados_com_partes_incompletas_entre_candidatos(tmp_path: Path) -> None:
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    writer.max_part_bytes = 200
+    writer.write_polars(
+        pl.DataFrame({"v": list(range(5000))}),
+        raw,
+        partitions={"ano": 2020},
+        origin_outputs=_decl(2020),
+    )
+    _write_years(writer, raw, years=(2019,), file_key_name="velho")  # leftover
+    assert _writer(tmp_path).origin_complete(raw)
+    sorted(writer.dataset_dir.rglob("*-00*.parquet"))[0].unlink()
+    assert not _writer(tmp_path).origin_complete(raw)
+
+
+def test_sobras_nao_valem_com_expected(tmp_path: Path) -> None:
+    a = _raw(tmp_path, "2020/dados.csv", "mesmo")
+    b = _raw(tmp_path, "2021/dados.csv", "mesmo")
+    writer = _writer(tmp_path)
+    _write_years(writer, a, years=(2019,), file_key_name="dados")  # undeclared
+    _write_declared(writer, a, (2020,), _decl(2020, key="dados"), key="dados")
+    assert writer.origin_complete(a, expected=_decl(2020, key="dados"))
+    assert not writer.origin_complete(b, expected=_decl(2021, key="dados"))
+
+
+# --- unlistable directories ----------------------------------------------------------
+
+
+def test_diretorio_que_nao_lista_torna_a_consulta_conservadora(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from quantilica.analytics import lake
+
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    _write_declared(writer, raw, (2020, 2021), _decl(2020, 2021))
+    assert writer.origin_complete(raw)
+    broken = os.fspath(writer.dataset_dir / "ano=2021")
+    real = lake._list_origin_dir
+
+    def failing(directory):
+        if directory == broken:
+            raise OSError(5, "Input/output error")
+        return real(directory)
+
+    monkeypatch.setattr(lake, "_list_origin_dir", failing)
+    # Force a relisting of that folder: its mtime moves.
+    _write_declared(_writer(tmp_path), raw, (2021,), _decl(2020, 2021))
+    other = _writer(tmp_path)
+    assert not other.origin_complete(raw)
+    assert not other.origin_recorded(raw)
+    assert other.origin_outputs(raw) is None
+    # A raw file of any name is unknown too, not just the ones cited there.
+    assert not other.origin_complete(_raw(tmp_path, "x.csv", "x"))
+    # Once the directory can be listed again, the answers come back.
+    monkeypatch.setattr(lake, "_list_origin_dir", real)
+    assert other.origin_complete(raw)
+    assert other.origin_recorded(raw)
+
+
+def test_diretorio_que_sumiu_nao_e_erro(tmp_path: Path) -> None:
+    import shutil
+
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    _write_declared(writer, raw, (2020, 2021), _decl(2020, 2021))
+    assert writer.origin_complete(raw)
+    shutil.rmtree(writer.dataset_dir / "ano=2021")
+    writer._origin_dirty.add(os.fspath(writer.dataset_dir))
+    assert not writer.origin_complete(raw)
+    _write_declared(writer, raw, (2021,), _decl(2020, 2021))
+    assert writer.origin_complete(raw)
+
+
+# --- digest passed by the caller -----------------------------------------------------
+
+
+def test_digest_do_chamador_evita_recalcular(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from quantilica.analytics import lake
+
+    raw = _raw(tmp_path)
+    writer = _writer(tmp_path)
+    _write_declared(writer, raw, (2020, 2021), _decl(2020, 2021))
+    digest = lake.sha256_file(raw)
+    calls: list[object] = []
+
+    def boom(path):
+        calls.append(path)
+        raise AssertionError("digest recalculado")
+
+    monkeypatch.setattr(lake, "sha256_file", boom)
+    fresh = _writer(tmp_path)
+    assert fresh.origin_complete(raw, digest=digest)
+    assert fresh.origin_recorded(raw, digest=digest)
+    assert fresh.origin_outputs(raw, digest=digest) == sorted(_decl(2020, 2021))
+    assert not fresh.origin_complete(raw, digest="0" * 64)
+    assert not fresh.origin_recorded(raw, digest="0" * 64)
+    assert fresh.origin_outputs(raw, digest="0" * 64) is None
+    assert not calls
 
 
 # --- cost of the index ---------------------------------------------------------------
