@@ -263,6 +263,7 @@ ENTRY_FIELDS = frozenset(
         "contract_version",
         "converter_version",
         "outputs",
+        "null_counts",
     }
 )
 
@@ -945,6 +946,7 @@ def _entry_is_current(
     contract_version: int | None = None,
     converter_version: str | None = None,
     origin_outputs: Collection[str] | None = None,
+    require_null_counts: bool = False,
 ) -> bool:
     """Whether a ``quantilica.members`` entry is up to date for the raw file.
 
@@ -954,8 +956,12 @@ def _entry_is_current(
     one that does not. ``columns`` (the member columns' values) are compared
     when given, and so is ``origin_outputs`` against the entry's ``outputs``
     (an entry without them is stale for a caller that declares them).
+    ``require_null_counts`` makes an entry without ``null_counts`` stale (see
+    ``member_stats`` in :meth:`LakeWriter.write_group`).
     """
     if not isinstance(entry, Mapping) or entry.get("origin_sha256") != sha256:
+        return False
+    if require_null_counts and not isinstance(entry.get("null_counts"), Mapping):
         return False
     if contract_version is not None and entry.get("contract_version") != (
         contract_version
@@ -1114,6 +1120,25 @@ def _version_fields(
     if converter_version is not None:
         out["converter_version"] = converter_version
     return out
+
+
+def _null_counts(conn, path: Path, skip: Collection[str]) -> dict[str, int]:
+    """Exact nulls of each column of the staged Parquet ``path`` except ``skip``.
+
+    One DuckDB aggregation (``count(*) - count(col)``), streamed over the file,
+    so a member never has to fit in memory. Only the columns the file has appear.
+    """
+    source = f"read_parquet({_lit(str(path))}, hive_partitioning=false)"
+    names = [
+        r[0]
+        for r in conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
+        if r[0] not in skip
+    ]
+    if not names:
+        return {}
+    items = ", ".join(f"count(*) - count({_ident(n)})" for n in names)
+    row = conn.execute(f"SELECT {items} FROM {source}").fetchall()[0]
+    return {n: int(v or 0) for n, v in zip(names, row, strict=True)}
 
 
 def _group_files(directory: Path, group_key: str) -> list[tuple[Path, dict, int]]:
@@ -2375,12 +2400,14 @@ class LakeWriter:
         contract_version: int | None = None,
         converter_version: str | None = None,
         prune: bool = True,
+        member_stats: bool = False,
     ) -> bool:
         """Whether :meth:`write_group` would skip this group.
 
         Hashes the raw files and reads the footer once, nothing else: a
         converter can ask before decoding anything. Always ``False`` with
-        ``force``.
+        ``force``. Pass the same ``member_stats`` as to :meth:`write_group`: with
+        it, a member whose entry has no ``null_counts`` makes the group stale.
         """
         if self.force:
             return False
@@ -2391,6 +2418,7 @@ class LakeWriter:
             contract_version,
             converter_version,
             prune,
+            member_stats,
         )
         return plan.is_current
 
@@ -2408,6 +2436,7 @@ class LakeWriter:
         schema: Mapping[str, str | pl.DataType] | None = None,
         replaces: Sequence[str] = (),
         replace_partition: bool = False,
+        member_stats: bool = False,
     ) -> GroupWriteResult:
         """Write all the members of a group into ``<group_key>.parquet``, once.
 
@@ -2456,6 +2485,27 @@ class LakeWriter:
         ``LakeError`` with the column, the types and the count. Widening casts
         pass. ``schema`` only acts when the group is rewritten.
 
+        Member statistics: with ``member_stats=True`` every member written in
+        this call records ``null_counts`` in its ``quantilica.members`` entry, a
+        ``{column: n}`` with the exact number of nulls of each data column **the
+        member itself carried** (counted on the member's staged Parquet, before
+        the group's union schema or ``schema`` fills the columns it lacks with
+        nulls). A column the member did not have is absent from the dictionary,
+        which tells "column missing" from "column present and all null". Only
+        the data columns are counted: the member columns (``uf``, ``mes``...) and
+        ``_origem`` are not, and neither are partition keys (they live in the
+        folder). A member with 0 rows has every column it carried at ``0``. The
+        count is a DuckDB aggregation over the staged Parquet (streamed, with
+        no collect, so the cost is a read of the member's columns). A member
+        kept from the existing file brings its entry as it was, ``null_counts``
+        included; with ``member_stats`` a kept member whose entry has none is
+        stale and is rewritten, so the entries of a file written with the
+        option never mix with and without the statistic (members carried over by
+        ``prune=False``, which are not in ``members``, are the exception: they
+        cannot be rewritten). Off (the default) the footer is exactly the one
+        written before the option existed; entries of kept members keep any
+        ``null_counts`` they already have.
+
         Memory: nothing is collected. A ``LazyFrame`` is streamed to a staged
         Parquet, a ``Path`` or :class:`DuckSource` goes through DuckDB, and the
         file is written by DuckDB from those staged files plus the kept rows
@@ -2502,6 +2552,7 @@ class LakeWriter:
                 contract_version,
                 converter_version,
                 prune,
+                member_stats,
             )
             if plan.blocked:
                 raise LakeError(
@@ -2540,6 +2591,7 @@ class LakeWriter:
                         converter_version=converter_version,
                         sort_by=list(sort_by or ()),
                         schema=schema,
+                        member_stats=member_stats,
                     )
                 finally:
                     self._cleanup_staging(staging)
@@ -2622,6 +2674,7 @@ class LakeWriter:
         contract_version: int | None,
         converter_version: str | None,
         prune: bool,
+        member_stats: bool = False,
     ) -> _GroupPlan:
         if not members:
             raise ValueError("write_group needs at least one member.")
@@ -2679,6 +2732,7 @@ class LakeWriter:
                 contract_version=contract_version,
                 converter_version=converter_version,
                 origin_outputs=declared.get(key),
+                require_null_counts=member_stats,
             ):
                 kept.append(key)
             else:
@@ -2755,6 +2809,7 @@ class LakeWriter:
         converter_version: str | None,
         sort_by: list[str],
         schema: Mapping[str, str | pl.DataType] | None,
+        member_stats: bool = False,
     ) -> GroupWriteResult:
         group_key = plan.group_key
         reserved = [*partitions, *self.descriptor.partition_keys]
@@ -2794,6 +2849,15 @@ class LakeWriter:
                     **member.columns,
                     **_version_fields(contract_version, converter_version),
                     **_outputs_field(member.origin_outputs),
+                    **(
+                        {
+                            "null_counts": _null_counts(
+                                conn, out, {*member.columns, ORIGIN_COLUMN}
+                            )
+                        }
+                        if member_stats
+                        else {}
+                    ),
                 }
             existing = (
                 "[" + ", ".join(_lit(str(p)) for p in plan.state.parts) + "]"

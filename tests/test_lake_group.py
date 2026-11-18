@@ -1369,3 +1369,155 @@ def test_limpeza_do_scratch_nao_consulta_pid_de_pasta_recente(
     viva.mkdir()
     lake_mod._remove_stale_scratch(tmp_path)
     assert viva.is_dir()
+
+
+# --- member_stats: nulos exatos por membro no rodapé -------------------------
+
+
+def _stat_members(tmp_path: Path, calls: list | None = None) -> list[GroupMember]:
+    """a: tem ``x`` (2 nulos em 4) e ``y``; b: só ``y`` (sem ``x``); c: 0 linhas."""
+    frames = {
+        "a": pl.DataFrame(
+            {"x": [1, None, 3, None], "y": ["p", "q", None, "s"]},
+            schema={"x": pl.Int64, "y": pl.String},
+        ),
+        "b": pl.DataFrame({"y": ["p", None]}, schema={"y": pl.String}),
+        "c": pl.DataFrame({"x": [], "y": []}, schema={"x": pl.Int64, "y": pl.String}),
+    }
+    out = []
+    for i, (name, frame) in enumerate(frames.items()):
+        src = _raw(tmp_path, f"{name}@20260101.csv")
+
+        def make(frame=frame, name=name):
+            if calls is not None:
+                calls.append(name)
+            return frame
+
+        out.append(GroupMember(src, make, columns={"mes": f"{i + 1:02d}"}))
+    return out
+
+
+_FILL = {"x": "BIGINT"}
+
+
+def test_member_stats_conta_nulos_exatos_so_das_colunas_do_membro(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path / "lake")
+    res = writer.write_group(
+        "ds_2024",
+        _stat_members(tmp_path),
+        partitions=PARTS,
+        schema=_FILL,
+        member_stats=True,
+    )
+    assert res.status == "converted"
+    path = _dataset(tmp_path / "lake") / "ano=2024" / "ds_2024.parquet"
+    entries = _entries(path)
+    assert entries["a"]["null_counts"] == {"x": 2, "y": 1}
+    # coluna ausente do membro não aparece (≠ presente e toda nula)
+    assert entries["b"]["null_counts"] == {"y": 1}
+    # 0 linhas: toda coluna que o membro trazia, com 0
+    assert entries["c"]["null_counts"] == {"x": 0, "y": 0}
+    for entry in entries.values():
+        assert "mes" not in entry["null_counts"]
+        assert ORIGIN_COLUMN not in entry["null_counts"]
+    df = scan_dataset(_dataset(tmp_path / "lake")).collect()
+    # a união tem 4 nulos em x: 2 do membro a e as 2 linhas do b, preenchidas
+    assert df["x"].null_count() == 4
+
+
+def test_member_stats_membro_mantido_preserva_a_entrada(tmp_path: Path) -> None:
+    writer = _writer(tmp_path / "lake")
+    writer.write_group(
+        "ds_2024",
+        _stat_members(tmp_path),
+        partitions=PARTS,
+        schema=_FILL,
+        member_stats=True,
+    )
+    path = _dataset(tmp_path / "lake") / "ano=2024" / "ds_2024.parquet"
+    before = _entries(path)
+    calls: list[str] = []
+    members = _stat_members(tmp_path, calls)
+    assert writer.is_current_group(
+        "ds_2024", members, partitions=PARTS, member_stats=True
+    )
+    # um membro muda: só ele é reavaliado, os outros levam a entrada intacta
+    _raw(tmp_path, "b@20260101.csv", "outro conteudo")
+    res = writer.write_group(
+        "ds_2024", members, partitions=PARTS, schema=_FILL, member_stats=True
+    )
+    after = _entries(path)
+    assert calls == ["b"] and res.kept == ["a", "c"]
+    assert after["a"] == before["a"]
+    assert after["c"] == before["c"]
+    assert after["b"]["null_counts"] == {"y": 1}
+
+
+def test_member_stats_entrada_sem_estatistica_forca_a_reescrita(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path / "lake")
+    writer.write_group(
+        "ds_2024", _stat_members(tmp_path), partitions=PARTS, schema=_FILL
+    )
+    path = _dataset(tmp_path / "lake") / "ano=2024" / "ds_2024.parquet"
+    assert all("null_counts" not in e for e in _entries(path).values())
+    members = _stat_members(tmp_path)
+    # sem a opção o grupo está em dia; com ela, não
+    assert writer.is_current_group("ds_2024", members, partitions=PARTS)
+    assert not writer.is_current_group(
+        "ds_2024", members, partitions=PARTS, member_stats=True
+    )
+    calls: list[str] = []
+    res = writer.write_group(
+        "ds_2024",
+        _stat_members(tmp_path, calls),
+        partitions=PARTS,
+        schema=_FILL,
+        member_stats=True,
+    )
+    assert res.status == "converted" and sorted(calls) == ["a", "b", "c"]
+    assert all("null_counts" in e for e in _entries(path).values())
+    assert writer.is_current_group(
+        "ds_2024", members, partitions=PARTS, member_stats=True
+    )
+
+
+def test_member_stats_desligado_deixa_o_rodape_como_era(tmp_path: Path) -> None:
+    writer = _writer(tmp_path / "lake")
+    writer.write_group(
+        "ds_2024", _stat_members(tmp_path), partitions=PARTS, schema=_FILL
+    )
+    path = _dataset(tmp_path / "lake") / "ano=2024" / "ds_2024.parquet"
+    entries = _entries(path)
+    assert set(entries["a"]) == {
+        "origin_file",
+        "origin_sha256",
+        "rows",
+        "converted_at",
+        "mes",
+    }
+    # ligado, o único acréscimo ao rodapé é null_counts
+    other = _writer(tmp_path / "lake2")
+    other.write_group(
+        "ds_2024",
+        _stat_members(tmp_path),
+        partitions=PARTS,
+        schema=_FILL,
+        member_stats=True,
+    )
+    path2 = _dataset(tmp_path / "lake2") / "ano=2024" / "ds_2024.parquet"
+    for key, entry in _entries(path2).items():
+        entry = dict(entry)
+        entry.pop("null_counts")
+        assert set(entry) == set(entries[key])
+
+
+def test_member_stats_nome_reservado_na_coluna_de_membro(tmp_path: Path) -> None:
+    writer = _writer(tmp_path / "lake")
+    src = _raw(tmp_path, "z.csv")
+    member = GroupMember(src, pl.DataFrame({"v": [1]}), columns={"null_counts": "1"})
+    with pytest.raises(ValueError, match="null_counts"):
+        writer.write_group("ds_2024", [member], partitions=PARTS)
