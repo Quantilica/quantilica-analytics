@@ -2506,6 +2506,17 @@ class LakeWriter:
         written before the option existed; entries of kept members keep any
         ``null_counts`` they already have.
 
+        Columns of the file with ``member_stats``: the group's data columns are
+        the union of the ``null_counts`` keys of the kept members, the columns
+        of the members written in this call and the ``schema`` columns (member
+        columns and ``_origem`` always stay). The kept rows are projected to
+        that set, with their types from the existing file, so a column only a
+        removed member (an old version that left the raw files) carried leaves
+        the file without rewriting the kept members: their ``data`` is not
+        called. If a kept member has no ``null_counts`` (only possible for
+        members carried over by ``prune=False``) no column is dropped. Without
+        ``member_stats`` the columns are those of the existing file, as before.
+
         Memory: nothing is collected. A ``LazyFrame`` is streamed to a staged
         Parquet, a ``Path`` or :class:`DuckSource` goes through DuckDB, and the
         file is written by DuckDB from those staged files plus the kept rows
@@ -2867,11 +2878,22 @@ class LakeWriter:
             carried_select = "*"
             # (label, member key or None for the existing file, description)
             sources: list[tuple[str, str | None, dict[str, str]]] = []
+            staged_desc = {
+                key: _describe(conn, _lit(str(staged[key]))) for key in sorted(staged)
+            }
+            project: dict[str, str] | None = None
             if existing is not None:
                 conn.register("keep", pa.table({"k": sorted(carried)}))
-                sources.append(("the existing file", None, _describe(conn, existing)))
-            for key in sorted(staged):
-                desc = _describe(conn, _lit(str(staged[key])))
+                present = _describe(conn, existing)
+                if member_stats:
+                    project = self._projected_columns(
+                        plan, carried, staged_desc, schema, present
+                    )
+                    if project is not None:
+                        present = project
+                        carried_select = ", ".join(_ident(c) for c in project)
+                sources.append(("the existing file", None, present))
+            for key, desc in staged_desc.items():
                 sources.append((f"member {key!r}", key, desc))
             targets = _unify_types([(lb, d) for lb, _, d in sources], wanted)
             normalized: list[tuple[str, dict[str, str]]] = []
@@ -2947,6 +2969,34 @@ class LakeWriter:
             kept=list(carried),
             removed=list(plan.orphans),
         )
+
+    @staticmethod
+    def _projected_columns(
+        plan: _GroupPlan,
+        carried: Sequence[str],
+        staged_desc: Mapping[str, Mapping[str, str]],
+        schema: Mapping[str, str | pl.DataType] | None,
+        present: Mapping[str, str],
+    ) -> dict[str, str] | None:
+        """Columns of the existing file the group keeps, with ``member_stats``.
+
+        The union of the ``null_counts`` keys of the kept members, the data
+        columns of the members written now and the ``schema`` columns, plus the
+        member columns and ``_origem`` (types from the existing file). ``None``
+        (keep every column) when a kept entry has no ``null_counts``: it cannot
+        say which columns it carried (only members carried over by ``prune=False``
+        can be in that case).
+        """
+        entries = [plan.state.members[k] for k in carried]
+        if not all(isinstance(e.get("null_counts"), Mapping) for e in entries):
+            return None
+        data: set[str] = set(schema or ())
+        for e in entries:
+            data.update(e["null_counts"])
+        own = {*plan.columns, ORIGIN_COLUMN}
+        for desc in staged_desc.values():
+            data.update(c for c in desc if c not in own)
+        return {c: t for c, t in present.items() if c in own or c in data}
 
     @staticmethod
     def _cast_staged(

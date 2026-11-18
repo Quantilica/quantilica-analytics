@@ -1521,3 +1521,66 @@ def test_member_stats_nome_reservado_na_coluna_de_membro(tmp_path: Path) -> None
     member = GroupMember(src, pl.DataFrame({"v": [1]}), columns={"null_counts": "1"})
     with pytest.raises(ValueError, match="null_counts"):
         writer.write_group("ds_2024", [member], partitions=PARTS)
+
+
+def test_member_stats_coluna_exclusiva_de_membro_removido_sai_do_arquivo(
+    tmp_path: Path,
+) -> None:
+    def make(name: str, frame: pl.DataFrame, mes: str, calls: list | None = None):
+        src = _raw(tmp_path, f"{name}.csv")
+
+        def data(frame=frame):
+            if calls is not None:
+                calls.append(name)
+            return frame
+
+        return GroupMember(src, data, columns={"mes": mes})
+
+    a = pl.DataFrame({"v": [1, None, 3]})
+    b = pl.DataFrame({"v": [4], "so_no_b": ["x"]})
+    writer = _writer(tmp_path / "lake")
+    writer.write_group(
+        "ds_2024",
+        [make("a", a, "01"), make("b", b, "02")],
+        partitions=PARTS,
+        schema={"so_no_b": "VARCHAR"},
+        member_stats=True,
+    )
+    path = _dataset(tmp_path / "lake") / "ano=2024" / "ds_2024.parquet"
+    assert "so_no_b" in pq.ParquetFile(path).schema_arrow.names
+    before = (
+        scan_dataset(_dataset(tmp_path / "lake"))
+        .collect()
+        .filter(pl.col(ORIGIN_COLUMN) == "a")
+    )
+    kept_entry = _entries(path)["a"]
+
+    calls: list[str] = []
+    res = writer.write_group(
+        "ds_2024",
+        [make("a", a, "01", calls)],
+        partitions=PARTS,
+        member_stats=True,
+    )
+    assert res.status == "converted" and res.removed == ["b"] and res.kept == ["a"]
+    assert calls == []  # o membro mantido não foi decodificado
+    assert "so_no_b" not in pq.ParquetFile(path).schema_arrow.names
+    after = scan_dataset(_dataset(tmp_path / "lake")).collect()
+    assert after.drop(ORIGIN_COLUMN).equals(before.drop(ORIGIN_COLUMN, "so_no_b"))
+    assert _entries(path) == {"a": kept_entry}
+    assert check_dataset(_dataset(tmp_path / "lake")) == []
+
+
+def test_member_stats_desligado_mantem_a_coluna_do_membro_removido(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path / "lake")
+    src_a, src_b = _raw(tmp_path, "a.csv"), _raw(tmp_path, "b.csv")
+    a = GroupMember(src_a, pl.DataFrame({"v": [1]}), columns={"mes": "01"})
+    b = GroupMember(
+        src_b, pl.DataFrame({"v": [2], "extra": ["x"]}), columns={"mes": "02"}
+    )
+    writer.write_group("ds_2024", [a, b], partitions=PARTS, schema={"extra": "VARCHAR"})
+    writer.write_group("ds_2024", [a], partitions=PARTS)
+    path = _dataset(tmp_path / "lake") / "ano=2024" / "ds_2024.parquet"
+    assert "extra" in pq.ParquetFile(path).schema_arrow.names
