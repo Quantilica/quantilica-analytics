@@ -5,6 +5,12 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Corrigido
+
+- `LakeWriter` (conexão DuckDB interna): `QUANTILICA_DUCKDB_MEMORY` e `QUANTILICA_DUCKDB_THREADS` passam a ser validados antes de abrir a conexão, com a mesma regra e as mesmas mensagens do `quantilica-sql`. Memória precisa ser tamanho com unidade (`64GB`, `512MiB`, `80%`) e threads, inteiro >= 1 (ASCII); valor inválido levanta `LakeError` com o nome da variável, em vez de montar `SET memory_limit` com texto livre ou deixar um `ValueError` cru subir de `int()`. Variável ausente ou em branco mantém o padrão do DuckDB. Nova função pública `quantilica.analytics.lake.duckdb_env_settings`.
+
 ## [0.15.0] - 2026-11-19
 
 ### Adicionado

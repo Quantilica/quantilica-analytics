@@ -357,17 +357,55 @@ def _ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+DUCKDB_MEMORY_ENV = "QUANTILICA_DUCKDB_MEMORY"
+DUCKDB_THREADS_ENV = "QUANTILICA_DUCKDB_THREADS"
+_MEMORY_RE = re.compile(
+    r"^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB|%)$", re.IGNORECASE | re.ASCII
+)
+
+
+def duckdb_env_settings(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str | None, int | None]:
+    """``(memory_limit, threads)`` from ``QUANTILICA_DUCKDB_MEMORY/THREADS``.
+
+    A missing or blank variable gives ``None`` (DuckDB keeps its default). An
+    invalid value raises :class:`LakeError` (memory such as ``64GB``,
+    ``512MiB`` or ``80%``; threads an integer >= 1) instead of reaching DuckDB
+    as free text or as a bare ``ValueError``.
+    """
+    env = os.environ if environ is None else environ
+    memory = (env.get(DUCKDB_MEMORY_ENV) or "").strip() or None
+    if memory is not None and not _MEMORY_RE.match(memory):
+        raise LakeError(
+            f"{DUCKDB_MEMORY_ENV}={memory!r} inválido: use tamanho com unidade "
+            "(ex.: 64GB, 512MiB, 80%)"
+        )
+    raw_threads = (env.get(DUCKDB_THREADS_ENV) or "").strip()
+    threads: int | None = None
+    if raw_threads:
+        if (
+            not (raw_threads.isascii() and raw_threads.isdigit())
+            or int(raw_threads) < 1
+        ):
+            raise LakeError(
+                f"{DUCKDB_THREADS_ENV}={raw_threads!r} inválido: use inteiro >= 1"
+            )
+        threads = int(raw_threads)
+    return memory, threads
+
+
 def _connect(temp_dir: Path):
     import duckdb
 
+    # Validate before opening the connection: a bad value must not leak one.
+    memory, threads = duckdb_env_settings()
     conn = duckdb.connect()
     conn.execute(f"SET temp_directory = {_lit(str(temp_dir))}")
-    memory = os.environ.get("QUANTILICA_DUCKDB_MEMORY")
-    if memory:
+    if memory is not None:
         conn.execute(f"SET memory_limit = {_lit(memory)}")
-    threads = os.environ.get("QUANTILICA_DUCKDB_THREADS")
-    if threads:
-        conn.execute(f"SET threads = {int(threads)}")
+    if threads is not None:
+        conn.execute(f"SET threads = {threads}")
     return conn
 
 
