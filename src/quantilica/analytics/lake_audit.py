@@ -135,6 +135,7 @@ from quantilica.analytics.lake import (
     DESCRIPTOR_FILENAME,
     META_FILE_KEY,
     META_MEMBERS,
+    META_ORIGIN_OUTPUTS,
     META_ORIGIN_SHA,
     TMP_DIRNAME,
     TMP_SUFFIX,
@@ -840,6 +841,9 @@ class _Origin:
     # The raw file's member (a ZIP member, a sheet): the footer's file key when
     # it is a composite of the file key and the member. Empty for a plain file.
     member: str = ""
+    # How many outputs the footer says the origin feeds in the dataset
+    # (``quantilica.origin_outputs``); 0 when it declares none.
+    outputs: int = 0
 
 
 class _Raw:
@@ -1368,6 +1372,7 @@ def _digest(foot: _Footprint, info: _FileInfo) -> None:
                 "/".join(parts[:-1]),
                 rel,
                 key if name and key != file_key(name) else "",
+                _declared_outputs(kv.get(META_ORIGIN_OUTPUTS)),
             )
         )
         return
@@ -1411,6 +1416,17 @@ def _digest(foot: _Footprint, info: _FileInfo) -> None:
                 key if name and key != file_key(name) else "",
             )
         )
+
+
+def _declared_outputs(value: str | None) -> int:
+    """How many outputs a footer's ``quantilica.origin_outputs`` lists (0: none)."""
+    try:
+        outputs = json.loads(value) if value else None
+    except ValueError:
+        return 0
+    if not isinstance(outputs, list) or not all(isinstance(o, str) for o in outputs):
+        return 0
+    return len(set(outputs))
 
 
 def _check_depth(foot: _Footprint, scan: _LakeScan) -> list[AuditFinding]:
@@ -1469,7 +1485,9 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
 
     * the same ``(origin name, sha256, member)`` in more Parquets or members than
       the raw side has files of that name and digest (a source may publish the very same
-      file in two folders, e.g. two competences);
+      file in two folders, e.g. two competences), times the outputs the footers
+      declare for the origin (``quantilica.origin_outputs``: one raw file that
+      feeds one Parquet per partition value found in its rows);
     * two versions (different names) of the same raw file, a *raw file* being
       ``(folder, file_key)`` of the raw side. The folder is found through the
       raw side (the file of that name and digest; failing that, the only folder
@@ -1494,6 +1512,10 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
         if raw is not None:
             files = raw.by_name.get((source, name), [])
             copies = max(1, sum(sha in raw.shas[f] for f in files))
+        # An origin that declares the outputs it feeds (one Parquet per partition
+        # value found in the rows, say ``contrato=``) legitimately sits in that many
+        # places per raw copy.
+        copies *= max(1, *(o.outputs for o in group))
         if places > copies:
             where = sorted({o.lake_rel for o in group})
             out.append(

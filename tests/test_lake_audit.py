@@ -919,3 +919,61 @@ def test_datasets_are_audited_independently(corpus) -> None:
     convert_year(corpus, raw, "2013", "dados")
     convert_year(corpus, raw, "2013", "outro")
     assert "versao_duplicada" not in categories(audit(corpus, readers=False))
+
+
+# --- one raw file, one Parquet per value found in the rows (declared outputs) ------
+
+
+def convert_outputs(
+    corpus, raw_file: Path, values: list[str], *, declare: bool = True
+) -> list[Path]:
+    """Write one Parquet per ``contrato=`` value of a raw file, declaring the lot."""
+    import polars as pl
+    from quantilica.core.lake import DatasetDescriptor, file_key
+
+    from quantilica.analytics import LakeWriter
+    from quantilica.analytics.lake import output_id
+
+    writer = LakeWriter(
+        corpus.dataset_dir("eps", "dados"),
+        DatasetDescriptor(
+            source_id="eps",
+            dataset_id="dados",
+            alias="dados",
+            partition_keys=["mes", "contrato"],
+            partition_types={"mes": "varchar", "contrato": "varchar"},
+        ),
+    )
+    parts = [{"mes": "01", "contrato": v} for v in values]
+    outputs = sorted(output_id(p, file_key(raw_file)) for p in parts)
+    return [
+        writer.write_polars(
+            pl.DataFrame({"valor": [1, 2, 3]}),
+            raw_file,
+            partitions=p,
+            origin_outputs=outputs if declare else None,
+        ).output
+        for p in parts
+    ]
+
+
+def test_declared_outputs_of_one_raw_file_are_not_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "2026", "agro-2026-11-03.csv")
+    convert_outputs(corpus, raw, ["BGI", "CCM", "ICF"])
+    report = audit(corpus, readers=False)
+    assert "versao_duplicada" not in categories(report), report.to_text()
+
+
+def test_undeclared_outputs_in_many_partitions_are_still_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "2026", "agro-2026-11-03.csv")
+    convert_outputs(corpus, raw, ["BGI", "CCM", "ICF"], declare=False)
+    assert categories(audit(corpus, readers=False))["versao_duplicada"] == 1
+
+
+def test_one_more_place_than_declared_is_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "2026", "agro-2026-11-03.csv")
+    first, *_ = convert_outputs(corpus, raw, ["BGI", "CCM", "ICF"])
+    stray = first.parent.parent / "contrato=SJC"
+    stray.mkdir()
+    (stray / first.name).write_bytes(first.read_bytes())
+    assert categories(audit(corpus, readers=False))["versao_duplicada"] == 1
