@@ -5,6 +5,12 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [0.15.3] - 2026-11-24
+
+### Corrigido
+
+- `lake_audit`: `versao_duplicada` não acusa mais o bruto que gera várias saídas e as declara. Um arquivo que vira um Parquet por valor achado nas linhas (um `contrato=` por contrato, nos derivativos agropecuários da B3; um `ano=` por ano das linhas) deixa a mesma origem em várias partições, e a checagem a contava como cópias. O rodapé já registra as saídas declaradas (`quantilica.origin_outputs`, desde 0.15.0), e agora a checagem as confere uma a uma: cada Parquet precisa ser uma das saídas declaradas (partições e chave, como `output_id`) e cada saída aparece no máximo uma vez por cópia do bruto. Um Parquet em partição não declarada, ou a mesma saída em dois arquivos, continua sendo `versao_duplicada`; sem declaração em algum rodapé do grupo, vale a regra anterior.
+
 ## [0.15.2] - 2026-11-24
 
 ### Alterado
