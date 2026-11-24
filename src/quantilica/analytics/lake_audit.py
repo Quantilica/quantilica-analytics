@@ -841,9 +841,11 @@ class _Origin:
     # The raw file's member (a ZIP member, a sheet): the footer's file key when
     # it is a composite of the file key and the member. Empty for a plain file.
     member: str = ""
-    # How many outputs the footer says the origin feeds in the dataset
-    # (``quantilica.origin_outputs``); 0 when it declares none.
-    outputs: int = 0
+    # The outputs the footer says the origin feeds in the dataset
+    # (``quantilica.origin_outputs``, as ``output_id`` names them); empty when it
+    # declares none. ``output`` is this Parquet's own id (``<partitions>/<key>``).
+    declared: frozenset[str] = frozenset()
+    output: str = ""
 
 
 class _Raw:
@@ -1373,6 +1375,7 @@ def _digest(foot: _Footprint, info: _FileInfo) -> None:
                 rel,
                 key if name and key != file_key(name) else "",
                 _declared_outputs(kv.get(META_ORIGIN_OUTPUTS)),
+                "/".join([*parts[2:-1], key.removesuffix(".parquet")]),
             )
         )
         return
@@ -1418,15 +1421,15 @@ def _digest(foot: _Footprint, info: _FileInfo) -> None:
         )
 
 
-def _declared_outputs(value: str | None) -> int:
-    """How many outputs a footer's ``quantilica.origin_outputs`` lists (0: none)."""
+def _declared_outputs(value: str | None) -> frozenset[str]:
+    """The ids a footer's ``quantilica.origin_outputs`` lists (empty: none)."""
     try:
         outputs = json.loads(value) if value else None
     except ValueError:
-        return 0
+        return frozenset()
     if not isinstance(outputs, list) or not all(isinstance(o, str) for o in outputs):
-        return 0
-    return len(set(outputs))
+        return frozenset()
+    return frozenset(outputs)
 
 
 def _check_depth(foot: _Footprint, scan: _LakeScan) -> list[AuditFinding]:
@@ -1485,9 +1488,11 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
 
     * the same ``(origin name, sha256, member)`` in more Parquets or members than
       the raw side has files of that name and digest (a source may publish the very same
-      file in two folders, e.g. two competences), times the outputs the footers
-      declare for the origin (``quantilica.origin_outputs``: one raw file that
-      feeds one Parquet per partition value found in its rows);
+      file in two folders, e.g. two competences). When the footers declare the
+      outputs of the origin (``quantilica.origin_outputs``: one raw file that
+      feeds one Parquet per partition value found in its rows), the check is per
+      output instead: each Parquet must be a declared output, and each output sits
+      in at most one place per raw copy;
     * two versions (different names) of the same raw file, a *raw file* being
       ``(folder, file_key)`` of the raw side. The folder is found through the
       raw side (the file of that name and digest; failing that, the only folder
@@ -1507,22 +1512,37 @@ def _check_duplicates(traced: list[_Origin], raw: _Raw | None) -> list[AuditFind
             (origin.source, origin.dataset, origin.name, origin.sha256, origin.member)
         ].append(origin)
     for (source, dataset, name, sha, _member), group in sorted(same.items()):
-        places = _places(group)
         copies = 1
         if raw is not None:
             files = raw.by_name.get((source, name), [])
             copies = max(1, sum(sha in raw.shas[f] for f in files))
-        # An origin that declares the outputs it feeds (one Parquet per partition
-        # value found in the rows, say ``contrato=``) legitimately sits in that many
-        # places per raw copy.
-        copies *= max(1, *(o.outputs for o in group))
-        if places > copies:
+        problem = ""
+        if all(o.declared for o in group):
+            # Every footer declares the outputs of its origin: each Parquet must be
+            # one of them (``output_id``: partitions and file key), and each output
+            # sits in at most one place per raw copy.
+            declared = frozenset().union(*(o.declared for o in group))
+            where_by_id: dict[str, set[str]] = defaultdict(set)
+            for o in group:
+                where_by_id[o.output].add(o.lake_rel)
+            places = len({o.lake_rel for o in group})
+            undeclared = sorted(i for i in where_by_id if i not in declared)
+            repeated = sorted(i for i, w in where_by_id.items() if len(w) > copies)
+            if undeclared:
+                problem = f"; fora das saídas declaradas: {', '.join(undeclared[:3])}"
+            elif repeated:
+                problem = f"; saída repetida: {', '.join(repeated[:3])}"
+            flagged = bool(undeclared or repeated)
+        else:
+            places = _places(group)
+            flagged = places > copies
+        if flagged:
             where = sorted({o.lake_rel for o in group})
             out.append(
                 AuditFinding(
                     "versao_duplicada",
                     f"{name} (sha256 {sha[:12]}) está em {places} lugares: "
-                    f"{', '.join(where[:4])}",
+                    f"{', '.join(where[:4])}{problem}",
                     where[0],
                     source,
                     dataset,

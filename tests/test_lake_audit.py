@@ -976,4 +976,64 @@ def test_one_more_place_than_declared_is_a_duplicate(corpus) -> None:
     stray = first.parent.parent / "contrato=SJC"
     stray.mkdir()
     (stray / first.name).write_bytes(first.read_bytes())
-    assert categories(audit(corpus, readers=False))["versao_duplicada"] == 1
+    report = audit(corpus, readers=False)
+    assert categories(report)["versao_duplicada"] == 1
+    (finding,) = [f for f in report.findings if f.category == "versao_duplicada"]
+    assert "contrato=SJC" in finding.message  # not one of the declared outputs
+
+
+def convert_years_declared(corpus, raw_file: Path, anos: list[str]) -> list[Path]:
+    """One Parquet per row-year, declaring every ``ano=`` output (the capes case)."""
+    import polars as pl
+    from quantilica.core.lake import DatasetDescriptor, file_key
+
+    from quantilica.analytics import LakeWriter
+    from quantilica.analytics.lake import output_id
+
+    writer = LakeWriter(
+        corpus.dataset_dir("eps", "dados"),
+        DatasetDescriptor(
+            source_id="eps",
+            dataset_id="dados",
+            alias="dados",
+            partition_keys=["ano"],
+            partition_types={"ano": "int"},
+        ),
+    )
+    outputs = sorted(output_id({"ano": a}, file_key(raw_file)) for a in anos)
+    return [
+        writer.write_polars(
+            pl.DataFrame({"valor": [1, 2, 3]}),
+            raw_file,
+            partitions={"ano": a},
+            origin_outputs=outputs,
+        ).output
+        for a in anos
+    ]
+
+
+def test_declared_row_year_split_is_not_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "acidentes", "acidentes@20251128.csv")
+    convert_years_declared(corpus, raw, ["2013", "2014", "2015"])
+    report = audit(corpus, readers=False)
+    assert "versao_duplicada" not in categories(report), report.to_text()
+
+
+def test_declared_row_year_copy_in_an_undeclared_year_is_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "acidentes", "acidentes@20251128.csv")
+    first, *_ = convert_years_declared(corpus, raw, ["2013", "2014"])
+    stray = first.parent.parent / "ano=2099"
+    stray.mkdir()
+    (stray / first.name).write_bytes(first.read_bytes())
+    report = audit(corpus, readers=False)
+    assert categories(report)["versao_duplicada"] == 1
+    (finding,) = [f for f in report.findings if f.category == "versao_duplicada"]
+    assert "ano=2099" in finding.message
+
+
+def test_a_declared_output_in_two_places_is_a_duplicate(corpus) -> None:
+    raw = add_raw(corpus, "eps", "2026", "agro-2026-11-03.csv")
+    first, *_ = convert_outputs(corpus, raw, ["BGI", "CCM"])
+    first.with_name("outro.parquet").write_bytes(first.read_bytes())
+    report = audit(corpus, readers=False)
+    assert categories(report)["versao_duplicada"] == 1
