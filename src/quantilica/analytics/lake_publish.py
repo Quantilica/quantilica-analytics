@@ -1,27 +1,22 @@
-"""Publication markers of a lake kept in a synced folder.
+"""Build marker, build manifest and state file of a lake.
 
-A lake that lives in a folder synced by a cloud client is written by one machine
-(the one that runs ``lake build``) and read by another one, through a read-only
-mount that never writes there. The sync client uploads files in any order, so a
-reader can see a new Parquet without its neighbours, or the marker already gone
-before the Parquets arrived. The reader needs a criterion of its own for
-"published". Three small JSON files carry it:
+A lake can be read while it is being updated, or after a copy that arrives file
+by file, in any order: a reader may then see a new Parquet without its
+neighbours, or the marker already gone before the Parquets arrived. These three
+small JSON files give the reader a criterion of its own for "published":
 
 * ``<lake>/<source>/_em-atualizacao.json`` (the *marker*): written by
   ``lake build`` before it writes anything of the source, removed by
-  ``lake audit --clear-marker`` once the audit of the source passes. While it
+  ``lake_audit(clear_marker=True)`` once the audit of the source passes. While it
   exists, the source is being updated.
 * ``<lake>/<source>/_build.json`` (the *build manifest*): written, atomically, at
   the end of a build that succeeded on the source. It lists every Parquet of the
   source with its size in bytes, so a reader can tell whether everything that
-  the build wrote has arrived.
+  the build wrote is there.
 * a *state file*, outside the lake, written by the read-only audit: per source,
-  the ``build_id`` audited, the result (:data:`RESULTS`) and when. Readers that
-  receive the state only use the sources it calls ``publicado`` whose
+  the ``build_id`` audited, the result (:data:`RESULTS`) and when. A reader that
+  has the state should only use the sources it calls ``publicado`` whose
   ``build_id`` is that of the current ``_build.json``.
-
-The file names, the result names and the state layout are a contract with
-``quantilica-cli``, which reads them without importing this package.
 
 State layout (``versao`` 1)::
 
@@ -55,7 +50,7 @@ RESULT_FAILED = "falhou"
 RESULTS = (RESULT_PUBLISHED, RESULT_UPDATING, RESULT_INCOMPLETE, RESULT_FAILED)
 
 
-# A sync client or an antivirus may hold a file for a moment (WinError 5/32 on
+# A file synchronizer or an antivirus may hold a file for a moment (WinError 5/32 on
 # Windows): replacing or removing it is tried again, waiting 0.2 s, 0.4 s...
 RETRY_ATTEMPTS = 5
 RETRY_FIRST_WAIT = 0.2
@@ -171,7 +166,7 @@ def write_marker(source_dir: Path | str, build_id: str) -> Path:
 def read_marker(source_dir: Path | str) -> dict[str, Any] | None:
     """The marker's content, ``None`` if there is none.
 
-    A marker that exists but cannot be parsed (the sync client may have shown the
+    A marker that exists but cannot be parsed (a partial copy may have shown the
     file before its content) still means "being updated": it comes back as an
     empty dict.
     """

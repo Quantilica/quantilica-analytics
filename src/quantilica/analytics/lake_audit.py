@@ -61,10 +61,10 @@ is ``em_atualizacao``; a source without ``_build.json`` is ``incompleto``.
 do in the lake; a marker that cannot be removed is a note, and the audit goes on.
 
 The manifest findings fail the audit only when it is about publication, that is,
-with ``read_only`` or ``state``. The plain audit (the builder machine's) shows
+with ``read_only`` or ``state``. The plain audit shows
 them as notes and keeps its verdict; they still count for the source's result.
 Under ``read_only``, a ``tmp_sobrando`` finding also makes the source
-``incompleto`` (a leftover that has not been synced away), not ``falhou``.
+``incompleto`` (a leftover that is still to be removed), not ``falhou``.
 Parquets written outside ``lake build`` (the ``convert`` commands of the fetchers)
 leave no manifest: a read-only audit calls such a source ``incompleto``.
 The manifest compares names and sizes only: a file rewritten with the same size
@@ -985,7 +985,7 @@ def lake_audit(
             their manifest sidecar.
         workers: Threads reading footers (default: twice the CPUs, up to 32).
         progress: Called as ``progress(stage, done, total)``.
-        read_only: The audit of a lake mounted for reading only: it writes
+        read_only: The audit of a lake opened for reading only: it writes
             nothing in the lake, a source with ``_em-atualizacao.json`` is
             ``em_atualizacao`` (not read, findings dropped) and a source without
             ``_build.json`` is ``incompleto``. Incompatible with ``clear_marker``.
@@ -1160,8 +1160,8 @@ def lake_audit(
         | published
     ) - skipped
     # Manifest divergences fail the audit only where the verdict is about
-    # publication (read-only, or a state file): the plain audit, which the
-    # builder machine runs, keeps its exit code and gets notes instead.
+    # publication (read-only, or a state file): the plain audit keeps its
+    # exit code and gets notes instead.
     strict = read_only or state_path is not None
     manifests = {s: _load_manifest(lake_path, s) for s in sorted(judged)}
     divergences: list[AuditFinding] = []

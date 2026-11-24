@@ -5,6 +5,12 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Alterado
+
+- Docstrings de `quantilica.analytics.lake_publish` e de `lake_audit` descrevem o marcador de atualização, o manifesto do build e o arquivo de estado como recursos genéricos de biblioteca, sem citar outro pacote nem uma forma específica de publicar o lake. Só textos: a API e o comportamento não mudam.
+
 ## [0.15.1] - 2026-11-19
 
 ### Corrigido
