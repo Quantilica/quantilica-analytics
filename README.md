@@ -23,20 +23,30 @@ O pacote utiliza as melhores ferramentas modernas para processamento de dados de
 ## Módulos
 
 ### 1. `quantilica.analytics.reader`
-Abstração de leitura multi-formato integrada aos manifestos do core.
-- Suporte a: `CSV`, `JSON`, `Excel`, `DBF` (comum no DATASUS).
-- Integração com `quantilica.core.storage.LocalStorage`.
-- Detecção automática de encoding e delimitadores.
+Leitura de arquivos brutos, guiada ou não por um manifesto do core.
+- `SmartReader.read()` / `.scan()`: `CSV` (padrão `;` e `latin-1`, com recuo de codificação), `Parquet`, `JSON` e `Excel` (`.xlsx`/`.xls`); aceita o caminho ou um `DownloadManifest`.
+- `read_brazilian_csv()` e `read_csv_resilient()`: CSVs de dados abertos brasileiros (separador `;`, decimal `,`, codificação incerta, linhas quebradas); `normalize_brazilian_numbers()`.
+- `quantilica.analytics.dbf`: `read_dbf()` e `read_dbc()` (dBase e DBC do DATASUS, sem dependências extras).
+- `quantilica.analytics.fixed_width`: layouts de largura fixa (`layout_from_datasus`, `layout_from_sas_input`) e a consulta DuckDB que os lê (`fixed_width_sql`).
 
 ### 2. `quantilica.analytics.schema`
-Definição de contratos de dados para garantir consistência entre datasets.
-- Classe `DataContract`: Define nomes de colunas padronizados, tipos e campos obrigatórios.
-- Validação preventiva: Erro imediato se a fonte oficial alterar o layout do arquivo.
+Contratos de dados para garantir consistência entre datasets.
+- `DataContract` e `Field`: nomes de colunas, tipos e campos obrigatórios; `validate()` levanta erro se a fonte oficial alterar o layout do arquivo.
+- `EraSchemaResolver`: renomeia colunas de eras históricas para o nome canônico, aplica os tipos esperados e preenche com nulos tipados o que falta nas eras antigas.
 
 ### 3. `quantilica.analytics.writer`
-Conversão padronizada para formatos analíticos.
-- `to_parquet()`: Escrita otimizada com compressão `zstd` e inclusão de metadados de proveniência (como o `sha256` original) no header do arquivo Parquet.
-- Particionamento inteligente baseado nos metadados do dataset.
+Escrita padronizada de Parquet.
+- `to_parquet(data, output_path, manifest=..., contract=...)`: escrita atômica (arquivo temporário + `os.replace`), compressão `zstd` por padrão, validação opcional contra um `DataContract`, e a proveniência do `DownloadManifest` (como o `sha256` de origem) nos metadados do arquivo e num sidecar `<arquivo>.manifest.json`. Sem `manifest`, `source_path=` lê o sidecar do bruto.
+
+### 4. Data Lake (`lake`, `lake_build`, `lake_audit`, `lake_publish`)
+Motor do lake Hive em Parquet.
+- `LakeWriter`, `SpecLakeConverter`/`convert_with_specs`, `scan_dataset`, `duckdb_view_sql` e `check_dataset`: escrita particionada com troca atômica, conversão por especificação e leitura por DuckDB/Polars.
+- `lake_build`: construção retomável, um processo por `(fonte, dataset)`.
+- `lake_audit`: auditoria de integridade, proveniência e completude do lake.
+- `lake_publish`: marcador de atualização, manifesto do build e arquivo de estado.
+
+### 5. `quantilica.analytics.geo`
+Dimensões geográficas canônicas (`get_dim_geo`, `get_dim_uf`), conversão de código de município IBGE entre 6 e 7 dígitos e utilitários de geometria (WKB e bbox; o extra `geo` traz geopandas, pyogrio e pyproj).
 
 ## Benefícios
 
@@ -46,23 +56,33 @@ Conversão padronizada para formatos analíticos.
 
 ## Instalação
 
-O `quantilica-analytics` é publicado via GitHub. Adicione-o ao seu projeto:
+O `quantilica-analytics` **não está no PyPI**: é distribuído pelo índice estático próprio da Quantilica (`https://index.quantilica.com/simple/`). Adicione-o ao seu projeto:
 
 ```bash
-uv add "quantilica-analytics @ git+https://github.com/Quantilica/quantilica-analytics.git"
+uv add quantilica-analytics --index https://index.quantilica.com/simple/
+```
+
+As dependências (`quantilica-core`, `polars`, `pyarrow`, `duckdb`) vêm do PyPI. Para reprojeção e leitura de shapefile/GeoPackage, use o extra `geo`:
+
+```bash
+uv add "quantilica-analytics[geo]" --index https://index.quantilica.com/simple/
 ```
 
 ## Uso Rápido
 
 ```python
+from quantilica.analytics.reader import SmartReader
 from quantilica.analytics.writer import to_parquet
 from quantilica.core.manifests import DownloadManifest
 
-# Carrega um manifesto de um download realizado pelo core
+# Manifesto de um download feito pelo core (o sidecar fica ao lado do bruto)
 manifest = DownloadManifest.read_json("data/raw/dataset.csv.manifest.json")
 
-# Converte para Parquet com rastreabilidade total (proveniência injetada no header)
-to_parquet(manifest, "data/processed/dataset.parquet")
+# Lê o arquivo apontado pelo manifesto (CSV: ';' e latin-1 por padrão)
+df = SmartReader().read(manifest)
+
+# Grava o Parquet com rastreabilidade total (proveniência injetada nos metadados)
+to_parquet(df, "data/processed/dataset.parquet", manifest=manifest)
 ```
 
 ## Desenvolvimento

@@ -5,6 +5,13 @@ Todas as mudanças notáveis deste projeto serão documentadas neste arquivo.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Corrigido
+
+- README: instalação pelo índice próprio (`uv add quantilica-analytics --index https://index.quantilica.com/simple/`; o pacote não está no PyPI), módulos conferidos contra o código (a menção à integração do leitor com `LocalStorage` não correspondia a nada no pacote; entram os módulos de lake, `dbf`, `fixed_width` e `geo`) e o exemplo de uso reescrito (`to_parquet` recebe o DataFrame, não o manifesto) e executado.
+- `tests/test_lake_build.py`: o arquivo de estado do build é escolhido com `sorted()` e asserção de unicidade, não o primeiro que o `glob` devolver.
+
 ## [0.15.3] - 2026-11-24
 
 ### Corrigido

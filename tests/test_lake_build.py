@@ -21,6 +21,14 @@ from quantilica.analytics.lake_build import (
     lake_build,
 )
 
+
+def _unico(achados) -> Path:
+    """O único caminho de `achados`; falha se houver zero ou mais de um."""
+    lista = sorted(achados)
+    assert len(lista) == 1, lista
+    return lista[0]
+
+
 WINDOWS = sys.platform.startswith("win")
 HERE = Path(__file__).parent
 
@@ -492,7 +500,7 @@ def test_truncated_state_line_is_ignored(tmp_path):
     conv = FakeConverter("src", ["a", "b"], control)
     _build(tmp_path, {"src": conv})
     lake = tmp_path / "lake"
-    state = next((lake / ".build").glob("*.jsonl"))
+    state = _unico((lake / ".build").glob("*.jsonl"))
     # Queda de energia no meio do fechamento: a linha fica pela metade.
     lines = state.read_text().splitlines()
     state.write_text("\n".join(lines[:-1]) + '\n{"run_id": "x", "event": "run_co')
